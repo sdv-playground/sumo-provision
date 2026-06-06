@@ -1,0 +1,25 @@
+# Rust
+/target
+**/*.rs.bk
+**/target/
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+
+# Key material — soft-HSM keystores, private keys, content keys.
+# Never commit these; production uses a real HSM.
+/keys/
+*.key
+*.pem
+!**/testdata/**/*.pem
+*.cek
+
+# Local service state (Postgres / MinIO volumes, scratch)
+/data/
+/local-state/
+
+# Editor / OS
+.DS_Store
+*.swp

@@ -1,0 +1,18 @@
+[package]
+name = "identity-tower"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "sumo-ca"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

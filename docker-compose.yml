@@ -1,0 +1,53 @@
+# Local development backing services for sumo-provision.
+#
+# Brings up the infrastructure the towers depend on:
+#   - postgres : metadata / index for both towers
+#   - minio    : S3-compatible object store for Tower 2 content blobs
+#
+# Tower 1 and Tower 2 use SEPARATE Postgres databases (created with the
+# persistence step) so they stay in separate fault domains — a Tower 2
+# compromise must not read Tower 1's identity data.
+#
+# Data is bind-mounted under ./data so it's visible/editable on the host. The
+# containers run as the invoking user's UID:GID (DOCKER_UID / DOCKER_GID, which
+# start.sh exports) so nothing in ./data ends up root-owned. Two rules that keep
+# it that way: never `sudo docker compose` here, and let start.sh pre-create
+# ./data/* (the daemon would otherwise create a missing bind source as root).
+# The defaults below cover a manual `docker compose up` from the typical first
+# user (1000:1000).
+#
+# The tower services (sumo-ca, sumo-hub) join this file once their container
+# images exist (see architecture.md, roadmap). Until then, run them with
+# `cargo run -p identity-tower` / `cargo run -p software-tower` against these
+# services.
+
+services:
+  postgres:
+    image: postgres:16
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+    environment:
+      POSTGRES_USER: sumo
+      POSTGRES_PASSWORD: dev-only-not-secret
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sumo"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: sumo
+      MINIO_ROOT_PASSWORD: dev-only-not-secret
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # console
+    volumes:
+      - ./data/minio:/data

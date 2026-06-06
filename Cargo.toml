@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wire",
+    "crates/identity-tower",
+    "crates/software-tower",
+    "crates/orchestrator",
+    "crates/client",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+# license: TBD before this repository is made public (see README.md).
+
+[workspace.dependencies]
+# internal
+wire = { path = "crates/wire" }
+client = { path = "crates/client" }
+orchestrator = { path = "crates/orchestrator" }
+
+# external — SOVD client lib (open-source; git-pinned now, published dep later)
+sovd-client = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+
+# async runtime + http
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"] }
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# cli + config
+clap = { version = "4", features = ["derive", "env"] }
+
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# errors
+anyhow = "1"
+thiserror = "1"
+
+# hashing + encoding
+sha2 = "0.10"
+hex = "0.4"
+
+# database
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros"] }
+
+# crypto
+aes-gcm = "0.10"
+rand = "0.8"
+
+# trait helpers
+async-trait = "0.1"
+
+# test helpers
+tempfile = "3"
+
+[profile.release]
+strip = true

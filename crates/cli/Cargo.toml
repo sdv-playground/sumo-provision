@@ -1,0 +1,17 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "sumo-provision"
+path = "src/main.rs"
+
+[dependencies]
+client = { workspace = true }
+orchestrator = { workspace = true }
+wire = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
