@@ -457,10 +457,15 @@ names.
    bank, never another's, mirroring the device's `seed_target_from_active`);
    `sumo-provision rig apply --channel <name>` (`orchestrator::apply_plan`)
    resolves the ship-set against Tower 2 — confirming Tower 2 can serve every
-   shipped part, flagging any it can't, and totalling the transfer. Next: drive
-   the SOVD `/updates` flash from the plan (UDS unlock via the security helper;
-   the wire is signature-agnostic, so a signed/encrypted SUIT envelope waits on
-   the Tower 2 signer, step 4).
+   shipped part, flagging any it can't, and totalling the transfer;
+   `sumo-provision rig flash --channel <name> --device <id>`
+   (`orchestrator::flash_bundle`) assembles the per-device flash bundle — a
+   signed SUIT envelope per component (Tower 2 builds it, CEK re-wrapped to the
+   device's Tower 1 key) plus payload refs — *dry*, exactly what would be
+   uploaded over SOVD, without touching the rig. Next: the *wet* flash — drive
+   the SOVD `/updates` wire (`FlashClient`: open_update → upload → prepare →
+   execute → commit) with a `sovd-token-helper` JWT; in-vehicle UDS unlock after
+   auth.
 4. **T2 per-node signer** — *done.* A sw-authority ES256 key (persisted via
    `--signing-key`, generated on first run); `build_envelope` re-wraps each
    part's stored CEK to a device's key (`rewrap_cek_ecdh`, no re-encryption) and

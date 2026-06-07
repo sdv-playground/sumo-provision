@@ -7,7 +7,7 @@
 //! read/resolve half of apply. Minting from Tower 1 and driving the SOVD
 //! `/updates` flash land against the roadmap in `architecture.md`.
 
-use client::{ClientError, SoftwareClient};
+use client::{ClientError, IdentityClient, SoftwareClient};
 use serde::{Deserialize, Serialize};
 use sovd_client::{SovdClient, SovdClientError};
 use wire::{ContentHash, Entity, Part, Tree};
@@ -24,6 +24,10 @@ pub enum Error {
     Client(#[from] ClientError),
     #[error("channel '{channel}' not found on Tower 2")]
     ChannelNotFound { channel: String },
+    #[error("device '{id}' not registered in Tower 1")]
+    DeviceNotFound { id: String },
+    #[error("device '{id}' has no public key registered")]
+    DeviceNoPubkey { id: String },
     #[error("could not parse installed manifest for {component}: {source}")]
     Manifest {
         component: String,
@@ -224,6 +228,93 @@ pub async fn apply_plan(rig_url: &str, hub_url: &str, channel: &str) -> Result<A
     }
     Ok(ApplyPlan {
         channel: channel.to_string(),
+        components,
+    })
+}
+
+// --- flash bundle (dry) ----------------------------------------------------
+
+/// A payload to upload alongside the envelope — referenced by SUIT `#uri`, the
+/// ciphertext fetched from Tower 2's blob store by `outer`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PayloadRef {
+    pub uri: String,
+    pub outer: ContentHash,
+    pub size: u64,
+}
+
+/// One component's flash bundle: the signed envelope + its payload references.
+#[derive(Debug, Clone, Serialize)]
+pub struct ComponentFlash {
+    pub entity: String,
+    pub envelope_bytes: usize,
+    pub payloads: Vec<PayloadRef>,
+}
+
+/// The per-device flash bundle for a channel — exactly what would be uploaded
+/// over SOVD, assembled without touching the rig (the dry half of the flash).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FlashBundle {
+    pub channel: String,
+    pub device: String,
+    pub components: Vec<ComponentFlash>,
+}
+
+/// Assemble the per-device flash bundle to bring the rig to `channel`'s desired
+/// state: the ship-set ([`apply_plan`]), then a signed SUIT envelope per
+/// component (built by Tower 2, with the CEK re-wrapped to the device's Tower 1
+/// key) plus its payload references — exactly what the flash would upload over
+/// SOVD, assembled without touching the rig.
+pub async fn flash_bundle(
+    rig_url: &str,
+    hub_url: &str,
+    ca_url: &str,
+    channel: &str,
+    device_id: &str,
+) -> Result<FlashBundle, Error> {
+    let plan = apply_plan(rig_url, hub_url, channel).await?;
+
+    let device = IdentityClient::new(ca_url)
+        .get_device(device_id)
+        .await?
+        .ok_or_else(|| Error::DeviceNotFound {
+            id: device_id.to_string(),
+        })?;
+    let pubkey = device.pubkey.ok_or_else(|| Error::DeviceNoPubkey {
+        id: device_id.to_string(),
+    })?;
+
+    let hub = SoftwareClient::new(hub_url);
+    let mut components = Vec::new();
+    for c in &plan.components {
+        if c.ship.is_empty() {
+            continue;
+        }
+        let parts: Vec<(String, ContentHash)> =
+            c.ship.iter().map(|s| (s.part.clone(), s.content)).collect();
+        let envelope = hub
+            .build_envelope(&pubkey, device_id, &c.entity, &parts, 1)
+            .await?;
+        let payloads = c
+            .ship
+            .iter()
+            .filter_map(|s| {
+                s.blob.as_ref().map(|b| PayloadRef {
+                    uri: format!("#{}", s.part),
+                    outer: b.outer,
+                    size: b.size,
+                })
+            })
+            .collect();
+        components.push(ComponentFlash {
+            entity: c.entity.clone(),
+            envelope_bytes: envelope.len(),
+            payloads,
+        });
+    }
+    Ok(FlashBundle {
+        channel: channel.to_string(),
+        device: device_id.to_string(),
         components,
     })
 }

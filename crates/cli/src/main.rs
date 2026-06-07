@@ -145,6 +145,25 @@ enum RigCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Assemble the flash bundle (signed envelopes + payloads) for a device —
+    /// dry by default: builds exactly what would be uploaded, does not flash.
+    Flash {
+        /// Desired state from a Tower 2 channel.
+        #[arg(long)]
+        channel: String,
+        /// Device id in the Tower 1 roster (the envelope recipient).
+        #[arg(long)]
+        device: String,
+        /// Tower 2 base URL.
+        #[arg(long, env = "SUMO_HUB_URL", default_value = "http://localhost:8081")]
+        hub_url: String,
+        /// Tower 1 base URL.
+        #[arg(long, env = "SUMO_CA_URL", default_value = "http://localhost:8080")]
+        ca_url: String,
+        /// Emit the bundle as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -294,6 +313,21 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                 print_apply(&plan);
             }
         }
+        RigCmd::Flash {
+            channel,
+            device,
+            hub_url,
+            ca_url,
+            json,
+        } => {
+            let bundle =
+                orchestrator::flash_bundle(&args.url, &hub_url, &ca_url, &channel, &device).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&bundle)?);
+            } else {
+                print_bundle(&bundle);
+            }
+        }
     }
     Ok(())
 }
@@ -399,7 +433,40 @@ fn print_apply(plan: &orchestrator::ApplyPlan) {
     println!(
         "flash (per component): SOVD open_update → upload manifest + parts → prepare → execute → commit"
     );
-    println!("(read-only plan; the live flash needs a UDS unlock via the security helper)");
+    println!("(read-only plan; `rig flash` assembles the signed envelopes)");
+}
+
+fn print_bundle(b: &orchestrator::FlashBundle) {
+    if b.components.is_empty() {
+        println!("up to date — nothing to flash for channel '{}'", b.channel);
+        return;
+    }
+    println!(
+        "flash bundle for device '{}' (channel '{}'):",
+        b.device, b.channel
+    );
+    let mut total = 0u64;
+    for c in &b.components {
+        println!(
+            "  {} — signed envelope {}, {} payload(s):",
+            c.entity,
+            human_size(c.envelope_bytes as u64),
+            c.payloads.len()
+        );
+        for p in &c.payloads {
+            println!("    {:<14} {}  ({})", p.uri, p.outer, human_size(p.size));
+            total += p.size;
+        }
+    }
+    println!(
+        "\n{} component(s), {} of payloads to upload",
+        b.components.len(),
+        human_size(total)
+    );
+    println!(
+        "would flash (per component): SOVD open_update → upload manifest + payloads → prepare → execute → commit"
+    );
+    println!("(dry run — no rig flash; the live flash authenticates to SOVD with a sovd-token-helper JWT)");
 }
 
 /// Render a byte count as a short human string (e.g. `1.2 MB`).

@@ -5,8 +5,24 @@
 //! (health/version, against either tower); [`SoftwareClient`] (Tower 2) and
 //! [`IdentityClient`] (Tower 1) add the per-tower operations, same pattern.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use wire::{ArtifactRef, ContentHash, Device, RegisterDevice, Tree};
+
+/// `POST /admin/envelope` request body (mirrors Tower 2's `NewEnvelope`).
+#[derive(Serialize)]
+struct EnvelopeReq<'a> {
+    device_pubkey: &'a str,
+    device_id: &'a str,
+    component: &'a str,
+    parts: Vec<EnvelopePartReq>,
+    seq: u64,
+}
+
+#[derive(Serialize)]
+struct EnvelopePartReq {
+    id: String,
+    content: ContentHash,
+}
 
 /// Error talking to a tower.
 #[derive(Debug, thiserror::Error)]
@@ -154,6 +170,43 @@ impl SoftwareClient {
             return Ok(None);
         }
         Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
+    /// `POST /admin/envelope` — build a signed SUIT envelope for `component`'s
+    /// `parts` (id + inner-hash), with each part's CEK re-wrapped to the device.
+    /// Returns the manifest bytes.
+    pub async fn build_envelope(
+        &self,
+        device_pubkey: &str,
+        device_id: &str,
+        component: &str,
+        parts: &[(String, ContentHash)],
+        seq: u64,
+    ) -> Result<Vec<u8>, ClientError> {
+        let body = EnvelopeReq {
+            device_pubkey,
+            device_id,
+            component,
+            parts: parts
+                .iter()
+                .map(|(id, content)| EnvelopePartReq {
+                    id: id.clone(),
+                    content: *content,
+                })
+                .collect(),
+            seq,
+        };
+        Ok(self
+            .tower
+            .http
+            .post(format!("{}/admin/envelope", self.tower.base))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .to_vec())
     }
 }
 
