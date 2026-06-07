@@ -431,8 +431,14 @@ names.
    T2, `IdentityClient` for T1, same pattern) + the `sumo-provision` CLI (`hub`
    publish/get/ping, `ca` ping). Next: the orchestrator's `FirmwareResolver`
    builds on `client` to fetch a package and flash a rig.
-3. **Channels + twin + diff** — pointer table, twin reporting, the diff endpoint;
-   the CLI gains `reconcile`.
+3. **Channels + twin + diff** — *in progress.* Done: the schema-agnostic vehicle
+   model + `wire::diff` (§4.6); the channel storage (L2 `component_releases`, L1
+   `campaign_releases`, `channels` pointer; `GET /channels/{name}/tree` resolves
+   to the desired `wire::Tree`); content existence (`GET /admin/artifacts/{inner}`)
+   so a build step skips re-uploads; twin reporting (the orchestrator reads the
+   rig's observed tree over SOVD). Next: the CLI diffs the rig against a channel
+   (`rig diff --channel`), and `wire::flash_plan` classifies each part as
+   present / copy-local / download for delta flashing.
 4. **T2 per-node signer** — sw-authority soft-HSM, per-node manifest, `kid`.
 5. **T1 (`sumo-ca`)** — identity roster + keystore minting, wired to the
    factory-reset + CSR enrollment flow.

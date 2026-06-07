@@ -13,14 +13,24 @@ use wire::{ArtifactRef, ContentHash};
 use crate::crypto;
 use crate::store::{ArtifactEntry, ArtifactIndex, BlobStore};
 
-/// Shared state: the blob store and the artifact index.
+/// Shared state: the blob store, the artifact index, and the release/channel
+/// database pool (`None` in unit tests, which exercise the content store with an
+/// in-memory index).
 #[derive(Clone)]
 pub struct AppState {
     pub blobs: Arc<dyn BlobStore>,
     pub index: Arc<dyn ArtifactIndex>,
+    pub pool: Option<sqlx::PgPool>,
 }
 
 impl AppState {
+    /// The release/channel database pool, or an error if none is configured.
+    pub fn pool(&self) -> Result<&sqlx::PgPool, AppError> {
+        self.pool
+            .as_ref()
+            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("no database configured")))
+    }
+
     /// Encrypt `plaintext` once, store the ciphertext, and index it. Idempotent
     /// on the plaintext (inner) hash: republishing the same bytes returns the
     /// existing reference without re-encrypting.
@@ -131,6 +141,7 @@ mod tests {
         let state = AppState {
             blobs: Arc::new(FsBlobStore::new(dir.path())),
             index: Arc::new(MemIndex::default()),
+            pool: None,
         };
         (state, dir)
     }

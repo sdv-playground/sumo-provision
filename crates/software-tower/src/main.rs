@@ -7,6 +7,7 @@
 
 mod content;
 mod crypto;
+mod releases;
 mod store;
 
 use std::net::SocketAddr;
@@ -14,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use clap::Parser;
 use serde::Serialize;
@@ -75,13 +76,25 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         blobs: Arc::new(FsBlobStore::new(&args.blob_dir)),
-        index: Arc::new(PgIndex::new(pool)),
+        index: Arc::new(PgIndex::new(pool.clone())),
+        pool: Some(pool),
     };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/version", get(version))
         .route("/admin/artifacts", post(content::publish))
+        .route("/admin/artifacts/{inner}", get(releases::artifact_exists))
+        .route(
+            "/admin/component-releases",
+            post(releases::create_component_release),
+        )
+        .route(
+            "/admin/campaign-releases",
+            post(releases::create_campaign_release),
+        )
+        .route("/admin/channels/{name}", put(releases::set_channel))
+        .route("/channels/{name}/tree", get(releases::channel_tree))
         .route("/blobs/{outer}", get(content::get_blob))
         .with_state(state);
 
