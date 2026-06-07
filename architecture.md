@@ -473,10 +473,13 @@ names.
    be uploaded over SOVD, without touching the rig. `--execute --token <jwt>`
    drives the *wet* flash (`orchestrator::flash_execute` → `FlashClient`:
    open_update → upload manifest + payloads → prepare → execute, with the JWT as a
-   `Bearer` header), staging banked components to awaiting-verdict; the
-   no-mix guard runs first. Next: the verdict (ECU reset when safe → commit /
-   rollback) and minting the JWT from `sovd-token-helper`. (In-vehicle UDS unlock
-   happens after the JWT auth, device-side.)
+   `Bearer` header), staging banked components to awaiting-verdict; the no-mix
+   guard runs first. The verdict — `rig reset` (boot the trial) → `rig commit` /
+   `rig rollback` (`flash_reset`/`flash_commit`/`flash_rollback`) — and the JWT
+   are wired: the JWT comes from `--token` or is minted from `sovd-token-helper`
+   (`--minter-url` + `--operator-token`, the `client::MinterClient`). In-vehicle
+   UDS unlock happens after the JWT auth, device-side. Only the first *live* flash
+   remains — gated on a human go.
 4. **T2 per-node signer** — *done.* A sw-authority ES256 key (persisted via
    `--signing-key`, generated on first run); `build_envelope` re-wraps each
    part's stored CEK to a device's key (`rewrap_cek_ecdh`, no re-encryption) and

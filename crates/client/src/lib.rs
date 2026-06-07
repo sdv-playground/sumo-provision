@@ -273,6 +273,66 @@ impl IdentityClient {
     }
 }
 
+/// A client for `sovd-token-helper` — mints short-lived SOVD bearer JWTs that
+/// SOVDd validates (the client→SOVD access token, distinct from UDS unlock).
+#[derive(Clone)]
+pub struct MinterClient {
+    base: String,
+    http: reqwest::Client,
+    operator_token: String,
+}
+
+#[derive(serde::Serialize)]
+struct MintReq<'a> {
+    device_id: &'a str,
+    components: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl_secs: Option<u64>,
+}
+
+/// A minted SOVD token.
+#[derive(Debug, Deserialize)]
+pub struct MintedToken {
+    pub token: String,
+    pub expires_at: String,
+}
+
+impl MinterClient {
+    /// Build a minter client for `base_url`, authenticating to `/mint` with the
+    /// operator bearer token.
+    pub fn new(base_url: impl Into<String>, operator_token: impl Into<String>) -> Self {
+        Self {
+            base: base_url.into().trim_end_matches('/').to_string(),
+            http: reqwest::Client::new(),
+            operator_token: operator_token.into(),
+        }
+    }
+
+    /// `POST /mint` — mint a token bound to `device_id` (the `aud`, the replay
+    /// guard) granting the given component scopes (`["*"]` for all).
+    pub async fn mint(
+        &self,
+        device_id: &str,
+        components: &[String],
+        ttl_secs: Option<u64>,
+    ) -> Result<MintedToken, ClientError> {
+        Ok(self
+            .http
+            .post(format!("{}/mint", self.base))
+            .bearer_auth(&self.operator_token)
+            .json(&MintReq {
+                device_id,
+                components,
+                ttl_secs,
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

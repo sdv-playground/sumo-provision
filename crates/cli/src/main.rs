@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use client::{IdentityClient, SoftwareClient, TowerClient};
+use client::{IdentityClient, MinterClient, SoftwareClient, TowerClient};
 use wire::ContentHash;
 
 #[derive(Parser, Debug)]
@@ -146,32 +146,77 @@ enum RigCmd {
         json: bool,
     },
     /// Assemble the flash bundle (signed envelopes + payloads) for a device —
-    /// dry by default: builds exactly what would be uploaded, does not flash.
+    /// dry by default; `--execute` flashes the rig over SOVD (destructive).
     Flash {
         /// Desired state from a Tower 2 channel.
         #[arg(long)]
         channel: String,
-        /// Device id in the Tower 1 roster (the envelope recipient).
-        #[arg(long)]
-        device: String,
         /// Tower 2 base URL.
         #[arg(long, env = "SUMO_HUB_URL", default_value = "http://localhost:8081")]
         hub_url: String,
         /// Tower 1 base URL.
         #[arg(long, env = "SUMO_CA_URL", default_value = "http://localhost:8080")]
         ca_url: String,
-        /// Actually flash the rig over SOVD (destructive). Requires `--token`.
-        /// Without it, the bundle is only assembled and reported (dry).
+        #[command(flatten)]
+        auth: AuthArgs,
+        /// Actually flash the rig over SOVD (destructive). Without it, dry.
         #[arg(long)]
         execute: bool,
-        /// SOVD bearer JWT (from `sovd-token-helper /mint`), required with
-        /// `--execute`.
-        #[arg(long, env = "SOVD_TOKEN")]
-        token: Option<String>,
         /// Emit the bundle / result as JSON.
         #[arg(long)]
         json: bool,
     },
+    /// Commit a staged update once its trial boot is healthy.
+    Commit {
+        /// Component to commit (e.g. `vm1`).
+        #[arg(long)]
+        component: String,
+        /// The update id returned by `rig flash --execute`.
+        #[arg(long)]
+        update: String,
+        #[command(flatten)]
+        auth: AuthArgs,
+    },
+    /// Roll a staged update back.
+    Rollback {
+        /// Component to roll back.
+        #[arg(long)]
+        component: String,
+        /// The update id returned by `rig flash --execute`.
+        #[arg(long)]
+        update: String,
+        #[command(flatten)]
+        auth: AuthArgs,
+    },
+    /// Reset a component so it boots its staged (trial) bank.
+    Reset {
+        /// Component to reset.
+        #[arg(long)]
+        component: String,
+        /// Reset type: `hard`, `soft`, `key_off_on`.
+        #[arg(long, default_value = "hard")]
+        reset_type: String,
+        #[command(flatten)]
+        auth: AuthArgs,
+    },
+}
+
+/// Auth for the SOVD flash wire: a device id (the token `aud` + envelope
+/// recipient) and either a bearer JWT or minter creds to mint one.
+#[derive(Args, Debug)]
+struct AuthArgs {
+    /// Device id in the Tower 1 roster (envelope recipient + token aud).
+    #[arg(long)]
+    device: String,
+    /// SOVD bearer JWT (skip minting).
+    #[arg(long, env = "SOVD_TOKEN")]
+    token: Option<String>,
+    /// `sovd-token-helper` base URL — mint a JWT when `--token` is absent.
+    #[arg(long, env = "SOVD_MINTER_URL")]
+    minter_url: Option<String>,
+    /// Operator bearer token for the minter.
+    #[arg(long, env = "SOVD_MINTER_OPERATOR_TOKEN")]
+    operator_token: Option<String>,
 }
 
 #[tokio::main]
@@ -323,21 +368,21 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
         }
         RigCmd::Flash {
             channel,
-            device,
             hub_url,
             ca_url,
+            auth,
             execute,
-            token,
             json,
         } => {
             if execute {
-                let jwt = token.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--execute requires --token <jwt> (from sovd-token-helper /mint)"
-                    )
-                })?;
+                let jwt = resolve_jwt(&auth, &["*".to_string()]).await?;
                 let result = orchestrator::flash_execute(
-                    &args.url, &hub_url, &ca_url, &channel, &device, &jwt,
+                    &args.url,
+                    &hub_url,
+                    &ca_url,
+                    &channel,
+                    &auth.device,
+                    &jwt,
                 )
                 .await?;
                 if json {
@@ -346,9 +391,14 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     print_flash_result(&result);
                 }
             } else {
-                let bundle =
-                    orchestrator::flash_bundle(&args.url, &hub_url, &ca_url, &channel, &device)
-                        .await?;
+                let bundle = orchestrator::flash_bundle(
+                    &args.url,
+                    &hub_url,
+                    &ca_url,
+                    &channel,
+                    &auth.device,
+                )
+                .await?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&bundle)?);
                 } else {
@@ -356,8 +406,59 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                 }
             }
         }
+        RigCmd::Commit {
+            component,
+            update,
+            auth,
+        } => {
+            let jwt = resolve_jwt(&auth, std::slice::from_ref(&component)).await?;
+            let status = orchestrator::flash_commit(&args.url, &component, &update, &jwt).await?;
+            println!("{component} committed → {status}");
+        }
+        RigCmd::Rollback {
+            component,
+            update,
+            auth,
+        } => {
+            let jwt = resolve_jwt(&auth, std::slice::from_ref(&component)).await?;
+            let status = orchestrator::flash_rollback(&args.url, &component, &update, &jwt).await?;
+            println!("{component} rolled back → {status}");
+        }
+        RigCmd::Reset {
+            component,
+            reset_type,
+            auth,
+        } => {
+            let jwt = resolve_jwt(&auth, std::slice::from_ref(&component)).await?;
+            let status =
+                orchestrator::flash_reset(&args.url, &component, &jwt, &reset_type).await?;
+            println!("{component} reset ({reset_type}) → {status}");
+        }
     }
     Ok(())
+}
+
+/// Resolve the SOVD bearer JWT: use `--token` if given, else mint one from
+/// `sovd-token-helper` (`--minter-url` + `--operator-token`).
+async fn resolve_jwt(auth: &AuthArgs, components: &[String]) -> anyhow::Result<String> {
+    if let Some(t) = &auth.token {
+        return Ok(t.clone());
+    }
+    let minter_url = auth.minter_url.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("provide --token, or --minter-url + --operator-token to mint one")
+    })?;
+    let operator_token = auth
+        .operator_token
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--minter-url requires --operator-token"))?;
+    let minted = MinterClient::new(minter_url, operator_token)
+        .mint(&auth.device, components, None)
+        .await?;
+    eprintln!(
+        "minted SOVD token for '{}' (expires {})",
+        auth.device, minted.expires_at
+    );
+    Ok(minted.token)
 }
 
 fn print_tree(tree: &wire::Tree) {

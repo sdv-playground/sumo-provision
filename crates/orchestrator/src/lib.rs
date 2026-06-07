@@ -435,13 +435,7 @@ pub async fn flash_execute(
             .build_envelope(&pubkey, device_id, &c.entity, &parts, 1)
             .await?;
 
-        let config = FlashConfig::builder(rig_url)
-            .component_id(&c.entity)
-            .api_key_header("Authorization")
-            .api_key(format!("Bearer {jwt}"))
-            .build();
-        let fc = FlashClient::new(config)?;
-
+        let fc = flash_client(rig_url, &c.entity, jwt)?;
         let update_id = fc.open_update_with(&c.entity, channel).await?;
         fc.upload_part("manifest", &envelope).await?;
         for s in &c.ship {
@@ -468,6 +462,57 @@ pub async fn flash_execute(
         device: device_id.to_string(),
         components,
     })
+}
+
+// --- verdict (reset / commit / rollback) -----------------------------------
+
+/// A `FlashClient` for one component, carrying the JWT as a `Bearer` header.
+fn flash_client(rig_url: &str, component: &str, jwt: &str) -> Result<FlashClient, Error> {
+    let config = FlashConfig::builder(rig_url)
+        .component_id(component)
+        .api_key_header("Authorization")
+        .api_key(format!("Bearer {jwt}"))
+        .build();
+    Ok(FlashClient::new(config)?)
+}
+
+/// Reset a component so it boots the staged (trial) bank — e.g. `reset_type =
+/// "hard"`. Issued when the rig is safe to reboot.
+pub async fn flash_reset(
+    rig_url: &str,
+    component: &str,
+    jwt: &str,
+    reset_type: &str,
+) -> Result<String, Error> {
+    Ok(flash_client(rig_url, component, jwt)?
+        .ecu_reset(reset_type)
+        .await?
+        .status)
+}
+
+/// Commit a staged update once its trial boot is healthy: re-attach to the
+/// `update_id` and commit. Returns the terminal status.
+pub async fn flash_commit(
+    rig_url: &str,
+    component: &str,
+    update_id: &str,
+    jwt: &str,
+) -> Result<String, Error> {
+    let fc = flash_client(rig_url, component, jwt)?;
+    fc.attach(update_id).await?;
+    Ok(fc.spec_commit().await?.status)
+}
+
+/// Roll a staged update back: re-attach to the `update_id` and roll back.
+pub async fn flash_rollback(
+    rig_url: &str,
+    component: &str,
+    update_id: &str,
+    jwt: &str,
+) -> Result<String, Error> {
+    let fc = flash_client(rig_url, component, jwt)?;
+    fc.attach(update_id).await?;
+    Ok(fc.spec_rollback().await?.status)
 }
 
 #[cfg(test)]
