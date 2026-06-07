@@ -355,6 +355,7 @@ dependencies = [
  "clap",
  "client",
  "orchestrator",
+ "serde_json",
  "tokio",
  "wire",
 ]
@@ -1317,6 +1318,7 @@ dependencies = [
  "serde_json",
  "sovd-client",
  "thiserror 1.0.69",
+ "wire",
 ]
 
 [[package]]

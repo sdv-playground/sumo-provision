@@ -83,8 +83,17 @@ struct RigArgs {
 
 #[derive(Subcommand, Debug)]
 enum RigCmd {
-    /// Read the rig's observed state (components + versions).
-    State,
+    /// Read the rig's observed state (the vehicle tree).
+    State {
+        /// Emit the tree as JSON (e.g. to capture a release).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diff the rig against a desired release (a tree JSON file).
+    Diff {
+        /// Release file: a tree JSON `{ "entities": { … } }`.
+        release: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -136,25 +145,59 @@ async fn run_ca(args: CaArgs) -> anyhow::Result<()> {
 }
 
 async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
+    let observed = orchestrator::read_rig_state(&args.url).await?;
     match args.cmd {
-        RigCmd::State => {
-            let state = orchestrator::read_rig_state(&args.url).await?;
-            for c in &state.components {
-                println!("{}  [{}]  {}", c.id, c.kind, c.name);
-                match &c.installed {
-                    Some(m) => {
-                        let ver = format!("{} {}", m.identity.name, m.identity.version);
-                        println!("    version  {}", ver.trim());
-                        for f in &m.files {
-                            println!("    {:<16} {}", f.path, f.sha256);
-                        }
-                    }
-                    None => println!("    (no signed manifest — never flashed)"),
-                }
+        RigCmd::State { json } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&observed)?);
+            } else {
+                print_tree(&observed);
             }
+        }
+        RigCmd::Diff { release } => {
+            let desired: wire::Tree = serde_json::from_reader(std::fs::File::open(&release)?)?;
+            print_diff(&wire::diff(&observed, &desired));
         }
     }
     Ok(())
+}
+
+fn print_tree(tree: &wire::Tree) {
+    for (path, e) in &tree.entities {
+        let ver = e
+            .version
+            .as_deref()
+            .map(|v| format!(" — {v}"))
+            .unwrap_or_default();
+        println!("{path}  [{}]{ver}", e.kind);
+        if e.parts.is_empty() {
+            println!("    (no signed manifest)");
+        }
+        for p in &e.parts {
+            println!("    {:<16} {}", p.id, p.content);
+        }
+    }
+}
+
+fn print_diff(d: &wire::TreeDiff) {
+    if d.is_empty() {
+        println!("up to date — nothing to flash");
+        return;
+    }
+    for e in &d.entities_added {
+        println!("+ entity {e}");
+    }
+    for e in &d.entities_removed {
+        println!("- entity {e}");
+    }
+    for c in &d.parts {
+        let sym = match c.change {
+            wire::Change::Added => '+',
+            wire::Change::Removed => '-',
+            wire::Change::Changed => '~',
+        };
+        println!("{sym} {}  {} [{}]", c.entity, c.part, c.kind);
+    }
 }
 
 async fn ping(tower: &TowerClient, url: &str) -> anyhow::Result<()> {

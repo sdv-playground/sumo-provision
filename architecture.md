@@ -225,6 +225,37 @@ GET    /healthz   /version
 A CI importer is just a publisher: it pulls CI artifacts with a CI job token and
 calls `/admin/artifacts` + `/admin/channels`.
 
+### 4.6 The vehicle model & diff
+
+A vehicle is modelled as a **tree of entities, each holding content-hashed
+parts**; a release describes the desired tree; the diff aligns observed (a rig)
+against desired (a release / channel). The model is **schema-agnostic** — `kind`s
+are open strings, so the engine never hardcodes any fleet's component types.
+(In `wire`: `Entity`, `Part`, `Tree`, `diff`.)
+
+- **Entity** — a tree node `{ path, kind, parent }`. The tree *is* composition,
+  mirroring SOVD's entity hierarchy, so the observed tree is a recursive walk of
+  components → sub-entities. Paths carry the shape (`vehicle`, `vm1`,
+  `vm1/sovd/myapp`); the parent of `a/b/c` is `a/b`.
+- **Part** — an updatable unit on an entity `{ kind, id, content_hash }`. The
+  unifying move: *everything* updatable is "a logical id + a content hash" — a
+  bank file → `(vm1, file, "kernel", sha256)` (what `x-sumo-installed-manifest`
+  gives); a container image → `(vm1/sovd/myapp, oci-image, "image", digest)`;
+  vehicle parameterization → `(vehicle, param-blob, "params", sha256)`.
+- **Release** — a desired snapshot of the tree (entities + parts), content-
+  addressed + sw-authority-signed. **Channel** — a mutable pointer → a release.
+- **Relations** — *composition* is the tree; *dependencies* are typed edges
+  (`vm1/sovd/myapp depends-on vm1 ≥ 1.0.0`, `params configures vm1`), stored as
+  data, driving ordering/validation later.
+
+**The diff** walks observed + desired, aligns entities by path, compares parts by
+`(id, content_hash)` → added / changed / removed, plus entity added / removed.
+It is "what an update would touch" — uniform across files, containers, and blobs.
+
+**Public vs private.** The model + SQL schema + diff are public and generic; the
+real entities/parts/releases are *rows*, seeded from the internal-workspace
+example — nothing fleet-specific touches the engine.
+
 ---
 
 ## 5. The orchestrator

@@ -1,16 +1,16 @@
 //! sumo-provision orchestrator core.
 //!
 //! The orchestrator is the only component that talks to both the towers and a
-//! rig. Today it can *observe* a rig over SOVD ([`read_rig_state`]) using the
-//! `sovd-client` library; fetching from Tower 2, minting from Tower 1, and
-//! flashing over the SOVD `/updates` wire land against the roadmap in
-//! `architecture.md`.
+//! rig. It observes a rig over SOVD as a [`wire::Tree`] ([`read_rig_state`]),
+//! which [`wire::diff`] compares against a desired tree (a release / channel).
+//! Fetching from Tower 2, minting from Tower 1, and flashing over the SOVD
+//! `/updates` wire land against the roadmap in `architecture.md`.
 
 use serde::Deserialize;
 use sovd_client::{SovdClient, SovdClientError};
+use wire::{ContentHash, Entity, Part, Tree};
 
-/// SOVD data resource carrying each VM's signed installed inventory (the
-/// running bank's IVD manifest). Vendor id, read over the standard `/data` path.
+/// SOVD data resource carrying each VM's signed installed inventory.
 const INSTALLED_MANIFEST: &str = "x-sumo-installed-manifest";
 
 /// Error from the orchestrator.
@@ -25,69 +25,38 @@ pub enum Error {
     },
 }
 
-/// The observed state of a rig — the input to the twin / diff. Read from the
-/// rig over SOVD; the rig is the source of truth.
-#[derive(Debug, Clone)]
-pub struct RigState {
-    pub components: Vec<ComponentState>,
-}
-
-/// One component's observed state.
-#[derive(Debug, Clone)]
-pub struct ComponentState {
-    pub id: String,
-    pub name: String,
-    pub kind: String,
-    /// The signed installed inventory, if the component has a committed bank
-    /// (`None` = never flashed / no signed manifest).
-    pub installed: Option<InstalledManifest>,
-}
-
-/// A VM's installed inventory, from `x-sumo-installed-manifest` (the running
-/// bank's signed IVD manifest). Read-and-display for now; independent signature
-/// verification + channel diff land with the twin step.
-#[derive(Debug, Clone, Deserialize)]
-pub struct InstalledManifest {
-    #[serde(default)]
-    pub identity: Identity,
-    #[serde(default)]
-    pub files: Vec<InstalledFile>,
-}
-
-/// The IVD identity block (a projection — only the fields we surface today).
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct Identity {
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub version: String,
-}
-
-/// One installed file and its content hash (the twin's observed inner-hash).
-#[derive(Debug, Clone, Deserialize)]
-pub struct InstalledFile {
-    pub path: String,
-    pub sha256: String,
-}
-
-/// Read a rig's observed state over SOVD: its components and, for each VM, the
-/// signed installed inventory (`x-sumo-installed-manifest`).
-pub async fn read_rig_state(sovd_url: &str) -> Result<RigState, Error> {
+/// Read a rig's observed state over SOVD as a [`wire::Tree`]: each component is
+/// an entity, and the files in its signed installed manifest are its parts
+/// (`kind = "file"`, `id = path`, `content = sha256`). Components with no signed
+/// manifest come back as entities with no parts.
+pub async fn read_rig_state(sovd_url: &str) -> Result<Tree, Error> {
     let client = SovdClient::new(sovd_url)?;
-    let mut components = Vec::new();
+    let mut tree = Tree::default();
     for c in client.list_components().await? {
-        let installed = read_installed(&client, &c.id).await?;
-        components.push(ComponentState {
-            id: c.id,
-            name: c.name,
+        let mut entity = Entity {
             kind: c.component_type.unwrap_or_default(),
-            installed,
-        });
+            ..Default::default()
+        };
+        if let Some(m) = read_installed(&client, &c.id).await? {
+            let label = format!("{} {}", m.identity.name, m.identity.version);
+            entity.version = Some(label.trim().to_string());
+            for f in m.files {
+                if let Ok(content) = f.sha256.parse::<ContentHash>() {
+                    entity.parts.push(Part {
+                        kind: "file".to_string(),
+                        id: f.path,
+                        content,
+                    });
+                }
+            }
+        }
+        tree.entities.insert(c.id, entity);
     }
-    Ok(RigState { components })
+    Ok(tree)
 }
 
-/// Read one component's installed manifest; `None` on 404 (never flashed).
+/// Read one component's installed manifest; `None` when the component doesn't
+/// expose it (404) or the rig doesn't implement that read (501).
 async fn read_installed(
     client: &SovdClient,
     component: &str,
@@ -101,7 +70,32 @@ async fn read_installed(
                 })?;
             Ok(Some(manifest))
         }
-        Err(SovdClientError::ServerError { status: 404, .. }) => Ok(None),
+        Err(SovdClientError::ServerError {
+            status: 404 | 501, ..
+        }) => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// The installed manifest's JSON shape — the fields we project into the tree.
+#[derive(Debug, Deserialize)]
+struct InstalledManifest {
+    #[serde(default)]
+    identity: Identity,
+    #[serde(default)]
+    files: Vec<InstalledFile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Identity {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    version: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstalledFile {
+    path: String,
+    sha256: String,
 }
