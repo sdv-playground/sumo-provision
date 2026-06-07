@@ -90,8 +90,8 @@ async fn main() -> anyhow::Result<()> {
             post(releases::create_component_release),
         )
         .route(
-            "/admin/campaign-releases",
-            post(releases::create_campaign_release),
+            "/admin/vehicle-releases",
+            post(releases::create_vehicle_release),
         )
         .route("/admin/channels/{name}", put(releases::set_channel))
         .route("/channels/{name}/tree", get(releases::channel_tree))

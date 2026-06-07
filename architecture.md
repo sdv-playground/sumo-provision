@@ -446,14 +446,16 @@ names.
    builds on `client` to fetch a package and flash a rig.
 3. **Channels + twin + diff** — *in progress.* Done: the schema-agnostic vehicle
    model + `wire::diff` (§4.6); the channel storage (L2 `component_releases`, L1
-   `campaign_releases`, `channels` pointer; `GET /channels/{name}/tree` resolves
-   to the desired `wire::Tree`); content existence (`GET /admin/artifacts/{inner}`)
-   so a build step skips re-uploads; twin reporting (the orchestrator reads the
-   rig's observed tree over SOVD); `sumo-provision rig diff --channel <name>` diffs
-   the rig against a channel, and `--plan` emits the per-component delta
+   `vehicle_releases` = the desired whole-vehicle state, `channels` pointer;
+   `GET /channels/{name}/tree` resolves to the desired `wire::Tree`); content
+   existence (`GET /admin/artifacts/{inner}`) so a build step skips re-uploads;
+   twin reporting (the orchestrator reads the rig's observed tree over SOVD); a
+   build/publish step that mints releases and advances a channel (the private
+   `seed-bleeding.sh`); `sumo-provision rig diff --channel <name>` diffs the rig
+   against a channel, and `--plan` emits the per-component delta
    (`wire::flash_plan` → ship vs reuse; each component reuses only its own active
    bank, never another's, mirroring the device's `seed_target_from_active`). Next:
-   the build/publish step that mints releases and advances a channel.
+   apply — fetch the ship-set from Tower 2 and flash the rig over SOVD.
 4. **T2 per-node signer** — sw-authority soft-HSM, per-node manifest, `kid`.
 5. **T1 (`sumo-ca`)** — identity roster + keystore minting, wired to the
    factory-reset + CSR enrollment flow.
