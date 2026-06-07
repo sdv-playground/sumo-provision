@@ -32,11 +32,12 @@ struct Args {
     #[arg(long, env = "SUMO_HUB_BIND", default_value = "0.0.0.0:8081")]
     bind: SocketAddr,
 
-    /// PostgreSQL connection string for the artifact index.
+    /// PostgreSQL connection string for the artifact index (its own DB, distinct
+    /// from Tower 1's).
     #[arg(
         long,
         env = "DATABASE_URL",
-        default_value = "postgres://sumo:dev-only-not-secret@localhost:5432/postgres"
+        default_value = "postgres://sumo:dev-only-not-secret@localhost:5432/sumo_hub"
     )]
     database_url: String,
 

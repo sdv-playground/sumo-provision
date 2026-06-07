@@ -47,19 +47,36 @@ if [ "${#COMPOSE[@]}" -gt 0 ]; then
     # Run the containers as the host user so data bind-mounted under ./data is
     # host-owned, never root-owned. Pre-create the dirs too: a missing bind-mount
     # source would otherwise be created by the daemon as root.
-    export DOCKER_UID="$(id -u)"
-    export DOCKER_GID="$(id -g)"
+    DOCKER_UID="$(id -u)"; export DOCKER_UID
+    DOCKER_GID="$(id -g)"; export DOCKER_GID
     mkdir -p data/postgres data/minio
     echo "==> Starting backing services (postgres, minio) via '${COMPOSE[*]}'..."
     if "${COMPOSE[@]}" up -d; then
         INFRA_UP=1
+        # Persistence step: each tower uses its OWN database (separate fault
+        # domains — a Tower 2 compromise must not read Tower 1's identity data).
+        # Idempotent: create only if missing, so existing data dirs are fine too.
+        echo "==> Waiting for postgres, then ensuring tower databases..."
+        for _ in $(seq 1 30); do
+            "${COMPOSE[@]}" exec -T postgres pg_isready -U sumo >/dev/null 2>&1 && break
+            sleep 1
+        done
+        # Each tower uses its OWN database (separate fault domains). createdb is
+        # the idempotent step: it creates the db, or reports it already exists.
+        # Either branch continues — a re-run never aborts the stack.
+        for db in sumo_hub sumo_ca; do
+            if "${COMPOSE[@]}" exec -T postgres createdb -U sumo "$db" 2>/dev/null; then
+                echo "    created $db"
+            else
+                echo "    $db already present"
+            fi
+        done
     else
-        echo "    failed to start backing services — continuing with towers only."
+        echo "    failed to start backing services — continuing without them."
     fi
 else
-    echo "==> Docker Compose not found — continuing with towers only."
-    echo "    (install the compose plugin for postgres + minio; the towers don't"
-    echo "     need them yet)"
+    echo "==> Docker Compose not found — install the compose plugin for postgres"
+    echo "    + minio (both towers need their Postgres databases to start)."
 fi
 
 # 3. Towers.
