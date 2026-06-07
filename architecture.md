@@ -469,11 +469,14 @@ names.
    `sumo-provision rig flash --channel <name> --device <id>`
    (`orchestrator::flash_bundle`) assembles the per-device flash bundle — a
    signed SUIT envelope per component (Tower 2 builds it, CEK re-wrapped to the
-   device's Tower 1 key) plus payload refs — *dry*, exactly what would be
-   uploaded over SOVD, without touching the rig. Next: the *wet* flash — drive
-   the SOVD `/updates` wire (`FlashClient`: open_update → upload → prepare →
-   execute → commit) with a `sovd-token-helper` JWT; in-vehicle UDS unlock after
-   auth.
+   device's Tower 1 key) plus payload refs — *dry* by default, exactly what would
+   be uploaded over SOVD, without touching the rig. `--execute --token <jwt>`
+   drives the *wet* flash (`orchestrator::flash_execute` → `FlashClient`:
+   open_update → upload manifest + payloads → prepare → execute, with the JWT as a
+   `Bearer` header), staging banked components to awaiting-verdict; the
+   no-mix guard runs first. Next: the verdict (ECU reset when safe → commit /
+   rollback) and minting the JWT from `sovd-token-helper`. (In-vehicle UDS unlock
+   happens after the JWT auth, device-side.)
 4. **T2 per-node signer** — *done.* A sw-authority ES256 key (persisted via
    `--signing-key`, generated on first run); `build_envelope` re-wraps each
    part's stored CEK to a device's key (`rewrap_cek_ecdh`, no re-encryption) and

@@ -9,7 +9,7 @@
 
 use client::{ClientError, IdentityClient, SoftwareClient};
 use serde::{Deserialize, Serialize};
-use sovd_client::{SovdClient, SovdClientError};
+use sovd_client::{FlashClient, FlashConfig, FlashError, SovdClient, SovdClientError};
 use wire::{ContentHash, Entity, Part, Tree, UpdateMode};
 
 /// SOVD data resource carrying each VM's signed installed inventory.
@@ -24,6 +24,10 @@ pub enum Error {
     Sovd(#[from] SovdClientError),
     #[error("tower client error: {0}")]
     Client(#[from] ClientError),
+    #[error("flash error: {0}")]
+    Flash(#[from] FlashError),
+    #[error("Tower 2 has no blob {outer} for a shipped part")]
+    PayloadMissing { outer: String },
     #[error("channel '{channel}' not found on Tower 2")]
     ChannelNotFound { channel: String },
     #[error("device '{id}' not registered in Tower 1")]
@@ -371,6 +375,95 @@ pub async fn flash_bundle(
         });
     }
     Ok(FlashBundle {
+        channel: channel.to_string(),
+        device: device_id.to_string(),
+        components,
+    })
+}
+
+// --- flash execute (wet) ---------------------------------------------------
+
+/// One component's wet-flash result (staged to awaiting-verdict).
+#[derive(Debug, Clone, Serialize)]
+pub struct ComponentFlashResult {
+    pub entity: String,
+    pub update_id: String,
+    pub status: String,
+}
+
+/// The result of a wet flash across a channel's components.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FlashResult {
+    pub channel: String,
+    pub device: String,
+    pub components: Vec<ComponentFlashResult>,
+}
+
+/// Drive the SOVD `/updates` flash per component, authenticated with `jwt`: Tower
+/// 2 builds the signed envelope, then open_update → upload manifest + payloads
+/// (ciphertext from Tower 2) → prepare → execute (orchestrated, so banked
+/// components stage to awaiting-verdict). The verdict — reset + commit — is a
+/// separate step issued when the rig is safe. **Destructive: mutates the rig.**
+pub async fn flash_execute(
+    rig_url: &str,
+    hub_url: &str,
+    ca_url: &str,
+    channel: &str,
+    device_id: &str,
+    jwt: &str,
+) -> Result<FlashResult, Error> {
+    let plan = apply_plan(rig_url, hub_url, channel).await?;
+    let device = IdentityClient::new(ca_url)
+        .get_device(device_id)
+        .await?
+        .ok_or_else(|| Error::DeviceNotFound {
+            id: device_id.to_string(),
+        })?;
+    let pubkey = device.pubkey.ok_or_else(|| Error::DeviceNoPubkey {
+        id: device_id.to_string(),
+    })?;
+    let hub = SoftwareClient::new(hub_url);
+
+    let mut components = Vec::new();
+    for c in &plan.components {
+        if c.ship.is_empty() {
+            continue;
+        }
+        let parts: Vec<(String, ContentHash)> =
+            c.ship.iter().map(|s| (s.part.clone(), s.content)).collect();
+        let envelope = hub
+            .build_envelope(&pubkey, device_id, &c.entity, &parts, 1)
+            .await?;
+
+        let config = FlashConfig::builder(rig_url)
+            .component_id(&c.entity)
+            .api_key_header("Authorization")
+            .api_key(format!("Bearer {jwt}"))
+            .build();
+        let fc = FlashClient::new(config)?;
+
+        let update_id = fc.open_update_with(&c.entity, channel).await?;
+        fc.upload_part("manifest", &envelope).await?;
+        for s in &c.ship {
+            if let Some(b) = &s.blob {
+                let ciphertext =
+                    hub.get_blob(&b.outer)
+                        .await?
+                        .ok_or_else(|| Error::PayloadMissing {
+                            outer: b.outer.to_prefixed(),
+                        })?;
+                fc.upload_part(&format!("#{}", s.part), &ciphertext).await?;
+            }
+        }
+        fc.prepare().await?;
+        let status = fc.execute(true).await?;
+        components.push(ComponentFlashResult {
+            entity: c.entity.clone(),
+            update_id,
+            status: status.status,
+        });
+    }
+    Ok(FlashResult {
         channel: channel.to_string(),
         device: device_id.to_string(),
         components,

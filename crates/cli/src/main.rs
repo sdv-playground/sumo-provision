@@ -160,7 +160,15 @@ enum RigCmd {
         /// Tower 1 base URL.
         #[arg(long, env = "SUMO_CA_URL", default_value = "http://localhost:8080")]
         ca_url: String,
-        /// Emit the bundle as JSON.
+        /// Actually flash the rig over SOVD (destructive). Requires `--token`.
+        /// Without it, the bundle is only assembled and reported (dry).
+        #[arg(long)]
+        execute: bool,
+        /// SOVD bearer JWT (from `sovd-token-helper /mint`), required with
+        /// `--execute`.
+        #[arg(long, env = "SOVD_TOKEN")]
+        token: Option<String>,
+        /// Emit the bundle / result as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -318,14 +326,34 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             device,
             hub_url,
             ca_url,
+            execute,
+            token,
             json,
         } => {
-            let bundle =
-                orchestrator::flash_bundle(&args.url, &hub_url, &ca_url, &channel, &device).await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&bundle)?);
+            if execute {
+                let jwt = token.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--execute requires --token <jwt> (from sovd-token-helper /mint)"
+                    )
+                })?;
+                let result = orchestrator::flash_execute(
+                    &args.url, &hub_url, &ca_url, &channel, &device, &jwt,
+                )
+                .await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    print_flash_result(&result);
+                }
             } else {
-                print_bundle(&bundle);
+                let bundle =
+                    orchestrator::flash_bundle(&args.url, &hub_url, &ca_url, &channel, &device)
+                        .await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&bundle)?);
+                } else {
+                    print_bundle(&bundle);
+                }
             }
         }
     }
@@ -467,6 +495,20 @@ fn print_bundle(b: &orchestrator::FlashBundle) {
         "would flash (per component): SOVD open_update → upload manifest + payloads → prepare → execute → commit"
     );
     println!("(dry run — no rig flash; the live flash authenticates to SOVD with a sovd-token-helper JWT)");
+}
+
+fn print_flash_result(r: &orchestrator::FlashResult) {
+    if r.components.is_empty() {
+        println!("nothing flashed — up to date for channel '{}'", r.channel);
+        return;
+    }
+    println!("flashed device '{}' (channel '{}'):", r.device, r.channel);
+    for c in &r.components {
+        println!("  {:<8} update {}  → {}", c.entity, c.update_id, c.status);
+    }
+    println!(
+        "\nstaged. Issue the verdict (ECU reset when safe, then commit) to finalize, or roll back."
+    );
 }
 
 /// Render a byte count as a short human string (e.g. `1.2 MB`).
