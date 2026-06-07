@@ -79,6 +79,24 @@ struct CaArgs {
 enum CaCmd {
     /// Probe health + version.
     Ping,
+    /// Register (or update) a device in the identity roster.
+    Register {
+        /// Stable device id (e.g. a VIN or rig name).
+        id: String,
+        /// Device model / type (e.g. `managed-cvc`).
+        #[arg(long)]
+        model: Option<String>,
+        /// File with the device's public key / CSR.
+        #[arg(long)]
+        pubkey_file: Option<PathBuf>,
+    },
+    /// List the device roster.
+    Devices,
+    /// Show one device by id.
+    Device {
+        /// Device id.
+        id: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -184,8 +202,53 @@ async fn run_ca(args: CaArgs) -> anyhow::Result<()> {
     let ca = IdentityClient::new(&args.url);
     match args.cmd {
         CaCmd::Ping => ping(ca.tower(), &args.url).await?,
+        CaCmd::Register {
+            id,
+            model,
+            pubkey_file,
+        } => {
+            let pubkey = match pubkey_file {
+                Some(p) => Some(std::fs::read_to_string(&p)?.trim().to_string()),
+                None => None,
+            };
+            let dev = ca
+                .register_device(&wire::RegisterDevice { id, model, pubkey })
+                .await?;
+            print_device(&dev);
+        }
+        CaCmd::Devices => {
+            let devices = ca.list_devices().await?;
+            if devices.is_empty() {
+                println!("(no devices registered)");
+            } else {
+                for d in &devices {
+                    println!(
+                        "{:<20} {:<14} {}",
+                        d.id,
+                        d.model.as_deref().unwrap_or("-"),
+                        d.status
+                    );
+                }
+            }
+        }
+        CaCmd::Device { id } => {
+            let dev = ca
+                .get_device(&id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("device '{id}' not registered"))?;
+            print_device(&dev);
+        }
     }
     Ok(())
+}
+
+fn print_device(d: &wire::Device) {
+    println!("id      {}", d.id);
+    if let Some(m) = &d.model {
+        println!("model   {m}");
+    }
+    println!("status  {}", d.status);
+    println!("pubkey  {}", d.pubkey.as_deref().unwrap_or("(none)"));
 }
 
 async fn run_rig(args: RigArgs) -> anyhow::Result<()> {

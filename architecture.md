@@ -462,8 +462,10 @@ names.
    the wire is signature-agnostic, so a signed/encrypted SUIT envelope waits on
    the Tower 2 signer, step 4).
 4. **T2 per-node signer** — sw-authority soft-HSM, per-node manifest, `kid`.
-5. **T1 (`sumo-ca`)** — identity roster + keystore minting, wired to the
-   factory-reset + CSR enrollment flow.
+5. **T1 (`sumo-ca`)** — *in progress.* The device identity roster
+   (`POST /admin/devices`, `GET /devices`; its own `sumo_ca` DB so its
+   migrations stay independent of Tower 2's) + `ca register` is done. Next:
+   keystore minting, wired to the factory-reset + CSR enrollment flow.
 6. **CI importer** — job-token publish + channel advance.
 7. **Collapse the per-rig scripts** to a registration + a channel subscription.
 8. **(Later)** on-rig reconciler daemon; delegated trust; rotation.

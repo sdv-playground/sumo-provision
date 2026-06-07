@@ -6,7 +6,7 @@
 //! [`IdentityClient`] (Tower 1) add the per-tower operations, same pattern.
 
 use serde::Deserialize;
-use wire::{ArtifactRef, ContentHash, Tree};
+use wire::{ArtifactRef, ContentHash, Device, RegisterDevice, Tree};
 
 /// Error talking to a tower.
 #[derive(Debug, thiserror::Error)]
@@ -176,6 +176,47 @@ impl IdentityClient {
     /// The shared base client (health / version).
     pub fn tower(&self) -> &TowerClient {
         &self.tower
+    }
+
+    /// `POST /admin/devices` — register (or update) a device in the roster.
+    pub async fn register_device(&self, req: &RegisterDevice) -> Result<Device, ClientError> {
+        Ok(self
+            .tower
+            .http
+            .post(format!("{}/admin/devices", self.tower.base))
+            .json(req)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// `GET /devices` — the device roster.
+    pub async fn list_devices(&self) -> Result<Vec<Device>, ClientError> {
+        Ok(self
+            .tower
+            .http
+            .get(format!("{}/devices", self.tower.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// `GET /devices/{id}` — one device; `None` if not registered.
+    pub async fn get_device(&self, id: &str) -> Result<Option<Device>, ClientError> {
+        let resp = self
+            .tower
+            .http
+            .get(format!("{}/devices/{}", self.tower.base, id))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(resp.error_for_status()?.json().await?))
     }
 }
 

@@ -1030,9 +1030,11 @@ dependencies = [
  "axum",
  "clap",
  "serde",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wire",
 ]
 
 [[package]]

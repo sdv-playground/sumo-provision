@@ -105,6 +105,36 @@ pub struct ArtifactRef {
     pub size: u64,
 }
 
+// --- device identity (Tower 1) ---------------------------------------------
+
+/// A device in Tower 1's identity roster. Registration records the device's
+/// identity; keystore minting (its `pubkey` → signed key material) lands with
+/// the enrollment flow.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    /// Stable device id (e.g. a VIN or rig name).
+    pub id: String,
+    /// Open device model/type, e.g. `"managed-cvc"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Lifecycle status, e.g. `"registered"`.
+    pub status: String,
+    /// The device's public key / CSR, once known (filled at enrollment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,
+}
+
+/// `POST /admin/devices` body — register (or update) a device. Idempotent on
+/// `id`: re-registering updates the supplied fields.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RegisterDevice {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,
+}
+
 // --- vehicle model ---------------------------------------------------------
 
 /// One updatable unit on an [`Entity`]: a logical id + a content hash, of some
