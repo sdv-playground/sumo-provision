@@ -10,10 +10,12 @@
 use client::{ClientError, IdentityClient, SoftwareClient};
 use serde::{Deserialize, Serialize};
 use sovd_client::{SovdClient, SovdClientError};
-use wire::{ContentHash, Entity, Part, Tree};
+use wire::{ContentHash, Entity, Part, Tree, UpdateMode};
 
 /// SOVD data resource carrying each VM's signed installed inventory.
 const INSTALLED_MANIFEST: &str = "x-sumo-installed-manifest";
+/// SOVD data resource carrying each component's update capability.
+const UPDATE_MODE: &str = "x-sumo-update-mode";
 
 /// Error from the orchestrator.
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +30,15 @@ pub enum Error {
     DeviceNotFound { id: String },
     #[error("device '{id}' has no public key registered")]
     DeviceNoPubkey { id: String },
+    #[error(
+        "campaign mixes rollbackable {rollbackable:?} with irreversible {irreversible:?} — a \
+         rollback would leave the device undefined; flash the irreversible component (e.g. the \
+         HSM keystore) as its own campaign"
+    )]
+    MixedUpdateModes {
+        rollbackable: Vec<String>,
+        irreversible: Vec<String>,
+    },
     #[error("could not parse installed manifest for {component}: {source}")]
     Manifest {
         component: String,
@@ -60,9 +71,26 @@ pub async fn read_rig_state(sovd_url: &str) -> Result<Tree, Error> {
                 }
             }
         }
+        entity.update_mode = read_update_mode(&client, &c.id).await?;
         tree.entities.insert(c.id, entity);
     }
     Ok(tree)
+}
+
+/// Read one component's `x-sumo-update-mode` capability; `None` when the device
+/// doesn't serve it (older firmware) or the value doesn't parse. Always-available
+/// on current devices — not gated on a committed manifest.
+async fn read_update_mode(
+    client: &SovdClient,
+    component: &str,
+) -> Result<Option<UpdateMode>, Error> {
+    match client.read_data(component, UPDATE_MODE).await {
+        Ok(resp) => Ok(serde_json::from_value(resp.value).ok()),
+        Err(SovdClientError::ServerError {
+            status: 404 | 501, ..
+        }) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Read one component's installed manifest; `None` when the component doesn't
@@ -194,6 +222,7 @@ pub async fn apply_plan(rig_url: &str, hub_url: &str, channel: &str) -> Result<A
         .ok_or_else(|| Error::ChannelNotFound {
             channel: channel.to_string(),
         })?;
+    guard_update_modes(&observed, &desired)?;
     let plan = wire::flash_plan(&observed, &desired);
 
     let mut components = Vec::new();
@@ -230,6 +259,35 @@ pub async fn apply_plan(rig_url: &str, hub_url: &str, channel: &str) -> Result<A
         channel: channel.to_string(),
         components,
     })
+}
+
+/// Reject a campaign that mixes rollbackable (banked) and irreversible
+/// (singleshot, e.g. the HSM keystore) components — a rollback would leave the
+/// device undefined. Uses the twin's reported `x-sumo-update-mode`; components
+/// the device doesn't report (`None`) are skipped (graceful on older firmware).
+fn guard_update_modes(observed: &Tree, desired: &Tree) -> Result<(), Error> {
+    let mut rollbackable = Vec::new();
+    let mut irreversible = Vec::new();
+    for path in desired.entities.keys() {
+        if let Some(m) = observed
+            .entities
+            .get(path)
+            .and_then(|e| e.update_mode.as_ref())
+        {
+            if m.supports_rollback {
+                rollbackable.push(path.clone());
+            } else {
+                irreversible.push(path.clone());
+            }
+        }
+    }
+    if !rollbackable.is_empty() && !irreversible.is_empty() {
+        return Err(Error::MixedUpdateModes {
+            rollbackable,
+            irreversible,
+        });
+    }
+    Ok(())
 }
 
 // --- flash bundle (dry) ----------------------------------------------------
@@ -317,4 +375,60 @@ pub async fn flash_bundle(
         device: device_id.to_string(),
         components,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mode(rollback: bool) -> Entity {
+        Entity {
+            update_mode: Some(UpdateMode {
+                mode: if rollback { "banked" } else { "singleshot" }.into(),
+                supports_rollback: rollback,
+                dual_bank: rollback,
+                reset_kind: "local".into(),
+            }),
+            ..Default::default()
+        }
+    }
+    fn tree(entries: Vec<(&str, Entity)>) -> Tree {
+        Tree {
+            entities: entries
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        }
+    }
+    fn desired(paths: &[&str]) -> Tree {
+        tree(paths.iter().map(|p| (*p, Entity::default())).collect())
+    }
+
+    #[test]
+    fn guard_rejects_rollbackable_mixed_with_irreversible() {
+        let observed = tree(vec![("vm1", mode(true)), ("hsm", mode(false))]);
+        assert!(matches!(
+            guard_update_modes(&observed, &desired(&["vm1", "hsm"])),
+            Err(Error::MixedUpdateModes { .. })
+        ));
+    }
+
+    #[test]
+    fn guard_allows_all_rollbackable() {
+        let observed = tree(vec![("vm1", mode(true)), ("vm2", mode(true))]);
+        assert!(guard_update_modes(&observed, &desired(&["vm1", "vm2"])).is_ok());
+    }
+
+    #[test]
+    fn guard_allows_irreversible_alone() {
+        let observed = tree(vec![("hsm", mode(false))]);
+        assert!(guard_update_modes(&observed, &desired(&["hsm"])).is_ok());
+    }
+
+    #[test]
+    fn guard_skips_components_with_unknown_mode() {
+        // hsm reports no mode (older firmware) → not counted, so no mix is seen.
+        let observed = tree(vec![("vm1", mode(true)), ("hsm", Entity::default())]);
+        assert!(guard_update_modes(&observed, &desired(&["vm1", "hsm"])).is_ok());
+    }
 }

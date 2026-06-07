@@ -195,6 +195,7 @@ async fn resolve_channel(pool: &PgPool, name: &str) -> sqlx::Result<Option<Tree>
         let mut entity = Entity {
             kind: row.get("entity_kind"),
             version: Some(row.get("version")),
+            update_mode: None,
             parts: Vec::new(),
         };
         let parts =

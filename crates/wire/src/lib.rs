@@ -150,6 +150,24 @@ pub struct Part {
     pub content: ContentHash,
 }
 
+/// A component's update capability, reported by the device (`x-sumo-update-mode`,
+/// the source of truth — the twin only syncs it). `banked` / `supports_rollback`
+/// components are rollbackable; `singleshot` / `!supports_rollback` (the HSM
+/// keystore) is irreversible. Drives the no-mix guard.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateMode {
+    /// `"banked"` or `"singleshot"`.
+    #[serde(rename = "update_mode")]
+    pub mode: String,
+    /// Whether a flashed update can be rolled back.
+    pub supports_rollback: bool,
+    #[serde(default)]
+    pub dual_bank: bool,
+    /// `"local"`, `"requires_ecu_reset"`, or `"none"`.
+    #[serde(default)]
+    pub reset_kind: String,
+}
+
 /// A node in the vehicle tree and the [`Part`]s installed on it. The tree's
 /// shape is carried by the path keys in [`Tree`]; this is the per-node payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +178,10 @@ pub struct Entity {
     /// Human-readable version label — display only; the [`diff`] ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// The component's update capability, if the device reports it (`None` on
+    /// devices that don't yet serve `x-sumo-update-mode`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_mode: Option<UpdateMode>,
     /// The updatable units on this entity.
     #[serde(default)]
     pub parts: Vec<Part>,
@@ -399,6 +421,7 @@ mod model_tests {
         Entity {
             kind: kind.into(),
             version: None,
+            update_mode: None,
             parts,
         }
     }

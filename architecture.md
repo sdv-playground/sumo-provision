@@ -265,6 +265,14 @@ byte-identical content (e.g. a shared CA bundle). Content addressing still earns
 its keep at Tower 2: when a part *is* shipped, encrypt-once de-dups storage and the
 build step's existence check (`GET /admin/artifacts/{inner}`) skips re-uploads.
 
+**Update mode & the no-mix guard.** The device reports each component's update
+capability (`x-sumo-update-mode`: `banked`/rollbackable vs `singleshot`/
+irreversible — the HSM keystore). `read_rig_state` syncs it onto the twin
+(`Entity.update_mode`, the device is the source of truth), and `apply_plan`
+**rejects a campaign that mixes rollbackable with irreversible** components — a
+rollback would leave the device undefined, so the HSM keystore flashes as its own
+campaign. Unknown (older firmware that doesn't serve it) degrades gracefully.
+
 **Public vs private.** The model + SQL schema + diff are public and generic; the
 real entities/parts/releases are *rows*, seeded from the internal-workspace
 example — nothing fleet-specific touches the engine.
