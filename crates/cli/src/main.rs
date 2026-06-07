@@ -55,6 +55,15 @@ enum HubCmd {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// Show a channel's target state — its desired vehicle tree (Tower 2 only,
+    /// no rig).
+    Channel {
+        /// Channel name (e.g. `bleeding`).
+        name: String,
+        /// Emit the tree as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -154,6 +163,17 @@ async fn run_hub(args: HubArgs) -> anyhow::Result<()> {
                     eprintln!("wrote {} bytes to {}", bytes.len(), path.display());
                 }
                 None => std::io::stdout().write_all(&bytes)?,
+            }
+        }
+        HubCmd::Channel { name, json } => {
+            let tree = hub
+                .channel_tree(&name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("channel '{name}' not found on {}", args.url))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tree)?);
+            } else {
+                print_tree(&tree);
             }
         }
     }
