@@ -105,6 +105,19 @@ enum RigCmd {
         #[arg(long)]
         plan: bool,
     },
+    /// Plan how to bring the rig to a channel's desired state: the ship-set
+    /// resolved against Tower 2 (read-only — does not flash).
+    Apply {
+        /// Desired state from a Tower 2 channel (e.g. `bleeding`).
+        #[arg(long)]
+        channel: String,
+        /// Tower 2 base URL.
+        #[arg(long, env = "SUMO_HUB_URL", default_value = "http://localhost:8081")]
+        hub_url: String,
+        /// Emit the plan as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -156,9 +169,9 @@ async fn run_ca(args: CaArgs) -> anyhow::Result<()> {
 }
 
 async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
-    let observed = orchestrator::read_rig_state(&args.url).await?;
     match args.cmd {
         RigCmd::State { json } => {
+            let observed = orchestrator::read_rig_state(&args.url).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&observed)?);
             } else {
@@ -171,6 +184,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             hub_url,
             plan,
         } => {
+            let observed = orchestrator::read_rig_state(&args.url).await?;
             let desired = match (release, channel) {
                 (Some(path), _) => serde_json::from_reader(std::fs::File::open(&path)?)?,
                 (None, Some(name)) => SoftwareClient::new(&hub_url)
@@ -183,6 +197,18 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                 print_plan(&wire::flash_plan(&observed, &desired));
             } else {
                 print_diff(&wire::diff(&observed, &desired));
+            }
+        }
+        RigCmd::Apply {
+            channel,
+            hub_url,
+            json,
+        } => {
+            let plan = orchestrator::apply_plan(&args.url, &hub_url, &channel).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                print_apply(&plan);
             }
         }
     }
@@ -246,6 +272,67 @@ fn print_plan(plan: &wire::FlashPlan) {
         }
     }
     println!("\n{ship} to ship from Tower 2, {reuse} reused bank-to-bank on-device");
+}
+
+fn print_apply(plan: &orchestrator::ApplyPlan) {
+    if plan.is_noop() {
+        println!(
+            "up to date — nothing to ship for channel '{}'",
+            plan.channel
+        );
+        return;
+    }
+    for c in &plan.components {
+        let ver = c
+            .version
+            .as_deref()
+            .map(|v| format!(" {v}"))
+            .unwrap_or_default();
+        println!(
+            "{}{}  — ship {}, reuse {}",
+            c.entity,
+            ver,
+            c.ship.len(),
+            c.reuse
+        );
+        for s in &c.ship {
+            match &s.blob {
+                Some(b) => println!("  ↑ {:<14} {}  ({})", s.part, s.content, human_size(b.size)),
+                None => println!("  ✗ {:<14} {}  — NOT in Tower 2", s.part, s.content),
+            }
+        }
+    }
+    let missing = plan.missing();
+    let ship_total: usize = plan.components.iter().map(|c| c.ship.len()).sum();
+    print!(
+        "\n{ship_total} part(s) to ship, {} total",
+        human_size(plan.ship_bytes())
+    );
+    if missing.is_empty() {
+        println!();
+    } else {
+        println!(" — {} unservable (not in Tower 2)", missing.len());
+    }
+    println!(
+        "flash (per component): SOVD open_update → upload manifest + parts → prepare → execute → commit"
+    );
+    println!("(read-only plan; the live flash needs a UDS unlock via the security helper)");
+}
+
+/// Render a byte count as a short human string (e.g. `1.2 MB`).
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
 }
 
 async fn ping(tower: &TowerClient, url: &str) -> anyhow::Result<()> {

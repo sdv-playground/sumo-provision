@@ -454,8 +454,13 @@ names.
    `seed-bleeding.sh`); `sumo-provision rig diff --channel <name>` diffs the rig
    against a channel, and `--plan` emits the per-component delta
    (`wire::flash_plan` → ship vs reuse; each component reuses only its own active
-   bank, never another's, mirroring the device's `seed_target_from_active`). Next:
-   apply — fetch the ship-set from Tower 2 and flash the rig over SOVD.
+   bank, never another's, mirroring the device's `seed_target_from_active`);
+   `sumo-provision rig apply --channel <name>` (`orchestrator::apply_plan`)
+   resolves the ship-set against Tower 2 — confirming Tower 2 can serve every
+   shipped part, flagging any it can't, and totalling the transfer. Next: drive
+   the SOVD `/updates` flash from the plan (UDS unlock via the security helper;
+   the wire is signature-agnostic, so a signed/encrypted SUIT envelope waits on
+   the Tower 2 signer, step 4).
 4. **T2 per-node signer** — sw-authority soft-HSM, per-node manifest, `kid`.
 5. **T1 (`sumo-ca`)** — identity roster + keystore minting, wired to the
    factory-reset + CSR enrollment flow.

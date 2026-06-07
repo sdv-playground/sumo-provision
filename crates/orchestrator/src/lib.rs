@@ -2,11 +2,13 @@
 //!
 //! The orchestrator is the only component that talks to both the towers and a
 //! rig. It observes a rig over SOVD as a [`wire::Tree`] ([`read_rig_state`]),
-//! which [`wire::diff`] compares against a desired tree (a release / channel).
-//! Fetching from Tower 2, minting from Tower 1, and flashing over the SOVD
-//! `/updates` wire land against the roadmap in `architecture.md`.
+//! which [`wire::diff`] / [`wire::flash_plan`] compare against a desired tree (a
+//! channel). [`apply_plan`] resolves a channel's ship-set against Tower 2 — the
+//! read/resolve half of apply. Minting from Tower 1 and driving the SOVD
+//! `/updates` flash land against the roadmap in `architecture.md`.
 
-use serde::Deserialize;
+use client::{ClientError, SoftwareClient};
+use serde::{Deserialize, Serialize};
 use sovd_client::{SovdClient, SovdClientError};
 use wire::{ContentHash, Entity, Part, Tree};
 
@@ -18,6 +20,10 @@ const INSTALLED_MANIFEST: &str = "x-sumo-installed-manifest";
 pub enum Error {
     #[error("sovd error: {0}")]
     Sovd(#[from] SovdClientError),
+    #[error("tower client error: {0}")]
+    Client(#[from] ClientError),
+    #[error("channel '{channel}' not found on Tower 2")]
+    ChannelNotFound { channel: String },
     #[error("could not parse installed manifest for {component}: {source}")]
     Manifest {
         component: String,
@@ -98,4 +104,126 @@ struct Identity {
 struct InstalledFile {
     path: String,
     sha256: String,
+}
+
+// --- apply plan ------------------------------------------------------------
+
+/// Where a part's content lives in Tower 2 — the ciphertext blob to fetch.
+#[derive(Debug, Clone, Serialize)]
+pub struct BlobRef {
+    pub outer: ContentHash,
+    pub size: u64,
+}
+
+/// One part to ship to a component, resolved against Tower 2. `blob` is `None`
+/// when the channel references content Tower 2 does not have (the build/publish
+/// step is out of sync) — such a part cannot be flashed.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShipPart {
+    pub part: String,
+    pub kind: String,
+    pub content: ContentHash,
+    pub blob: Option<BlobRef>,
+}
+
+/// One component's slice of the apply plan: what ships, and how many parts the
+/// device reuses from its own active bank.
+#[derive(Debug, Clone, Serialize)]
+pub struct ComponentApply {
+    pub entity: String,
+    pub version: Option<String>,
+    pub ship: Vec<ShipPart>,
+    pub reuse: usize,
+}
+
+/// The executable plan to bring a rig to a channel's desired state: per
+/// component, the ship-set resolved against Tower 2 (everything else the device
+/// seeds from its own active bank). Built by [`apply_plan`]; the flash itself
+/// (drive the SOVD `/updates` wire per component) executes this.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ApplyPlan {
+    pub channel: String,
+    pub components: Vec<ComponentApply>,
+}
+
+impl ApplyPlan {
+    /// Total bytes that must cross the wire — the sum of resolved ship blobs.
+    pub fn ship_bytes(&self) -> u64 {
+        self.components
+            .iter()
+            .flat_map(|c| &c.ship)
+            .filter_map(|s| s.blob.as_ref().map(|b| b.size))
+            .sum()
+    }
+
+    /// Ship parts Tower 2 cannot serve — `(entity, part)` for each.
+    pub fn missing(&self) -> Vec<(&str, &str)> {
+        self.components
+            .iter()
+            .flat_map(|c| {
+                c.ship
+                    .iter()
+                    .filter(|s| s.blob.is_none())
+                    .map(move |s| (c.entity.as_str(), s.part.as_str()))
+            })
+            .collect()
+    }
+
+    /// True when nothing ships — the rig already matches the channel.
+    pub fn is_noop(&self) -> bool {
+        self.components.iter().all(|c| c.ship.is_empty())
+    }
+}
+
+/// Plan how to bring the rig at `rig_url` to the desired state on `channel`
+/// (resolved from Tower 2 at `hub_url`). Reads the rig over SOVD, resolves the
+/// channel's desired tree, computes the per-component [`wire::flash_plan`], and
+/// resolves each shipped part against Tower 2's index — confirming Tower 2 can
+/// actually serve it and totalling the transfer. This is the read/resolve half
+/// of apply; flashing drives the SOVD `/updates` wire per component from it.
+pub async fn apply_plan(rig_url: &str, hub_url: &str, channel: &str) -> Result<ApplyPlan, Error> {
+    let observed = read_rig_state(rig_url).await?;
+    let hub = SoftwareClient::new(hub_url);
+    let desired = hub
+        .channel_tree(channel)
+        .await?
+        .ok_or_else(|| Error::ChannelNotFound {
+            channel: channel.to_string(),
+        })?;
+    let plan = wire::flash_plan(&observed, &desired);
+
+    let mut components = Vec::new();
+    for (path, entity) in &desired.entities {
+        let mut ship = Vec::new();
+        let mut reuse = 0;
+        for p in plan.parts.iter().filter(|p| p.entity == *path) {
+            match p.plan {
+                wire::PartPlan::Reuse => reuse += 1,
+                wire::PartPlan::Ship => {
+                    let blob = hub.artifact_exists(&p.content).await?.map(|a| BlobRef {
+                        outer: a.outer,
+                        size: a.size,
+                    });
+                    ship.push(ShipPart {
+                        part: p.part.clone(),
+                        kind: p.kind.clone(),
+                        content: p.content,
+                        blob,
+                    });
+                }
+            }
+        }
+        if !ship.is_empty() || reuse > 0 {
+            components.push(ComponentApply {
+                entity: path.clone(),
+                version: entity.version.clone(),
+                ship,
+                reuse,
+            });
+        }
+    }
+    Ok(ApplyPlan {
+        channel: channel.to_string(),
+        components,
+    })
 }

@@ -1314,6 +1314,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 name = "orchestrator"
 version = "0.0.0"
 dependencies = [
+ "client",
  "serde",
  "serde_json",
  "sovd-client",
