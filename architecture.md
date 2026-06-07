@@ -437,8 +437,8 @@ names.
 ---
 
 ## 10. Roadmap (rough; subject to the open questions)
-1. **T2 content core** — *done.* `POST /admin/artifacts` (encrypt-once,
-   AES-256-GCM) + `GET /blobs/{outer}`; filesystem blob store + Postgres index
+1. **T2 content core** — *done.* `POST /admin/artifacts` (encrypt-once via
+   `sumo-offboard`, AES-128-GCM) + `GET /blobs/{outer}`; filesystem blob store + Postgres index
    (CEK kept out of the blob store). Manifests deferred to land with channels.
 2. **Client lib + CLI** — *done.* Reusable `client` crate (`SoftwareClient` for
    T2, `IdentityClient` for T1, same pattern) + the `sumo-provision` CLI (`hub`
