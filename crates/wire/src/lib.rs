@@ -229,6 +229,100 @@ fn diff_parts(entity: &str, observed: &[Part], desired: &[Part], out: &mut Vec<P
     }
 }
 
+// --- flash plan (per-component A/B delta) ----------------------------------
+
+/// How one desired part is realised on its component's target (inactive) bank.
+///
+/// The decision is scoped to the **same component's active bank** — a component
+/// is never sourced from another's bank, so there is no data flow between
+/// components. This mirrors the device's `seed_target_from_active`: after the
+/// update payload is written to the target bank, every file the update did *not*
+/// carry is copied from that same component's active bank (by slot).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PartPlan {
+    /// New or changed content — shipped in the update (fetched from Tower 2) and
+    /// written to the target bank.
+    Ship,
+    /// Already in this component's active bank at the same slot — the device
+    /// copies it bank-to-bank (active → target); nothing crosses the wire.
+    Reuse,
+}
+
+/// One desired part and how its content is acquired. See [`flash_plan`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedPart {
+    pub entity: String,
+    pub part: String,
+    pub kind: String,
+    pub content: ContentHash,
+    pub plan: PartPlan,
+}
+
+/// A delta-aware plan to realise a desired tree on a rig: every desired part,
+/// classified [`Ship`](PartPlan::Ship) or [`Reuse`](PartPlan::Reuse). Built by
+/// [`flash_plan`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlashPlan {
+    pub parts: Vec<PlannedPart>,
+}
+
+impl FlashPlan {
+    /// The parts shipped in the update — the bytes that actually cross the wire
+    /// (everything else the device seeds from its own active bank).
+    pub fn ships(&self) -> impl Iterator<Item = &PlannedPart> {
+        self.parts.iter().filter(|p| p.plan == PartPlan::Ship)
+    }
+
+    /// The parts the device reuses from its active bank (a bank-to-bank copy).
+    pub fn reused(&self) -> impl Iterator<Item = &PlannedPart> {
+        self.parts.iter().filter(|p| p.plan == PartPlan::Reuse)
+    }
+
+    /// True when every desired part is already in its component's active bank —
+    /// nothing to ship.
+    pub fn is_noop(&self) -> bool {
+        self.parts.iter().all(|p| p.plan == PartPlan::Reuse)
+    }
+}
+
+/// Plan how to realise `desired` on a rig whose observed (active-bank) state is
+/// `observed`. Each desired part's content is compared **only against the same
+/// component's active bank**: an unchanged slot is [`Reuse`](PartPlan::Reuse)
+/// (the device copies it bank-to-bank), a new or changed slot is
+/// [`Ship`](PartPlan::Ship) (fetched from Tower 2 into the update). Components are
+/// never cross-sourced — there is no data flow between them. Structural removals
+/// are reported by [`diff`], not here: a flash plan is about acquiring desired
+/// content, not tearing down the old.
+pub fn flash_plan(observed: &Tree, desired: &Tree) -> FlashPlan {
+    let empty = Entity::default();
+    let mut parts = Vec::new();
+    for (epath, des) in &desired.entities {
+        // The only local-copy source for this component is its own active bank.
+        let active = observed.entities.get(epath).unwrap_or(&empty);
+        let active_at: BTreeMap<&str, ContentHash> = active
+            .parts
+            .iter()
+            .map(|p| (p.id.as_str(), p.content))
+            .collect();
+        for part in &des.parts {
+            let plan = if active_at.get(part.id.as_str()) == Some(&part.content) {
+                PartPlan::Reuse
+            } else {
+                PartPlan::Ship
+            };
+            parts.push(PlannedPart {
+                entity: epath.clone(),
+                part: part.id.clone(),
+                kind: part.kind.clone(),
+                content: part.content,
+                plan,
+            });
+        }
+    }
+    FlashPlan { parts }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +448,82 @@ mod model_tests {
         let json = serde_json::to_string(&t).unwrap();
         let back: Tree = serde_json::from_str(&json).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn flash_plan_ships_changed_reuses_unchanged() {
+        // The component's active bank: vm1 with kernel=K and rootfs=R.
+        let observed = tree(vec![(
+            "vm1",
+            entity(
+                "vm",
+                vec![part("file", "kernel", b"K"), part("file", "rootfs", b"R")],
+            ),
+        )]);
+        // Desired vm1: changed kernel (ship), unchanged rootfs (reuse from active
+        // bank), brand-new policy (ship).
+        let desired = tree(vec![(
+            "vm1",
+            entity(
+                "vm",
+                vec![
+                    part("file", "kernel", b"K2"),
+                    part("file", "rootfs", b"R"),
+                    part("file", "policy", b"P"),
+                ],
+            ),
+        )]);
+
+        let plan = flash_plan(&observed, &desired);
+        assert!(!plan.is_noop());
+
+        let by: BTreeMap<&str, PartPlan> = plan
+            .parts
+            .iter()
+            .map(|p| (p.part.as_str(), p.plan))
+            .collect();
+        assert_eq!(by["kernel"], PartPlan::Ship);
+        assert_eq!(by["rootfs"], PartPlan::Reuse);
+        assert_eq!(by["policy"], PartPlan::Ship);
+
+        // The shipped set is exactly the changed + new parts.
+        let mut ship: Vec<&str> = plan.ships().map(|p| p.part.as_str()).collect();
+        ship.sort();
+        assert_eq!(ship, vec!["kernel", "policy"]);
+        assert_eq!(plan.reused().count(), 1);
+    }
+
+    #[test]
+    fn flash_plan_never_reuses_across_components() {
+        // vm1's active bank holds content R; vm2 wants the very same bytes. Even
+        // though that content is on the rig, vm2 must SHIP it — a component is
+        // never sourced from another's bank (no cross-component data flow).
+        let observed = tree(vec![(
+            "vm1",
+            entity("vm", vec![part("file", "rootfs", b"R")]),
+        )]);
+        let desired = tree(vec![(
+            "vm2",
+            entity("vm", vec![part("file", "rootfs", b"R")]),
+        )]);
+
+        let plan = flash_plan(&observed, &desired);
+        assert_eq!(plan.parts.len(), 1);
+        assert_eq!(plan.parts[0].entity, "vm2");
+        assert_eq!(plan.parts[0].plan, PartPlan::Ship);
+        assert_eq!(plan.ships().count(), 1);
+        assert_eq!(plan.reused().count(), 0);
+    }
+
+    #[test]
+    fn flash_plan_identical_is_noop() {
+        let t = tree(vec![(
+            "vm1",
+            entity("vm", vec![part("file", "kernel", b"k")]),
+        )]);
+        let plan = flash_plan(&t, &t);
+        assert!(plan.is_noop());
+        assert_eq!(plan.ships().count(), 0);
+        assert_eq!(plan.reused().count(), 1);
     }
 }

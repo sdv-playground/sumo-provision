@@ -6,7 +6,7 @@
 //! [`IdentityClient`] (Tower 1) add the per-tower operations, same pattern.
 
 use serde::Deserialize;
-use wire::{ArtifactRef, ContentHash};
+use wire::{ArtifactRef, ContentHash, Tree};
 
 /// Error talking to a tower.
 #[derive(Debug, thiserror::Error)]
@@ -116,6 +116,44 @@ impl SoftwareClient {
             return Ok(None);
         }
         Ok(Some(resp.error_for_status()?.bytes().await?.to_vec()))
+    }
+
+    /// `GET /admin/artifacts/{inner}` — the stored artifact ref for this plaintext
+    /// content, or `None` if Tower 2 doesn't have it. A build step uses this to
+    /// upload only genuinely-new content.
+    pub async fn artifact_exists(
+        &self,
+        inner: &ContentHash,
+    ) -> Result<Option<ArtifactRef>, ClientError> {
+        let resp = self
+            .tower
+            .http
+            .get(format!(
+                "{}/admin/artifacts/{}",
+                self.tower.base,
+                inner.to_prefixed()
+            ))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
+    /// `GET /channels/{name}/tree` — resolve a channel to its desired
+    /// [`wire::Tree`]; `None` if the channel is unset or unknown.
+    pub async fn channel_tree(&self, name: &str) -> Result<Option<Tree>, ClientError> {
+        let resp = self
+            .tower
+            .http
+            .get(format!("{}/channels/{}/tree", self.tower.base, name))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(resp.error_for_status()?.json().await?))
     }
 }
 

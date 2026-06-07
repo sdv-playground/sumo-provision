@@ -252,6 +252,19 @@ are open strings, so the engine never hardcodes any fleet's component types.
 `(id, content_hash)` → added / changed / removed, plus entity added / removed.
 It is "what an update would touch" — uniform across files, containers, and blobs.
 
+**Delta & bank isolation.** Flashing is **per-component A/B**: an update writes a
+component's *inactive* bank, then the device copies every file the update did not
+carry from that **same component's active bank** (vm-mgr's `seed_target_from_active`,
+by slot). So the orchestrator's delta job is only to compute each component's
+**ship-set** — the parts whose content differs from (or is absent in) that
+component's *own* active bank; the rest the device reuses bank-to-bank.
+`flash_plan(observed, desired)` does exactly that, classifying each desired part
+`Ship` or `Reuse`, scoped strictly per component — **a component is never sourced
+from another's bank** (no cross-component data flow), even when two components hold
+byte-identical content (e.g. a shared CA bundle). Content addressing still earns
+its keep at Tower 2: when a part *is* shipped, encrypt-once de-dups storage and the
+build step's existence check (`GET /admin/artifacts/{inner}`) skips re-uploads.
+
 **Public vs private.** The model + SQL schema + diff are public and generic; the
 real entities/parts/releases are *rows*, seeded from the internal-workspace
 example — nothing fleet-specific touches the engine.
@@ -436,9 +449,11 @@ names.
    `campaign_releases`, `channels` pointer; `GET /channels/{name}/tree` resolves
    to the desired `wire::Tree`); content existence (`GET /admin/artifacts/{inner}`)
    so a build step skips re-uploads; twin reporting (the orchestrator reads the
-   rig's observed tree over SOVD). Next: the CLI diffs the rig against a channel
-   (`rig diff --channel`), and `wire::flash_plan` classifies each part as
-   present / copy-local / download for delta flashing.
+   rig's observed tree over SOVD); `sumo-provision rig diff --channel <name>` diffs
+   the rig against a channel, and `--plan` emits the per-component delta
+   (`wire::flash_plan` → ship vs reuse; each component reuses only its own active
+   bank, never another's, mirroring the device's `seed_target_from_active`). Next:
+   the build/publish step that mints releases and advances a channel.
 4. **T2 per-node signer** — sw-authority soft-HSM, per-node manifest, `kid`.
 5. **T1 (`sumo-ca`)** — identity roster + keystore minting, wired to the
    factory-reset + CSR enrollment flow.
