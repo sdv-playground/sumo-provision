@@ -107,7 +107,10 @@ async fn main() -> anyhow::Result<()> {
             "/admin/vehicle-releases",
             post(releases::create_vehicle_release),
         )
-        .route("/admin/channels/{name}", put(releases::set_channel))
+        .route(
+            "/admin/channels/{name}",
+            put(releases::set_channel).get(releases::get_channel),
+        )
         .route("/channels/{name}/tree", get(releases::channel_tree))
         .route("/admin/signer/pubkey", get(signer::signer_pubkey))
         .route("/admin/envelope", post(signer::create_envelope))
