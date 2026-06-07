@@ -25,6 +25,11 @@ sovd-client = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "m
 # external — sumo-rs SUIT toolkit (open-source): encrypt-once + per-device CEK
 # rewrap, manifest signing. Tower 2 reuses it so we don't fork the envelope format.
 sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+# sumo-onboard + sumo-crypto + coset: device-side validate/decrypt, used by the
+# signer's roundtrip test (dev-only) to prove envelopes verify and decrypt.
+sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+coset = "0.3"
 
 # async runtime + http
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"] }

@@ -8,6 +8,7 @@
 mod content;
 mod crypto;
 mod releases;
+mod signer;
 mod store;
 
 use std::net::SocketAddr;

@@ -25,3 +25,6 @@ hex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+sumo-onboard = { workspace = true }
+sumo-crypto = { workspace = true }
+coset = { workspace = true }

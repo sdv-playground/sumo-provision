@@ -2020,6 +2020,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
+name = "ruzstd"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fad02996bfc73da3e301efe90b1837be9ed8f4a462b6ed410aa35d00381de89f"
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2221,10 +2227,13 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "coset",
  "hex",
  "serde",
  "sqlx",
+ "sumo-crypto",
  "sumo-offboard",
+ "sumo-onboard",
  "tempfile",
  "tokio",
  "tracing",
@@ -2553,6 +2562,18 @@ dependencies = [
  "sumo-crypto",
  "thiserror 2.0.18",
  "zstd",
+]
+
+[[package]]
+name = "sumo-onboard"
+version = "0.1.0"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#71dcc9b8b3a864c56158faeae8cd31067ecb92cc"
+dependencies = [
+ "ciborium",
+ "coset",
+ "ruzstd",
+ "sumo-codec",
+ "sumo-crypto",
 ]
 
 [[package]]

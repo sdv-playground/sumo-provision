@@ -461,7 +461,13 @@ names.
    the SOVD `/updates` flash from the plan (UDS unlock via the security helper;
    the wire is signature-agnostic, so a signed/encrypted SUIT envelope waits on
    the Tower 2 signer, step 4).
-4. **T2 per-node signer** — sw-authority soft-HSM, per-node manifest, `kid`.
+4. **T2 per-node signer** — *in progress.* The signer core is done (`signer.rs`):
+   a sw-authority ES256 key + `build_envelope` that re-wraps each part's stored
+   CEK to a device's key (`rewrap_cek_ecdh`, no re-encryption) and signs a
+   per-device multi-component SUIT manifest via `sumo-offboard` — proven by an
+   encrypt-once → re-wrap → build → validate → decrypt roundtrip. Next: the
+   `POST /admin/envelope` endpoint (resolve parts from the index → envelope) +
+   key persistence.
 5. **T1 (`sumo-ca`)** — *in progress.* The device identity roster
    (`POST /admin/devices`, `GET /devices`; its own `sumo_ca` DB so its
    migrations stay independent of Tower 2's) + `ca register` is done. Next:
