@@ -2228,14 +2228,18 @@ dependencies = [
  "axum",
  "clap",
  "coset",
+ "futures",
  "hex",
  "serde",
+ "serde_json",
  "sqlx",
  "sumo-crypto",
  "sumo-offboard",
  "sumo-onboard",
  "tempfile",
  "tokio",
+ "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "wire",
@@ -2518,7 +2522,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sumo-codec"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#71dcc9b8b3a864c56158faeae8cd31067ecb92cc"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
 dependencies = [
  "ciborium",
  "coset",
@@ -2527,7 +2531,7 @@ dependencies = [
 [[package]]
 name = "sumo-crypto"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#71dcc9b8b3a864c56158faeae8cd31067ecb92cc"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2548,7 +2552,7 @@ dependencies = [
 [[package]]
 name = "sumo-offboard"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#71dcc9b8b3a864c56158faeae8cd31067ecb92cc"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
 dependencies = [
  "ciborium",
  "coset",
@@ -2567,7 +2571,7 @@ dependencies = [
 [[package]]
 name = "sumo-onboard"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#71dcc9b8b3a864c56158faeae8cd31067ecb92cc"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
 dependencies = [
  "ciborium",
  "coset",

@@ -33,8 +33,10 @@ coset = "0.3"
 
 # async runtime + http
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"] }
+tokio-util = { version = "0.7", features = ["io"] }
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+futures = "0.3"
 
 # serialization
 serde = { version = "1", features = ["derive"] }
@@ -67,6 +69,15 @@ async-trait = "0.1"
 
 # test helpers
 tempfile = "3"
+
+# Optimize dependencies even in dev builds. The crypto crates (aes, ghash, sha2,
+# sumo-crypto) are ~100x faster at opt-level 3 — with AES-NI codegen and inlining —
+# so streaming a bank image (hundreds of MB) through sumo-hub's encrypt-once is
+# quick even when the towers run as debug binaries. Workspace crates stay at
+# opt-level 0: fast incremental compiles, fully debuggable. This is the reason we
+# don't need a full `--release` build of the towers just for acceptable throughput.
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 strip = true

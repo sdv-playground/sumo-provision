@@ -181,9 +181,11 @@ mod tests {
     use sumo_onboard::decryptor::{InMemoryKeyUnwrap, StreamingDecryptor};
     use sumo_onboard::validator::Validator;
 
-    /// The whole signer path: encrypt-once → re-wrap the CEK to a device →
-    /// multi-component signed manifest → the device validates the sw-authority
-    /// signature and decrypts with its own key, recovering the plaintext.
+    /// The whole signer path: streaming encrypt-once → re-wrap the CEK to a
+    /// device → multi-component signed manifest → the device validates the
+    /// sw-authority signature and decrypts with its own key, recovering the
+    /// plaintext. Encrypts via the same streaming [`StreamEncryptor`] the content
+    /// store uses, so this proves the streamed ciphertext is decryptable on-device.
     #[test]
     fn encrypt_once_rewrap_build_validate_decrypt() {
         let crypto = RustCryptoBackend::new();
@@ -192,14 +194,22 @@ mod tests {
 
         let pt = b"vm1 kernel plaintext for the per-device envelope roundtrip";
 
-        // What Tower 2's content store does: encrypt once, keep CEK + IV.
-        let enc = encryptor::encrypt_firmware(pt, &[]).unwrap();
-        let iv = encryptor::extract_iv_from_enc_info(&enc.encryption_info).unwrap();
+        // What Tower 2's content store does: stream-encrypt once, keep CEK + IV.
+        let mut enc = crate::crypto::StreamEncryptor::new().unwrap();
+        let (cek, iv) = (enc.cek, enc.nonce);
+        let mut ciphertext = Vec::new();
+        let mut buf = Vec::new();
+        for chunk in pt.chunks(16) {
+            enc.update(chunk, &mut buf).unwrap();
+            ciphertext.extend_from_slice(&buf);
+        }
+        ciphertext.extend_from_slice(&enc.finish().unwrap());
+
         let part = EnvelopePart {
             id: "kernel".into(),
             inner: encryptor::sha256(pt),
             size: pt.len() as u64,
-            cek: enc.cek,
+            cek,
             iv,
         };
 
@@ -224,11 +234,9 @@ mod tests {
         let device_coset = coset::CoseKey::from_slice(&device.to_cose_key_bytes()).unwrap();
         let unwrap = InMemoryKeyUnwrap::new(&device_coset, &crypto);
         let mut decryptor = StreamingDecryptor::new(&manifest, 0, &unwrap, &crypto).unwrap();
-        let mut out = vec![0u8; enc.ciphertext.len() + 256];
+        let mut out = vec![0u8; ciphertext.len() + 256];
         let mut total = 0;
-        total += decryptor
-            .update(&enc.ciphertext, &mut out[total..])
-            .unwrap();
+        total += decryptor.update(&ciphertext, &mut out[total..]).unwrap();
         total += decryptor.finalize(&mut out[total..]).unwrap();
         assert_eq!(&out[..total], pt);
     }

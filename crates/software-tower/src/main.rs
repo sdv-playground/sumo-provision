@@ -112,8 +112,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/signer/pubkey", get(signer::signer_pubkey))
         .route("/admin/envelope", post(signer::create_envelope))
         .route("/blobs/{outer}", get(content::get_blob))
-        // Bank images are large (hundreds of MB) — lift axum's 2 MB body cap.
-        .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(args.bind).await?;

@@ -40,9 +40,33 @@ impl ContentHash {
         &self.0
     }
 
+    /// An incremental hasher, for content-addressing a stream without holding it
+    /// all in memory. Feed chunks with [`Hasher::update`], then [`Hasher::finalize`].
+    pub fn hasher() -> Hasher {
+        Hasher(Sha256::new())
+    }
+
     /// Render as `sha256:<hex>` — the canonical form on the wire and in URLs.
     pub fn to_prefixed(&self) -> String {
         format!("sha256:{}", hex::encode(self.0))
+    }
+}
+
+/// Incremental SHA-256 that yields a [`ContentHash`]; see [`ContentHash::hasher`].
+pub struct Hasher(Sha256);
+
+impl Hasher {
+    /// Feed the next chunk of bytes.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// Finish hashing and produce the content address.
+    pub fn finalize(self) -> ContentHash {
+        let digest = self.0.finalize();
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&digest);
+        ContentHash(buf)
     }
 }
 
