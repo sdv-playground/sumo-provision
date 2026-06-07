@@ -21,6 +21,7 @@ pub struct AppState {
     pub blobs: Arc<dyn BlobStore>,
     pub index: Arc<dyn ArtifactIndex>,
     pub pool: Option<sqlx::PgPool>,
+    pub signer: Arc<crate::signer::Signer>,
 }
 
 impl AppState {
@@ -101,6 +102,7 @@ pub async fn get_blob(
 #[derive(Debug)]
 pub enum AppError {
     BadHash,
+    BadRequest(String),
     NotFound,
     Internal(anyhow::Error),
 }
@@ -120,11 +122,15 @@ impl From<std::io::Error> for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
-            AppError::BadHash => (StatusCode::BAD_REQUEST, "invalid content hash"),
-            AppError::NotFound => (StatusCode::NOT_FOUND, "not found"),
+            AppError::BadHash => (StatusCode::BAD_REQUEST, "invalid content hash".to_string()),
+            AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             AppError::Internal(e) => {
                 tracing::error!(error = %e, "internal error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
         };
         (status, msg).into_response()
@@ -142,6 +148,7 @@ mod tests {
             blobs: Arc::new(FsBlobStore::new(dir.path())),
             index: Arc::new(MemIndex::default()),
             pool: None,
+            signer: Arc::new(crate::signer::Signer::generate().unwrap()),
         };
         (state, dir)
     }

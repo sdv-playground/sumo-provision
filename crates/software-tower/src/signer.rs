@@ -6,14 +6,21 @@
 //! each device's key (`rewrap_cek_ecdh`, no re-encryption) and the per-device
 //! manifest is signed with the sw-authority key.
 //!
-//! The struct is exercised end-to-end by the test below; it is wired into a
-//! `POST /admin/envelope` endpoint in the next slice.
-#![allow(dead_code)]
+//! Exposed as `GET /admin/signer/pubkey` (the trust anchor) and
+//! `POST /admin/envelope` (build a per-device envelope from stored parts).
 
+use axum::extract::State;
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::Deserialize;
 use sumo_offboard::cose_key::CoseKey;
 use sumo_offboard::image_builder::{ComponentSpec, MultiComponentBuilder};
 use sumo_offboard::recipient::Recipient;
 use sumo_offboard::{encryptor, keygen, OffboardError};
+use wire::ContentHash;
+
+use crate::content::{AppError, AppState};
 
 /// The sw-authority signing key (COSE ES256).
 pub struct Signer {
@@ -89,6 +96,81 @@ impl Signer {
         }
         builder.build(&self.key)
     }
+}
+
+// --- handlers --------------------------------------------------------------
+
+/// `POST /admin/envelope` body — build an envelope for one component, with each
+/// part's CEK re-wrapped to `device_pubkey`.
+#[derive(Deserialize)]
+pub struct NewEnvelope {
+    /// Device public key as hex of its COSE_Key CBOR (from the Tower 1 roster).
+    pub device_pubkey: String,
+    /// Device id — the recipient `kid`.
+    pub device_id: String,
+    /// The component being flashed, e.g. `"vm1"`.
+    pub component: String,
+    /// Parts to include — each an id + its content (inner hash).
+    pub parts: Vec<NewEnvelopePart>,
+    /// SUIT sequence number (anti-replay); the caller advances it.
+    #[serde(default = "default_seq")]
+    pub seq: u64,
+}
+
+#[derive(Deserialize)]
+pub struct NewEnvelopePart {
+    pub id: String,
+    pub content: ContentHash,
+}
+
+fn default_seq() -> u64 {
+    1
+}
+
+/// `GET /admin/signer/pubkey` — the sw-authority public key (COSE_Key CBOR), the
+/// trust anchor a rig pins to verify envelopes.
+pub async fn signer_pubkey(State(s): State<AppState>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/cbor")],
+        s.signer.public_key_cbor(),
+    )
+        .into_response()
+}
+
+/// `POST /admin/envelope` — build a signed SUIT envelope for one component's
+/// parts, each part's CEK re-wrapped to the device. Returns the manifest bytes;
+/// the caller fetches each part's ciphertext from `/blobs/{outer}` to upload
+/// alongside it.
+pub async fn create_envelope(
+    State(s): State<AppState>,
+    Json(req): Json<NewEnvelope>,
+) -> Result<Response, AppError> {
+    let device_pubkey = hex::decode(req.device_pubkey.trim())
+        .map_err(|_| AppError::BadRequest("device_pubkey must be hex".into()))?;
+    CoseKey::from_cose_key_bytes(&device_pubkey)
+        .map_err(|_| AppError::BadRequest("device_pubkey is not a valid COSE_Key".into()))?;
+    let mut parts = Vec::new();
+    for p in &req.parts {
+        let entry = s.index.get(&p.content).await?.ok_or(AppError::NotFound)?;
+        parts.push(EnvelopePart {
+            id: p.id.clone(),
+            inner: *p.content.as_bytes(),
+            size: entry.size,
+            cek: entry.cek,
+            iv: entry.nonce,
+        });
+    }
+    let envelope = s
+        .signer
+        .build_envelope(
+            &device_pubkey,
+            req.device_id.as_bytes(),
+            &req.component,
+            &parts,
+            req.seq,
+        )
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("envelope build failed: {e}")))?;
+    Ok(([(header::CONTENT_TYPE, "application/cbor")], envelope).into_response())
 }
 
 #[cfg(test)]

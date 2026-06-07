@@ -12,7 +12,7 @@ mod signer;
 mod store;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +45,15 @@ struct Args {
     /// Directory for the content-addressed blob store.
     #[arg(long, env = "SUMO_HUB_BLOB_DIR", default_value = "data/blobs")]
     blob_dir: PathBuf,
+
+    /// sw-authority signing key (COSE_Key CBOR). Generated + persisted here on
+    /// first run if absent.
+    #[arg(
+        long,
+        env = "SUMO_HUB_SIGNING_KEY",
+        default_value = "data/sw-authority.key"
+    )]
+    signing_key: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -76,10 +85,13 @@ async fn main() -> anyhow::Result<()> {
     sqlx::migrate!("./migrations").run(&pool).await?;
     tracing::info!("artifact index ready (postgres)");
 
+    let signer = Arc::new(load_or_generate_signer(&args.signing_key)?);
+
     let state = AppState {
         blobs: Arc::new(FsBlobStore::new(&args.blob_dir)),
         index: Arc::new(PgIndex::new(pool.clone())),
         pool: Some(pool),
+        signer,
     };
 
     let app = Router::new()
@@ -97,6 +109,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/admin/channels/{name}", put(releases::set_channel))
         .route("/channels/{name}/tree", get(releases::channel_tree))
+        .route("/admin/signer/pubkey", get(signer::signer_pubkey))
+        .route("/admin/envelope", post(signer::create_envelope))
         .route("/blobs/{outer}", get(content::get_blob))
         .with_state(state);
 
@@ -131,6 +145,25 @@ async fn connect_with_retry(url: &str) -> anyhow::Result<sqlx::PgPool> {
         "could not connect to postgres at {url}: {}",
         last_err.expect("loop ran at least once")
     ))
+}
+
+/// Load the sw-authority signing key from `path`, or generate + persist one on
+/// first run.
+fn load_or_generate_signer(path: &Path) -> anyhow::Result<signer::Signer> {
+    if path.exists() {
+        let bytes = std::fs::read(path)?;
+        signer::Signer::from_cbor(&bytes)
+            .map_err(|e| anyhow::anyhow!("invalid signing key {}: {e}", path.display()))
+    } else {
+        let s = signer::Signer::generate()
+            .map_err(|e| anyhow::anyhow!("signing keygen failed: {e}"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, s.to_cbor())?;
+        tracing::info!(path = %path.display(), "generated sw-authority signing key");
+        Ok(s)
+    }
 }
 
 async fn shutdown_signal() {
