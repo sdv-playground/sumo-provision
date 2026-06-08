@@ -178,6 +178,21 @@ pub struct ComponentApply {
     pub version: Option<String>,
     pub ship: Vec<ShipPart>,
     pub reuse: usize,
+    /// The component's rollback capability, from the twin's `x-sumo-update-mode`:
+    /// `Some(true)` = banked (reversible trial), `Some(false)` = singleshot
+    /// (irreversible), `None` = not reported. Drives the campaign's step grouping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_rollback: Option<bool>,
+}
+
+/// Total bytes a component would ship (sum of its resolved blob sizes).
+impl ComponentApply {
+    pub fn ship_bytes(&self) -> u64 {
+        self.ship
+            .iter()
+            .filter_map(|s| s.blob.as_ref().map(|b| b.size))
+            .sum()
+    }
 }
 
 /// The executable plan to bring a rig to a channel's desired state: per
@@ -225,7 +240,12 @@ impl ApplyPlan {
 /// resolves each shipped part against Tower 2's index — confirming Tower 2 can
 /// actually serve it and totalling the transfer. This is the read/resolve half
 /// of apply; flashing drives the SOVD `/updates` wire per component from it.
-pub async fn apply_plan(rig_url: &str, hub_url: &str, channel: &str) -> Result<ApplyPlan, Error> {
+pub async fn apply_plan(
+    rig_url: &str,
+    hub_url: &str,
+    channel: &str,
+    only: Option<&str>,
+) -> Result<ApplyPlan, Error> {
     let observed = read_rig_state(rig_url).await?;
     let hub = SoftwareClient::new(hub_url);
     let desired = hub
@@ -234,11 +254,15 @@ pub async fn apply_plan(rig_url: &str, hub_url: &str, channel: &str) -> Result<A
         .ok_or_else(|| Error::ChannelNotFound {
             channel: channel.to_string(),
         })?;
-    guard_update_modes(&observed, &desired)?;
     let plan = wire::flash_plan(&observed, &desired);
 
     let mut components = Vec::new();
     for (path, entity) in &desired.entities {
+        if let Some(o) = only {
+            if path != o {
+                continue;
+            }
+        }
         let mut ship = Vec::new();
         let mut reuse = 0;
         for p in plan.parts.iter().filter(|p| p.entity == *path) {
@@ -264,6 +288,11 @@ pub async fn apply_plan(rig_url: &str, hub_url: &str, channel: &str) -> Result<A
                 version: entity.version.clone(),
                 ship,
                 reuse,
+                supports_rollback: observed
+                    .entities
+                    .get(path)
+                    .and_then(|e| e.update_mode.as_ref())
+                    .map(|m| m.supports_rollback),
             });
         }
     }
@@ -271,35 +300,6 @@ pub async fn apply_plan(rig_url: &str, hub_url: &str, channel: &str) -> Result<A
         channel: channel.to_string(),
         components,
     })
-}
-
-/// Reject a campaign that mixes rollbackable (banked) and irreversible
-/// (singleshot, e.g. the HSM keystore) components — a rollback would leave the
-/// device undefined. Uses the twin's reported `x-sumo-update-mode`; components
-/// the device doesn't report (`None`) are skipped (graceful on older firmware).
-fn guard_update_modes(observed: &Tree, desired: &Tree) -> Result<(), Error> {
-    let mut rollbackable = Vec::new();
-    let mut irreversible = Vec::new();
-    for path in desired.entities.keys() {
-        if let Some(m) = observed
-            .entities
-            .get(path)
-            .and_then(|e| e.update_mode.as_ref())
-        {
-            if m.supports_rollback {
-                rollbackable.push(path.clone());
-            } else {
-                irreversible.push(path.clone());
-            }
-        }
-    }
-    if !rollbackable.is_empty() && !irreversible.is_empty() {
-        return Err(Error::MixedUpdateModes {
-            rollbackable,
-            irreversible,
-        });
-    }
-    Ok(())
 }
 
 // --- flash bundle (dry) ----------------------------------------------------
@@ -341,8 +341,9 @@ pub async fn flash_bundle(
     ca_url: &str,
     channel: &str,
     device_id: &str,
+    only: Option<&str>,
 ) -> Result<FlashBundle, Error> {
-    let plan = apply_plan(rig_url, hub_url, channel).await?;
+    let plan = apply_plan(rig_url, hub_url, channel, only).await?;
     let pubkey = device_pubkey(ca_url, device_id).await?;
 
     let hub = SoftwareClient::new(hub_url);
@@ -477,8 +478,9 @@ pub async fn build_flash_plan(
     ca_url: &str,
     channel: &str,
     device_id: &str,
+    only: Option<&str>,
 ) -> Result<(FlashPlan, Vec<u8>), Error> {
-    let plan = apply_plan(rig_url, hub_url, channel).await?;
+    let plan = apply_plan(rig_url, hub_url, channel, only).await?;
     let pubkey = device_pubkey(ca_url, device_id).await?;
     let hub = SoftwareClient::new(hub_url);
     let trust_anchor = hub.signer_pubkey().await?;
@@ -531,23 +533,66 @@ pub async fn flash_execute(
     ca_url: &str,
     channel: &str,
     device_id: &str,
+    only: Option<&str>,
     token: RigToken,
 ) -> Result<FlashResult, Error> {
     let (plan, trust_anchor) =
-        build_flash_plan(rig_url, hub_url, ca_url, channel, device_id).await?;
+        build_flash_plan(rig_url, hub_url, ca_url, channel, device_id, only).await?;
     let engine = FlashEngine::new(
         rig_url,
         Arc::new(token),
         trust_anchor,
         EngineTimeouts::default(),
     );
-    // The no-mix guard already ran offboard in apply_plan (guard_update_modes),
-    // so drive the phases directly: stage, then reset into trial.
+    // No-mix guard, scoped to this (possibly `--only`-filtered) plan: reject a
+    // mix of rollbackable + irreversible components, reading each job's
+    // x-sumo-update-mode off the device. `--only` is how a singleshot component
+    // (e.g. rt) flashes in its own transaction.
+    engine.guard(&plan).await?;
     let mut ecus = engine.stage_all(&plan).await?;
     engine.reset_all(&mut ecus).await?;
     Ok(FlashResult {
         channel: channel.to_string(),
         device: device_id.to_string(),
+        components: ecus.iter().map(component_result).collect(),
+    })
+}
+
+/// Install a pre-built, factory-signed HSM keystore SUIT on the rig's `hsm`
+/// component (the device's trust anchors — minted by Tower 1 from the device
+/// CSR). The SUIT is NOT a Tower-2 envelope: it carries an integrated
+/// `#hsm-keys` payload, so the job has no detached payloads. `trust_anchor` is
+/// the firmware signer pubkey (Tower 2's): the keystore is factory-signed, so it
+/// fails validation against that anchor and the engine treats it as opaque,
+/// uploading the manifest only — the device re-validates against the well-known
+/// factory key (mirrors `sumo-campaign flash hsm --trust-anchor`). The anchor
+/// must be a valid COSE_Key (an empty one panics the validator). `hsm` is
+/// singleshot, so staging completes it; no reset/trial. Flash this ALONE — never
+/// mixed with banked components. **Destructive: mutates the rig.**
+pub async fn flash_keystore(
+    rig_url: &str,
+    hsm_suit: Vec<u8>,
+    trust_anchor: Vec<u8>,
+    token: RigToken,
+) -> Result<FlashResult, Error> {
+    let plan = FlashPlan {
+        jobs: vec![FlashJob {
+            component_id: "hsm".to_string(),
+            gateway_id: None,
+            envelope: hsm_suit,
+            payloads: Vec::new(),
+        }],
+    };
+    let engine = FlashEngine::new(
+        rig_url,
+        Arc::new(token),
+        trust_anchor,
+        EngineTimeouts::default(),
+    );
+    let ecus = engine.stage_all(&plan).await?;
+    Ok(FlashResult {
+        channel: "(keystore)".to_string(),
+        device: String::new(),
         components: ecus.iter().map(component_result).collect(),
     })
 }
@@ -642,61 +687,5 @@ fn component_result(s: &EcuStatus) -> ComponentFlashResult {
         entity: s.component_id.clone(),
         update_id: s.update_id.clone(),
         state: format!("{:?}", s.state),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn mode(rollback: bool) -> Entity {
-        Entity {
-            update_mode: Some(UpdateMode {
-                mode: if rollback { "banked" } else { "singleshot" }.into(),
-                supports_rollback: rollback,
-                dual_bank: rollback,
-                reset_kind: "local".into(),
-            }),
-            ..Default::default()
-        }
-    }
-    fn tree(entries: Vec<(&str, Entity)>) -> Tree {
-        Tree {
-            entities: entries
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
-        }
-    }
-    fn desired(paths: &[&str]) -> Tree {
-        tree(paths.iter().map(|p| (*p, Entity::default())).collect())
-    }
-
-    #[test]
-    fn guard_rejects_rollbackable_mixed_with_irreversible() {
-        let observed = tree(vec![("vm1", mode(true)), ("hsm", mode(false))]);
-        assert!(matches!(
-            guard_update_modes(&observed, &desired(&["vm1", "hsm"])),
-            Err(Error::MixedUpdateModes { .. })
-        ));
-    }
-
-    #[test]
-    fn guard_allows_all_rollbackable() {
-        let observed = tree(vec![("vm1", mode(true)), ("vm2", mode(true))]);
-        assert!(guard_update_modes(&observed, &desired(&["vm1", "vm2"])).is_ok());
-    }
-
-    #[test]
-    fn guard_allows_irreversible_alone() {
-        let observed = tree(vec![("hsm", mode(false))]);
-        assert!(guard_update_modes(&observed, &desired(&["hsm"])).is_ok());
-    }
-
-    #[test]
-    fn guard_skips_components_with_unknown_mode() {
-        // hsm reports no mode (older firmware) → not counted, so no mix is seen.
-        let observed = tree(vec![("vm1", mode(true)), ("hsm", Entity::default())]);
-        assert!(guard_update_modes(&observed, &desired(&["vm1", "hsm"])).is_ok());
     }
 }

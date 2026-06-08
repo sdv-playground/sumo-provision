@@ -97,6 +97,31 @@ enum CaCmd {
         /// Device id.
         id: String,
     },
+    /// Enroll a registered device: submit its CSR (DER PKCS#10) and get back a
+    /// signed clientAuth device cert (the CSR response), stored in Tower 1.
+    Enroll {
+        /// Device id (register it first).
+        id: String,
+        /// Device CSR file (DER PKCS#10) — e.g. captured from the rig's
+        /// `hsm/x-sumo-csr`.
+        #[arg(long)]
+        csr: PathBuf,
+        /// Write the issued certificate PEM here (default: stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Mint a device's HSM trust-anchor keystore SUIT (sw-authority = Tower 2's
+    /// signer). Install it on the rig with `rig install-keystore`.
+    MintKeystore {
+        /// Device id (register + enroll it first, so it has a pubkey).
+        id: String,
+        /// Tower 2 base URL — to fetch the sw-authority signer pubkey.
+        #[arg(long, env = "SUMO_HUB_URL", default_value = "http://localhost:8081")]
+        hub_url: String,
+        /// Write the keystore SUIT here (default: stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -159,12 +184,36 @@ enum RigCmd {
         ca_url: String,
         #[command(flatten)]
         auth: AuthArgs,
+        /// Flash only this component (e.g. `rt`) — for a singleshot component that
+        /// must flash in its own transaction (the no-mix guard). Omit for all.
+        #[arg(long)]
+        only: Option<String>,
         /// Actually flash the rig over SOVD (destructive). Without it, dry.
         #[arg(long)]
         execute: bool,
         /// Emit the bundle / result as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Plan + run the campaign to bring the rig to a channel's target state:
+    /// groups the ship-set by update-mode into ordered transactions (each
+    /// singleshot component its own step, then the banked group), reports the
+    /// plan, and with `--execute` runs the steps in order.
+    Campaign {
+        /// Desired state from a Tower 2 channel.
+        #[arg(long)]
+        channel: String,
+        /// Tower 2 base URL.
+        #[arg(long, env = "SUMO_HUB_URL", default_value = "http://localhost:8081")]
+        hub_url: String,
+        /// Tower 1 base URL.
+        #[arg(long, env = "SUMO_CA_URL", default_value = "http://localhost:8080")]
+        ca_url: String,
+        #[command(flatten)]
+        auth: AuthArgs,
+        /// Actually run the campaign (destructive). Without it, just report the plan.
+        #[arg(long)]
+        execute: bool,
     },
     /// Commit a staged update once its trial boot is healthy.
     Commit {
@@ -197,6 +246,18 @@ enum RigCmd {
         /// The update id returned by `rig flash --execute`.
         #[arg(long)]
         update: String,
+        #[command(flatten)]
+        auth: AuthArgs,
+    },
+    /// Install a minted HSM trust-anchor keystore SUIT on the rig — the device
+    /// bootstrap; flash this before firmware on a factory-reset rig.
+    InstallKeystore {
+        /// The keystore SUIT file (from `ca mint-keystore`).
+        #[arg(long)]
+        suit: PathBuf,
+        /// Tower 2 base URL — for the firmware signer pubkey (the validator anchor).
+        #[arg(long, env = "SUMO_HUB_URL", default_value = "http://localhost:8081")]
+        hub_url: String,
         #[command(flatten)]
         auth: AuthArgs,
     },
@@ -311,6 +372,36 @@ async fn run_ca(args: CaArgs) -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("device '{id}' not registered"))?;
             print_device(&dev);
         }
+        CaCmd::Enroll { id, csr, out } => {
+            let csr_der = std::fs::read(&csr)?;
+            let resp = ca.enroll(&id, &csr_der).await?;
+            match &out {
+                Some(p) => {
+                    std::fs::write(p, resp.certificate_pem.as_bytes())?;
+                    eprintln!("wrote device cert to {}", p.display());
+                }
+                None => print!("{}", resp.certificate_pem),
+            }
+            eprintln!(
+                "enrolled '{}' — cert serial {} (expires {})",
+                resp.id, resp.serial, resp.not_after
+            );
+        }
+        CaCmd::MintKeystore { id, hub_url, out } => {
+            let sw_pubkey = SoftwareClient::new(&hub_url).signer_pubkey().await?;
+            let suit = ca.mint_keystore(&id, &hex::encode(sw_pubkey)).await?;
+            match &out {
+                Some(p) => {
+                    std::fs::write(p, &suit)?;
+                    eprintln!(
+                        "wrote keystore SUIT ({} bytes) to {}",
+                        suit.len(),
+                        p.display()
+                    );
+                }
+                None => std::io::stdout().write_all(&suit)?,
+            }
+        }
     }
     Ok(())
 }
@@ -360,7 +451,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             hub_url,
             json,
         } => {
-            let plan = orchestrator::apply_plan(&args.url, &hub_url, &channel).await?;
+            let plan = orchestrator::apply_plan(&args.url, &hub_url, &channel, None).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
@@ -372,6 +463,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             hub_url,
             ca_url,
             auth,
+            only,
             execute,
             json,
         } => {
@@ -383,6 +475,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     &ca_url,
                     &channel,
                     &auth.device,
+                    only.as_deref(),
                     token,
                 )
                 .await?;
@@ -398,6 +491,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     &ca_url,
                     &channel,
                     &auth.device,
+                    only.as_deref(),
                 )
                 .await?;
                 if json {
@@ -405,6 +499,73 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                 } else {
                     print_bundle(&bundle);
                 }
+            }
+        }
+        RigCmd::Campaign {
+            channel,
+            hub_url,
+            ca_url,
+            auth,
+            execute,
+        } => {
+            let plan = orchestrator::apply_plan(&args.url, &hub_url, &channel, None).await?;
+            let shipping: Vec<&orchestrator::ComponentApply> = plan
+                .components
+                .iter()
+                .filter(|c| !c.ship.is_empty())
+                .collect();
+            if shipping.is_empty() {
+                println!("up to date — nothing to flash for channel '{channel}'");
+                return Ok(());
+            }
+            // Singleshot (irreversible) components each flash in their own
+            // transaction; banked (reversible trial) ones flash together. Singleshot
+            // first — its node reboot must not interrupt a banked trial.
+            let (singleshot, banked): (Vec<&orchestrator::ComponentApply>, Vec<_>) = shipping
+                .into_iter()
+                .partition(|c| c.supports_rollback == Some(false));
+            print_campaign(&channel, &auth.device, &singleshot, &banked);
+            if !execute {
+                println!("\n(plan only — re-run with --execute to run the campaign)");
+                return Ok(());
+            }
+            // Step through: each singleshot alone, then the banked group. By the
+            // banked step the singleshots are committed + up-to-date, so a
+            // no-filter flash ships only the banked components.
+            for c in &singleshot {
+                println!("\n== campaign step: {} (singleshot) ==", c.entity);
+                let token = rig_token(&auth)?;
+                let r = orchestrator::flash_execute(
+                    &args.url,
+                    &hub_url,
+                    &ca_url,
+                    &channel,
+                    &auth.device,
+                    Some(c.entity.as_str()),
+                    token,
+                )
+                .await?;
+                print_flash_result(&r);
+            }
+            if !banked.is_empty() {
+                println!("\n== campaign step: banked VMs ==");
+                let token = rig_token(&auth)?;
+                let r = orchestrator::flash_execute(
+                    &args.url,
+                    &hub_url,
+                    &ca_url,
+                    &channel,
+                    &auth.device,
+                    None,
+                    token,
+                )
+                .await?;
+                print_flash_result(&r);
+            }
+            if banked.is_empty() {
+                println!("\ncampaign complete — all components committed (write-through).");
+            } else {
+                println!("\ncampaign complete — banked components in trial; commit when healthy.");
             }
         }
         RigCmd::Commit {
@@ -435,6 +596,23 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             let status = orchestrator::flash_reset(&args.url, &component, &update, token).await?;
             println!("{component} reset → {status}");
         }
+        RigCmd::InstallKeystore {
+            suit,
+            hub_url,
+            auth,
+        } => {
+            let token = rig_token(&auth)?;
+            let suit_bytes = std::fs::read(&suit)?;
+            let trust_anchor = SoftwareClient::new(&hub_url).signer_pubkey().await?;
+            let result =
+                orchestrator::flash_keystore(&args.url, suit_bytes, trust_anchor, token).await?;
+            for c in &result.components {
+                println!("hsm keystore → {}", c.state);
+            }
+            println!(
+                "keystore installed — the rig now trusts Tower 2's signer; flash firmware next."
+            );
+        }
     }
     Ok(())
 }
@@ -446,19 +624,23 @@ fn rig_token(auth: &AuthArgs) -> anyhow::Result<orchestrator::RigToken> {
     if let Some(t) = &auth.token {
         return Ok(orchestrator::RigToken::fixed(t.clone()));
     }
-    let minter_url = auth.minter_url.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("provide --token, or --minter-url + --operator-token to mint one")
-    })?;
-    let operator_token = auth
-        .operator_token
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("--minter-url requires --operator-token"))?;
-    Ok(orchestrator::RigToken::minting(
-        minter_url,
-        operator_token,
-        auth.device.clone(),
-        None,
-    ))
+    if let Some(minter_url) = auth.minter_url.as_deref() {
+        let operator_token = auth
+            .operator_token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--minter-url requires --operator-token"))?;
+        return Ok(orchestrator::RigToken::minting(
+            minter_url,
+            operator_token,
+            auth.device.clone(),
+            None,
+        ));
+    }
+    // No --token and no --minter-url: connect unauthenticated. The device SOVD
+    // does not enforce auth yet (JWT bearer is the direction; SOVDd's auth slice
+    // is future). When it lands, pass --token or --minter-url + --operator-token.
+    // No runtime note here — the device logs unauthenticated access itself.
+    Ok(orchestrator::RigToken::fixed(String::new()))
 }
 
 fn print_tree(tree: &wire::Tree) {
@@ -608,9 +790,48 @@ fn print_flash_result(r: &orchestrator::FlashResult) {
         let id = c.update_id.as_deref().unwrap_or("-");
         println!("  {:<8} {:<12} update {}", c.entity, c.state, id);
     }
-    println!(
-        "\nin trial — the rig rebooted into the staged bank. When healthy, finalize each:\n  rig commit --component <c> --update <id>   (or `rig rollback …` to revert)"
-    );
+    // Only banked components sit in a trial awaiting a verdict; singleshot
+    // (write-through) ones come back `Committed` with nothing to finalize, so the
+    // trial footer would be misleading for them. Print it only for trial states.
+    let in_trial = |s: &str| matches!(s, "Staged" | "AwaitingSystemReboot" | "Activated");
+    if r.components.iter().any(|c| in_trial(&c.state)) {
+        println!(
+            "\nin trial — the rig rebooted into the staged bank. When healthy, finalize each:\n  rig commit --component <c> --update <id>   (or `rig rollback …` to revert)"
+        );
+    }
+}
+
+/// Report the campaign plan: the ordered transactions to reach the target state,
+/// grouped by update-mode (singleshot components each alone, then the banked group).
+fn print_campaign(
+    channel: &str,
+    device: &str,
+    singleshot: &[&orchestrator::ComponentApply],
+    banked: &[&orchestrator::ComponentApply],
+) {
+    let steps = singleshot.len() + usize::from(!banked.is_empty());
+    println!("Campaign — bring '{device}' to channel '{channel}' in {steps} step(s):");
+    let mut n = 1;
+    for c in singleshot {
+        println!(
+            "  Step {n} (singleshot, irreversible): {} — {} part(s), {} — write-through + node reboot",
+            c.entity,
+            c.ship.len(),
+            human_size(c.ship_bytes())
+        );
+        n += 1;
+    }
+    if !banked.is_empty() {
+        let names: Vec<&str> = banked.iter().map(|c| c.entity.as_str()).collect();
+        let parts: usize = banked.iter().map(|c| c.ship.len()).sum();
+        let bytes: u64 = banked.iter().map(|c| c.ship_bytes()).sum();
+        println!(
+            "  Step {n} (banked, trial): {} — {} part(s), {} — flash → reboot → trial → commit",
+            names.join(", "),
+            parts,
+            human_size(bytes)
+        );
+    }
 }
 
 /// Render a byte count as a short human string (e.g. `1.2 MB`).

@@ -2,6 +2,7 @@
 //! the HTTP handlers that wrap them. Both directions stream — a bank image
 //! (hundreds of MB) is never held in memory in full.
 
+use std::io::Write;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -14,6 +15,12 @@ use wire::{ArtifactRef, ContentHash};
 
 use crate::crypto::StreamEncryptor;
 use crate::store::{ArtifactEntry, ArtifactIndex, BlobStore};
+
+/// zstd compression level for published artifacts — matches `sumo-offboard`'s
+/// producer default (`compress_firmware(_, 3, _)`), a good size/speed balance.
+/// No window-log override: the device-side decompressor (a full host, not an
+/// MCU) enforces no window cap, so zstd's default suffices.
+const ZSTD_LEVEL: i32 = 3;
 
 /// Shared state: the blob store, the artifact index, and the release/channel
 /// database pool (`None` in unit tests, which exercise the content store with an
@@ -34,17 +41,26 @@ impl AppState {
             .ok_or_else(|| AppError::Internal(anyhow::anyhow!("no database configured")))
     }
 
-    /// Encrypt-once, store, and index a streamed artifact. The request body is
-    /// read chunk by chunk; each chunk is hashed (plaintext → inner), encrypted,
-    /// hashed again (ciphertext → outer), and written to the blob sink — so the
-    /// artifact never sits in memory in full. Idempotent on the plaintext (inner)
-    /// hash: if the same bytes were already published, the freshly-encrypted temp
-    /// is dropped and the existing reference returned.
+    /// Compress-once, encrypt-once, store, and index a streamed artifact. The
+    /// request body is read chunk by chunk; each chunk is hashed (plaintext →
+    /// inner), zstd-compressed, encrypted, hashed again (ciphertext → outer), and
+    /// written to the blob sink — so the artifact never sits in memory in full.
+    /// The device sniffs the zstd frame magic in the first decrypted bytes and
+    /// decompresses (no manifest flag), so the stored blob just has to *be*
+    /// compressed; `inner`/`size` stay over the **plaintext** — the SUIT digest +
+    /// size the device verifies after decompression. Idempotent on the plaintext
+    /// (inner) hash: if the same bytes were already published, the freshly-built
+    /// temp is dropped and the existing reference returned.
     pub async fn publish_stream(&self, body: Body) -> Result<ArtifactRef, AppError> {
         let mut enc = StreamEncryptor::new()
             .map_err(|e| AppError::Internal(anyhow::anyhow!("encryptor init failed: {e}")))?;
         let cek = enc.cek;
         let nonce = enc.nonce;
+        // Stream the plaintext through zstd before the encryptor. We drain the
+        // encoder's output buffer each chunk so a 600 MB image never buffers in
+        // full — the encoder holds at most its working window plus one block.
+        let mut zenc = zstd::Encoder::new(Vec::new(), ZSTD_LEVEL)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("zstd init failed: {e}")))?;
 
         let mut inner_h = ContentHash::hasher();
         let mut outer_h = ContentHash::hasher();
@@ -56,11 +72,30 @@ impl AppState {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| AppError::BadRequest(format!("upload aborted: {e}")))?;
             inner_h.update(&chunk);
-            enc.update(&chunk, &mut ct)
+            size += chunk.len() as u64;
+            // Compress the plaintext, then encrypt only what zstd emitted this
+            // round. Small chunks often buffer inside zstd and emit nothing until a
+            // block completes — `compressed` is then empty and we skip the encrypt.
+            zenc.write_all(&chunk)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("compress failed: {e}")))?;
+            let compressed = std::mem::take(zenc.get_mut());
+            if !compressed.is_empty() {
+                enc.update(&compressed, &mut ct)
+                    .map_err(|e| AppError::Internal(anyhow::anyhow!("encrypt failed: {e}")))?;
+                outer_h.update(&ct);
+                sink.write_all(&ct).await?;
+            }
+        }
+        // Flush the zstd frame footer (and any buffered block), encrypt it, then
+        // append the trailing GCM tag.
+        let tail = zenc
+            .finish()
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("compress finalize failed: {e}")))?;
+        if !tail.is_empty() {
+            enc.update(&tail, &mut ct)
                 .map_err(|e| AppError::Internal(anyhow::anyhow!("encrypt failed: {e}")))?;
             outer_h.update(&ct);
             sink.write_all(&ct).await?;
-            size += chunk.len() as u64;
         }
         let tag = enc
             .finish()
@@ -215,14 +250,23 @@ mod tests {
         assert_eq!(aref.inner, ContentHash::of(&plaintext));
         assert_eq!(aref.size, plaintext.len() as u64);
 
-        // the blob is the ciphertext, content-addressed by the outer hash
+        // the blob is the compressed ciphertext, content-addressed by the outer hash
         let cipher = read_blob(&*state.blobs, &aref.outer).await.unwrap();
         assert_eq!(ContentHash::of(&cipher), aref.outer);
         assert_ne!(cipher, plaintext);
+        // compressed before encryption: the repetitive plaintext stores smaller
+        // than its own length (pre-fix the blob was plaintext-sized + 16).
+        assert!(
+            cipher.len() < plaintext.len(),
+            "blob ({} B) should compress below the {} B plaintext",
+            cipher.len(),
+            plaintext.len()
+        );
 
-        // and it decrypts back to the original using the indexed CEK
+        // it decrypts (indexed CEK) to the zstd frame, which decompresses to the original
         let entry = state.index.get(&aref.inner).await.unwrap().unwrap();
-        let dec = crypto::decrypt(&entry.cek, &entry.nonce, &cipher).unwrap();
+        let frame = crypto::decrypt(&entry.cek, &entry.nonce, &cipher).unwrap();
+        let dec = zstd::decode_all(frame.as_slice()).unwrap();
         assert_eq!(dec, plaintext);
     }
 
@@ -297,6 +341,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ContentHash::of(&cipher), aref.outer);
-        assert_eq!(cipher.len() as u64, aref.size + 16); // plaintext + GCM tag
+        // 20 MB of one repeated byte compresses to a tiny zstd frame — proof the
+        // publish path compresses before encrypting (pre-fix the blob was
+        // plaintext-sized: cipher.len() == aref.size + 16).
+        assert!(
+            (cipher.len() as u64) < aref.size / 100,
+            "expected a compressed blob far below the {} B plaintext, got {} B",
+            aref.size,
+            cipher.len()
+        );
     }
 }

@@ -6,7 +6,13 @@
 //! [`IdentityClient`] (Tower 1) add the per-tower operations, same pattern.
 
 use serde::{Deserialize, Serialize};
-use wire::{ArtifactRef, ContentHash, Device, RegisterDevice, Tree};
+use wire::{ArtifactRef, ContentHash, Device, EnrollResponse, RegisterDevice, Tree};
+
+/// `POST /admin/devices/{id}/keystore` body.
+#[derive(Serialize)]
+struct MintKeystoreReq<'a> {
+    sw_authority_pubkey: &'a str,
+}
 
 /// `POST /admin/envelope` request body (mirrors Tower 2's `NewEnvelope`).
 #[derive(Serialize)]
@@ -287,6 +293,44 @@ impl IdentityClient {
             return Ok(None);
         }
         Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
+    /// `POST /admin/devices/{id}/enroll` — submit the device CSR (DER PKCS#10);
+    /// Tower 1 issues + stores a `clientAuth` device cert and returns it.
+    pub async fn enroll(&self, id: &str, csr_der: &[u8]) -> Result<EnrollResponse, ClientError> {
+        Ok(self
+            .tower
+            .http
+            .post(format!("{}/admin/devices/{}/enroll", self.tower.base, id))
+            .body(csr_der.to_vec())
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// `POST /admin/devices/{id}/keystore` — mint the device's HSM trust-anchor
+    /// keystore SUIT. `sw_authority_pubkey` is Tower 2's signer pubkey (hex of
+    /// the COSE_Key CBOR). Returns the signed+encrypted SUIT bytes.
+    pub async fn mint_keystore(
+        &self,
+        id: &str,
+        sw_authority_pubkey: &str,
+    ) -> Result<Vec<u8>, ClientError> {
+        Ok(self
+            .tower
+            .http
+            .post(format!("{}/admin/devices/{}/keystore", self.tower.base, id))
+            .json(&MintKeystoreReq {
+                sw_authority_pubkey,
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .to_vec())
     }
 }
 

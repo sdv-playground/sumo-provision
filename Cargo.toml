@@ -25,6 +25,10 @@ sovd-client = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "m
 # external — shared SOVD flash execution engine (FlashPlan → guard → stage →
 # reset → verdict). rig is a thin adapter over it; campaign + onboard share it.
 sumo-sovd-flash-engine = { git = "https://github.com/sdv-playground/sumo-sovd.git", branch = "main" }
+# external — HSM keystore schema (HsmKeystore / KeySlot / payload::encode + the
+# factory signing keys + KeyRole). default-features=false → schema + enums only
+# (no suit/crypto, no sumo-rs pull). Tower 1 mints the keystore against this.
+hsm = { git = "https://github.com/sdv-playground/sumo-machine-manager.git", branch = "main", default-features = false }
 # external — sumo-rs SUIT toolkit (open-source): encrypt-once + per-device CEK
 # rewrap, manifest signing. Tower 2 reuses it so we don't fork the envelope format.
 sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
@@ -33,6 +37,10 @@ sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch 
 sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 coset = "0.3"
+# zstd: compress published artifacts *before* encrypt-once, matching sumo-offboard's
+# producer (level 3). The device sniffs the zstd frame magic in the first decrypted
+# bytes and decompresses — no manifest flag, so the blob just has to be compressed.
+zstd = "0.13"
 
 # async runtime + http
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"] }
@@ -57,7 +65,8 @@ anyhow = "1"
 thiserror = "1"
 
 # hashing + encoding
-sha2 = "0.10"
+# `oid` so Sha256: AssociatedOid — x509-cert needs it to emit ecdsa-with-SHA256.
+sha2 = { version = "0.10", features = ["oid"] }
 hex = "0.4"
 
 # database
@@ -66,6 +75,11 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # crypto
 aes-gcm = "0.10"
 rand = "0.8"
+# X.509 CA (Tower 1): sign the device CSR → a clientAuth device cert, on the
+# der/spki/p256 stack already in the lock (no openssl/ring). x509-cert 0.2 tracks der 0.7.
+x509-cert = { version = "0.2", features = ["std", "pem", "builder"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem", "std"] }
+const-oid = { version = "0.9", features = ["db"] }
 
 # trait helpers
 async-trait = "0.1"

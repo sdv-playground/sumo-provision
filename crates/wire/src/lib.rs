@@ -141,11 +141,20 @@ pub struct Device {
     /// Open device model/type, e.g. `"managed-cvc"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Lifecycle status, e.g. `"registered"`.
+    /// Lifecycle status, e.g. `"registered"` / `"enrolled"`.
     pub status: String,
-    /// The device's public key / CSR, once known (filled at enrollment).
+    /// The device's public key, once known (filled at enrollment).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pubkey: Option<String>,
+    /// The CA-issued device cert's serial (hex), once enrolled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_serial: Option<String>,
+    /// The device cert's expiry (RFC3339), once enrolled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_not_after: Option<String>,
+    /// SHA-256 fingerprint of the device cert (`sha256:<hex>`), once enrolled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_fingerprint: Option<String>,
 }
 
 /// `POST /admin/devices` body — register (or update) a device. Idempotent on
@@ -157,6 +166,22 @@ pub struct RegisterDevice {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pubkey: Option<String>,
+}
+
+/// `POST /admin/devices/{id}/enroll` response — the CA-signed device certificate
+/// issued from the device's CSR (the "CSR response"). Stored in Tower 1 and
+/// reusable later as the device's mTLS client identity.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EnrollResponse {
+    pub id: String,
+    /// The signed device certificate, PEM.
+    pub certificate_pem: String,
+    /// Certificate serial number (hex).
+    pub serial: String,
+    /// Expiry (RFC3339).
+    pub not_after: String,
+    /// SHA-256 fingerprint (`sha256:<hex>`).
+    pub fingerprint: String,
 }
 
 // --- vehicle model ---------------------------------------------------------

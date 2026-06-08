@@ -7,9 +7,13 @@
 //! Uses its own database (default `sumo_ca`) so its migrations stay independent
 //! of Tower 2's — the two towers can share one Postgres server, different DBs.
 
+mod ca;
 mod devices;
+mod keystore;
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::routing::{get, post};
@@ -36,6 +40,14 @@ struct Args {
         default_value = "postgres://sumo:dev-only-not-secret@localhost:5432/sumo_ca"
     )]
     database_url: String,
+
+    /// CA signing key (PKCS#8 DER, P-256). Generated on first run.
+    #[arg(long, env = "SUMO_CA_KEY", default_value = "data/ca-authority.key")]
+    ca_key: PathBuf,
+
+    /// CA root certificate (X.509 DER). Self-signed on first run.
+    #[arg(long, env = "SUMO_CA_CERT", default_value = "data/ca-cert.der")]
+    ca_cert: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -67,12 +79,19 @@ async fn main() -> anyhow::Result<()> {
     sqlx::migrate!("./migrations").run(&pool).await?;
     tracing::info!("device roster ready (postgres)");
 
-    let state = AppState { pool };
+    let ca = Arc::new(load_or_generate_ca(&args.ca_key, &args.ca_cert)?);
+    let state = AppState { pool, ca };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/version", get(version))
         .route("/admin/devices", post(devices::register_device))
+        .route("/admin/devices/{id}/enroll", post(devices::enroll_device))
+        .route(
+            "/admin/devices/{id}/keystore",
+            post(keystore::mint_keystore_endpoint),
+        )
+        .route("/admin/ca/cert", get(devices::ca_cert))
         .route("/devices", get(devices::list_devices))
         .route("/devices/{id}", get(devices::get_device))
         .with_state(state);
@@ -108,6 +127,20 @@ async fn connect_with_retry(url: &str) -> anyhow::Result<sqlx::PgPool> {
         "could not connect to postgres at {url}: {}",
         last_err.expect("loop ran at least once")
     ))
+}
+
+/// Load the device CA from disk, or generate + persist it on first run (mirrors
+/// Tower 2's signer bootstrap). The CA private key is crypto-critical — kept in
+/// the gitignored `data/` dir at `0600`.
+fn load_or_generate_ca(key: &Path, cert: &Path) -> anyhow::Result<ca::Ca> {
+    if key.exists() && cert.exists() {
+        ca::Ca::load(key, cert)
+    } else {
+        let authority = ca::Ca::generate()?;
+        authority.save(key, cert)?;
+        tracing::info!(key = %key.display(), cert = %cert.display(), "generated device CA root");
+        Ok(authority)
+    }
 }
 
 async fn shutdown_signal() {

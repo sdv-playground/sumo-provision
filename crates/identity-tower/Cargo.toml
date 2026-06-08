@@ -18,3 +18,15 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 sqlx = { workspace = true }
+hsm = { workspace = true }
+sumo-offboard = { workspace = true }
+coset = { workspace = true }
+x509-cert = { workspace = true }
+p256 = { workspace = true }
+const-oid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
