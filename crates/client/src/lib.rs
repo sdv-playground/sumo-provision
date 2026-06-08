@@ -208,6 +208,23 @@ impl SoftwareClient {
             .await?
             .to_vec())
     }
+
+    /// `GET /admin/signer/pubkey` — the sw-authority public key (COSE_Key CBOR).
+    /// This is the SUIT trust anchor: an envelope built by [`build_envelope`] is
+    /// signed by this key, so a verifier (e.g. the flash engine classifying the
+    /// manifest) validates against these bytes.
+    pub async fn signer_pubkey(&self) -> Result<Vec<u8>, ClientError> {
+        Ok(self
+            .tower
+            .http
+            .get(format!("{}/admin/signer/pubkey", self.tower.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .to_vec())
+    }
 }
 
 /// Tower 1 (identity) client: the base ops today. Enrollment and keystore

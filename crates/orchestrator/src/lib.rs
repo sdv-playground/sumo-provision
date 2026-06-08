@@ -7,9 +7,17 @@
 //! read/resolve half of apply. Minting from Tower 1 and driving the SOVD
 //! `/updates` flash land against the roadmap in `architecture.md`.
 
-use client::{ClientError, IdentityClient, SoftwareClient};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use client::{ClientError, IdentityClient, MinterClient, SoftwareClient};
 use serde::{Deserialize, Serialize};
-use sovd_client::{FlashClient, FlashConfig, FlashError, SovdClient, SovdClientError};
+use sovd_client::{SovdClient, SovdClientError};
+use sumo_sovd_flash_engine::{
+    EcuState, EcuStatus, EngineError, EngineTimeouts, FlashEngine, FlashJob, FlashPlan, Payload,
+    PayloadSource, TokenSource, UpdateType,
+};
+use tokio::sync::Mutex;
 use wire::{ContentHash, Entity, Part, Tree, UpdateMode};
 
 /// SOVD data resource carrying each VM's signed installed inventory.
@@ -24,8 +32,8 @@ pub enum Error {
     Sovd(#[from] SovdClientError),
     #[error("tower client error: {0}")]
     Client(#[from] ClientError),
-    #[error("flash error: {0}")]
-    Flash(#[from] FlashError),
+    #[error("flash engine error: {0}")]
+    Engine(#[from] EngineError),
     #[error("Tower 2 has no blob {outer} for a shipped part")]
     PayloadMissing { outer: String },
     #[error("channel '{channel}' not found on Tower 2")]
@@ -335,16 +343,7 @@ pub async fn flash_bundle(
     device_id: &str,
 ) -> Result<FlashBundle, Error> {
     let plan = apply_plan(rig_url, hub_url, channel).await?;
-
-    let device = IdentityClient::new(ca_url)
-        .get_device(device_id)
-        .await?
-        .ok_or_else(|| Error::DeviceNotFound {
-            id: device_id.to_string(),
-        })?;
-    let pubkey = device.pubkey.ok_or_else(|| Error::DeviceNoPubkey {
-        id: device_id.to_string(),
-    })?;
+    let pubkey = device_pubkey(ca_url, device_id).await?;
 
     let hub = SoftwareClient::new(hub_url);
     let mut components = Vec::new();
@@ -383,15 +382,82 @@ pub async fn flash_bundle(
 
 // --- flash execute (wet) ---------------------------------------------------
 
-/// One component's wet-flash result (staged to awaiting-verdict).
+/// Bearer-token source for the flash engine's SOVD calls — replaces the old
+/// `api_key`-as-Bearer hack. Either a token the operator supplied directly, or a
+/// per-device JWT minted from `sovd-token-helper`. Minting is cached for the run
+/// (one mint per flash, device-scoped `*`) — matching the single-token flow the
+/// fork used, and covering every component plus the engine's entity-root restart.
+pub enum RigToken {
+    /// A pre-supplied bearer JWT, used verbatim for every component.
+    Static(String),
+    /// Mint a per-device JWT (aud = device_id) on first use, then cache it.
+    Mint {
+        minter: MinterClient,
+        device_id: String,
+        ttl_secs: Option<u64>,
+        cached: Mutex<Option<String>>,
+    },
+}
+
+impl RigToken {
+    /// Use a fixed operator-supplied bearer token.
+    pub fn fixed(jwt: impl Into<String>) -> Self {
+        RigToken::Static(jwt.into())
+    }
+
+    /// Mint per-device JWTs from `minter_url` (operator-authenticated to `/mint`),
+    /// bound to `device_id` as the audience.
+    pub fn minting(
+        minter_url: impl Into<String>,
+        operator_token: impl Into<String>,
+        device_id: impl Into<String>,
+        ttl_secs: Option<u64>,
+    ) -> Self {
+        RigToken::Mint {
+            minter: MinterClient::new(minter_url, operator_token),
+            device_id: device_id.into(),
+            ttl_secs,
+            cached: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl TokenSource for RigToken {
+    async fn token(&self, _component_id: &str) -> Result<String, EngineError> {
+        match self {
+            RigToken::Static(jwt) => Ok(jwt.clone()),
+            RigToken::Mint {
+                minter,
+                device_id,
+                ttl_secs,
+                cached,
+            } => {
+                let mut guard = cached.lock().await;
+                if let Some(tok) = guard.as_ref() {
+                    return Ok(tok.clone());
+                }
+                let minted = minter
+                    .mint(device_id, &["*".to_string()], *ttl_secs)
+                    .await
+                    .map_err(|e| EngineError::Internal(format!("mint token: {e}")))?;
+                *guard = Some(minted.token.clone());
+                Ok(minted.token)
+            }
+        }
+    }
+}
+
+/// One component's flash result.
 #[derive(Debug, Clone, Serialize)]
 pub struct ComponentFlashResult {
     pub entity: String,
-    pub update_id: String,
-    pub status: String,
+    /// The `/updates` package id — pass to `commit`/`rollback` for the verdict.
+    pub update_id: Option<String>,
+    pub state: String,
 }
 
-/// The result of a wet flash across a channel's components.
+/// The result of a flash across a channel's components.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct FlashResult {
     pub channel: String,
@@ -399,32 +465,25 @@ pub struct FlashResult {
     pub components: Vec<ComponentFlashResult>,
 }
 
-/// Drive the SOVD `/updates` flash per component, authenticated with `jwt`: Tower
-/// 2 builds the signed envelope, then open_update → upload manifest + payloads
-/// (ciphertext from Tower 2) → prepare → execute (orchestrated, so banked
-/// components stage to awaiting-verdict). The verdict — reset + commit — is a
-/// separate step issued when the rig is safe. **Destructive: mutates the rig.**
-pub async fn flash_execute(
+/// Build the engine [`FlashPlan`] to bring the rig to `channel`'s desired state,
+/// plus the SUIT trust anchor the engine validates manifests against. For each
+/// shipping component: a Tower-2 signed envelope (CEK re-wrapped to the device)
+/// and its ciphertext payloads fetched from Tower 2. Payloads are buffered
+/// (`PayloadSource::Bytes`) — fine for the offboard orchestrator; the onboard
+/// adapter streams instead.
+pub async fn build_flash_plan(
     rig_url: &str,
     hub_url: &str,
     ca_url: &str,
     channel: &str,
     device_id: &str,
-    jwt: &str,
-) -> Result<FlashResult, Error> {
+) -> Result<(FlashPlan, Vec<u8>), Error> {
     let plan = apply_plan(rig_url, hub_url, channel).await?;
-    let device = IdentityClient::new(ca_url)
-        .get_device(device_id)
-        .await?
-        .ok_or_else(|| Error::DeviceNotFound {
-            id: device_id.to_string(),
-        })?;
-    let pubkey = device.pubkey.ok_or_else(|| Error::DeviceNoPubkey {
-        id: device_id.to_string(),
-    })?;
+    let pubkey = device_pubkey(ca_url, device_id).await?;
     let hub = SoftwareClient::new(hub_url);
+    let trust_anchor = hub.signer_pubkey().await?;
 
-    let mut components = Vec::new();
+    let mut jobs = Vec::new();
     for c in &plan.components {
         if c.ship.is_empty() {
             continue;
@@ -434,10 +493,7 @@ pub async fn flash_execute(
         let envelope = hub
             .build_envelope(&pubkey, device_id, &c.entity, &parts, 1)
             .await?;
-
-        let fc = flash_client(rig_url, &c.entity, jwt)?;
-        let update_id = fc.open_update_with(&c.entity, channel).await?;
-        fc.upload_part("manifest", &envelope).await?;
+        let mut payloads = Vec::new();
         for s in &c.ship {
             if let Some(b) = &s.blob {
                 let ciphertext =
@@ -446,73 +502,147 @@ pub async fn flash_execute(
                         .ok_or_else(|| Error::PayloadMissing {
                             outer: b.outer.to_prefixed(),
                         })?;
-                fc.upload_part(&format!("#{}", s.part), &ciphertext).await?;
+                payloads.push(Payload {
+                    uri: format!("#{}", s.part),
+                    source: PayloadSource::Bytes(ciphertext),
+                });
             }
         }
-        fc.prepare().await?;
-        let status = fc.execute(true).await?;
-        components.push(ComponentFlashResult {
-            entity: c.entity.clone(),
-            update_id,
-            status: status.status,
+        jobs.push(FlashJob {
+            component_id: c.entity.clone(),
+            gateway_id: None,
+            envelope,
+            payloads,
         });
     }
+    Ok((FlashPlan { jobs }, trust_anchor))
+}
+
+/// Drive the rig to `channel`'s desired state over SOVD via the shared flash
+/// engine: build the plan, stage every shipping component, then reset. The engine
+/// reads each component's `reset_kind` off the wire and coalesces a
+/// `RequiresEcuReset` (RT / host-OS) into a single node reboot — so the new
+/// firmware actually boots, in a reversible trial. The verdict — `commit` or
+/// `rollback` — is a separate step taken once the rig is confirmed healthy.
+/// **Destructive: mutates the rig.**
+pub async fn flash_execute(
+    rig_url: &str,
+    hub_url: &str,
+    ca_url: &str,
+    channel: &str,
+    device_id: &str,
+    token: RigToken,
+) -> Result<FlashResult, Error> {
+    let (plan, trust_anchor) =
+        build_flash_plan(rig_url, hub_url, ca_url, channel, device_id).await?;
+    let engine = FlashEngine::new(
+        rig_url,
+        Arc::new(token),
+        trust_anchor,
+        EngineTimeouts::default(),
+    );
+    // The no-mix guard already ran offboard in apply_plan (guard_update_modes),
+    // so drive the phases directly: stage, then reset into trial.
+    let mut ecus = engine.stage_all(&plan).await?;
+    engine.reset_all(&mut ecus).await?;
     Ok(FlashResult {
         channel: channel.to_string(),
         device: device_id.to_string(),
-        components,
+        components: ecus.iter().map(component_result).collect(),
     })
 }
 
 // --- verdict (reset / commit / rollback) -----------------------------------
 
-/// A `FlashClient` for one component, carrying the JWT as a `Bearer` header.
-fn flash_client(rig_url: &str, component: &str, jwt: &str) -> Result<FlashClient, Error> {
-    let config = FlashConfig::builder(rig_url)
-        .component_id(component)
-        .api_key_header("Authorization")
-        .api_key(format!("Bearer {jwt}"))
-        .build();
-    Ok(FlashClient::new(config)?)
-}
-
-/// Reset a component so it boots the staged (trial) bank — e.g. `reset_type =
-/// "hard"`. Issued when the rig is safe to reboot.
+/// Reset a staged component so it boots the trial bank — via the engine, which
+/// reads the component's `reset_kind` and either restarts it locally or reboots
+/// the parent ECU/node (`RequiresEcuReset`), then polls it to `Activated`.
+/// Normally `flash_execute` already does this; exposed as a manual escape hatch.
 pub async fn flash_reset(
     rig_url: &str,
     component: &str,
-    jwt: &str,
-    reset_type: &str,
+    update_id: &str,
+    token: RigToken,
 ) -> Result<String, Error> {
-    Ok(flash_client(rig_url, component, jwt)?
-        .ecu_reset(reset_type)
-        .await?
-        .status)
+    let engine = verdict_engine(rig_url, token);
+    let mut ecus = [ecu_status(component, update_id, EcuState::Staged)];
+    engine.reset_all(&mut ecus).await?;
+    Ok(format!("{:?}", ecus[0].state))
 }
 
-/// Commit a staged update once its trial boot is healthy: re-attach to the
-/// `update_id` and commit. Returns the terminal status.
+/// Commit a staged update once its trial boot is healthy: re-attach and commit.
 pub async fn flash_commit(
     rig_url: &str,
     component: &str,
     update_id: &str,
-    jwt: &str,
+    token: RigToken,
 ) -> Result<String, Error> {
-    let fc = flash_client(rig_url, component, jwt)?;
-    fc.attach(update_id).await?;
-    Ok(fc.spec_commit().await?.status)
+    let engine = verdict_engine(rig_url, token);
+    let mut ecus = [ecu_status(component, update_id, EcuState::Activated)];
+    engine.commit_all(&mut ecus).await?;
+    Ok(format!("{:?}", ecus[0].state))
 }
 
-/// Roll a staged update back: re-attach to the `update_id` and roll back.
+/// Roll a staged update back: re-attach and revert to the prior bank.
 pub async fn flash_rollback(
     rig_url: &str,
     component: &str,
     update_id: &str,
-    jwt: &str,
+    token: RigToken,
 ) -> Result<String, Error> {
-    let fc = flash_client(rig_url, component, jwt)?;
-    fc.attach(update_id).await?;
-    Ok(fc.spec_rollback().await?.status)
+    let engine = verdict_engine(rig_url, token);
+    let mut ecus = [ecu_status(component, update_id, EcuState::Activated)];
+    engine.rollback_all(&mut ecus).await?;
+    Ok(format!("{:?}", ecus[0].state))
+}
+
+// --- adapter helpers -------------------------------------------------------
+
+/// Resolve a device's registered public key from Tower 1.
+async fn device_pubkey(ca_url: &str, device_id: &str) -> Result<String, Error> {
+    let device = IdentityClient::new(ca_url)
+        .get_device(device_id)
+        .await?
+        .ok_or_else(|| Error::DeviceNotFound {
+            id: device_id.to_string(),
+        })?;
+    device.pubkey.ok_or_else(|| Error::DeviceNoPubkey {
+        id: device_id.to_string(),
+    })
+}
+
+/// An engine for the verdict verbs (reset/commit/rollback). These never classify
+/// a manifest, so the trust anchor is unused — an empty one is correct.
+fn verdict_engine(rig_url: &str, token: RigToken) -> FlashEngine {
+    FlashEngine::new(
+        rig_url,
+        Arc::new(token),
+        Vec::new(),
+        EngineTimeouts::default(),
+    )
+}
+
+/// A single-component [`EcuStatus`] reconstructed from CLI args, so the verdict
+/// verbs can drive the engine's per-phase methods one component at a time.
+fn ecu_status(component: &str, update_id: &str, state: EcuState) -> EcuStatus {
+    EcuStatus {
+        component_id: component.to_string(),
+        gateway_id: None,
+        state,
+        update_type: UpdateType::Firmware,
+        active_version: None,
+        previous_version: None,
+        error: None,
+        update_id: Some(update_id.to_string()),
+    }
+}
+
+fn component_result(s: &EcuStatus) -> ComponentFlashResult {
+    ComponentFlashResult {
+        entity: s.component_id.clone(),
+        update_id: s.update_id.clone(),
+        state: format!("{:?}", s.state),
+    }
 }
 
 #[cfg(test)]

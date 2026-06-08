@@ -22,6 +22,9 @@ orchestrator = { path = "crates/orchestrator" }
 
 # external — SOVD client lib (open-source; git-pinned now, published dep later)
 sovd-client = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+# external — shared SOVD flash execution engine (FlashPlan → guard → stage →
+# reset → verdict). rig is a thin adapter over it; campaign + onboard share it.
+sumo-sovd-flash-engine = { git = "https://github.com/sdv-playground/sumo-sovd.git", branch = "main" }
 # external — sumo-rs SUIT toolkit (open-source): encrypt-once + per-device CEK
 # rewrap, manifest signing. Tower 2 reuses it so we don't fork the envelope format.
 sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
