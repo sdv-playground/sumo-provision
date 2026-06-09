@@ -2494,7 +2494,7 @@ dependencies = [
 [[package]]
 name = "sovd-client"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#f6d865add79ae9569add9bb97e82000f4c46d78a"
+source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#fea0d8fdffaa3147cc053c99a919024231c95d00"
 dependencies = [
  "anyhow",
  "axum",
@@ -2517,7 +2517,7 @@ dependencies = [
 [[package]]
 name = "sovd-core"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#f6d865add79ae9569add9bb97e82000f4c46d78a"
+source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#fea0d8fdffaa3147cc053c99a919024231c95d00"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2829,7 +2829,7 @@ dependencies = [
 [[package]]
 name = "sumo-sovd-flash-engine"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#6b4c909d8b01b52bc406f7d7a17a71b899196a79"
+source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#648de09b5290f7d58b80db2f793df2378da599dd"
 dependencies = [
  "async-trait",
  "reqwest",
