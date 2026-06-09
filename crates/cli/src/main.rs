@@ -287,6 +287,17 @@ struct AuthArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Surface the flash engine's progress (per-payload upload size/time/throughput,
+    // staging, reset, commit) on stderr. Quiet by default for everything else;
+    // override with RUST_LOG (e.g. `RUST_LOG=info` or `=debug` for more detail).
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,sumo_sovd_flash_engine=info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .without_time()
+        .with_target(false)
+        .init();
+
     match Cli::parse().command {
         Command::Hub(args) => run_hub(args).await,
         Command::Ca(args) => run_ca(args).await,
@@ -480,13 +491,14 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     &channel,
                     &auth.device,
                     only.as_deref(),
+                    false, // `rig flash`: respect each component's declared reset_kind
                     token,
                 )
                 .await?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 } else {
-                    print_flash_result(&result);
+                    print_flash_result(&result, true);
                 }
             } else {
                 let bundle = orchestrator::flash_bundle(
@@ -550,10 +562,11 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     &channel,
                     &auth.device,
                     Some(c.entity.as_str()),
+                    false, // singleshot (rt) reboots via its own declared reset_kind
                     rig_token(&auth)?,
                 )
                 .await?;
-                print_flash_result(&r);
+                print_flash_result(&r, no_commit);
                 finalize_step(&args.url, &c.entity, &r, no_commit, &auth).await?;
             }
             if !banked.is_empty() {
@@ -565,10 +578,11 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     &channel,
                     &auth.device,
                     None,
+                    true, // banked step: activate the whole step with ONE node reboot
                     rig_token(&auth)?,
                 )
                 .await?;
-                print_flash_result(&r);
+                print_flash_result(&r, no_commit);
                 finalize_step(&args.url, "banked VMs", &r, no_commit, &auth).await?;
             }
             println!(
@@ -823,18 +837,29 @@ async fn finalize_step(
     no_commit: bool,
     auth: &AuthArgs,
 ) -> anyhow::Result<()> {
-    let trial: Vec<(&str, &str)> = r
+    // The step's banked components sit in `Activated` (trial); singleshot ones are
+    // already `Committed`. The trial is a step-level transaction, so commit (or roll
+    // back) the whole set in ONE engine verdict — not once per component.
+    let trial: Vec<(String, String)> = r
         .components
         .iter()
         .filter(|c| c.state == "Activated")
-        .filter_map(|c| c.update_id.as_deref().map(|id| (c.entity.as_str(), id)))
+        .filter_map(|c| {
+            c.update_id
+                .as_deref()
+                .map(|id| (c.entity.clone(), id.to_string()))
+        })
         .collect();
     if !step_came_up(r) {
         eprintln!("  step '{label}' unhealthy — an ECU did not come up; rolling back + aborting.");
-        for (entity, id) in &trial {
-            match orchestrator::flash_rollback(rig_url, entity, id, rig_token(auth)?).await {
-                Ok(s) => eprintln!("    rolled back {entity} → {s}"),
-                Err(e) => eprintln!("    rollback {entity} failed: {e}"),
+        if !trial.is_empty() {
+            match orchestrator::flash_rollback_all(rig_url, &trial, rig_token(auth)?).await {
+                Ok(rolled) => {
+                    for (entity, state) in rolled {
+                        eprintln!("    rolled back {entity} → {state}");
+                    }
+                }
+                Err(e) => eprintln!("    rollback failed: {e}"),
             }
         }
         anyhow::bail!("campaign aborted: step '{label}' left the system unhealthy");
@@ -842,14 +867,14 @@ async fn finalize_step(
     if no_commit || trial.is_empty() {
         return Ok(()); // singleshot is write-through; or operator wants a manual verdict
     }
-    for (entity, id) in &trial {
-        let status = orchestrator::flash_commit(rig_url, entity, id, rig_token(auth)?).await?;
-        println!("  committed {entity} (healthy) → {status}");
+    for (entity, state) in orchestrator::flash_commit_all(rig_url, &trial, rig_token(auth)?).await?
+    {
+        println!("  committed {entity} (healthy) → {state}");
     }
     Ok(())
 }
 
-fn print_flash_result(r: &orchestrator::FlashResult) {
+fn print_flash_result(r: &orchestrator::FlashResult, trial_hint: bool) {
     if r.components.is_empty() {
         println!("nothing flashed — up to date for channel '{}'", r.channel);
         return;
@@ -859,13 +884,14 @@ fn print_flash_result(r: &orchestrator::FlashResult) {
         let id = c.update_id.as_deref().unwrap_or("-");
         println!("  {:<8} {:<12} update {}", c.entity, c.state, id);
     }
-    // Only banked components sit in a trial awaiting a verdict; singleshot
-    // (write-through) ones come back `Committed` with nothing to finalize, so the
-    // trial footer would be misleading for them. Print it only for trial states.
+    // Banked components sit in a trial awaiting a verdict; singleshot ones come back
+    // `Committed`. Show the manual-verdict hint only when the caller won't finalize
+    // for us (`rig flash --execute`, or `campaign --no-commit`) — the auto-commit
+    // campaign reports its own commit, so the hint would contradict it.
     let in_trial = |s: &str| matches!(s, "Staged" | "AwaitingSystemReboot" | "Activated");
-    if r.components.iter().any(|c| in_trial(&c.state)) {
+    if trial_hint && r.components.iter().any(|c| in_trial(&c.state)) {
         println!(
-            "\nin trial — the rig rebooted into the staged bank. When healthy, finalize each:\n  rig commit --component <c> --update <id>   (or `rig rollback …` to revert)"
+            "\nin trial — the rig rebooted into the staged bank. When healthy, finalize:\n  ./commit.sh   (or `rig rollback …` to revert)"
         );
     }
 }

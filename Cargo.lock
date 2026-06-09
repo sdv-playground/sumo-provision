@@ -402,6 +402,8 @@ dependencies = [
  "orchestrator",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "wire",
 ]
 
@@ -2827,7 +2829,7 @@ dependencies = [
 [[package]]
 name = "sumo-sovd-flash-engine"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#e0475557b7058dc66f97940a227d8465d1971158"
+source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#6b4c909d8b01b52bc406f7d7a17a71b899196a79"
 dependencies = [
  "async-trait",
  "reqwest",

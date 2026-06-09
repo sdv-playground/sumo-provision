@@ -527,6 +527,7 @@ pub async fn build_flash_plan(
 /// firmware actually boots, in a reversible trial. The verdict — `commit` or
 /// `rollback` — is a separate step taken once the rig is confirmed healthy.
 /// **Destructive: mutates the rig.**
+#[allow(clippy::too_many_arguments)] // rig + two tower URLs, selectors, flags — all distinct
 pub async fn flash_execute(
     rig_url: &str,
     hub_url: &str,
@@ -534,16 +535,22 @@ pub async fn flash_execute(
     channel: &str,
     device_id: &str,
     only: Option<&str>,
+    reboot_to_activate: bool,
     token: RigToken,
 ) -> Result<FlashResult, Error> {
     let (plan, trust_anchor) =
         build_flash_plan(rig_url, hub_url, ca_url, channel, device_id, only).await?;
+    // `reboot_to_activate` (the workshop campaign) activates the whole step via one
+    // node reboot — both banks boot their new images together, no racy per-VM
+    // relaunch. The onboard/field path leaves it false (no orchestrator reboot;
+    // activation waits for the next power cycle).
     let engine = FlashEngine::new(
         rig_url,
         Arc::new(token),
         trust_anchor,
         EngineTimeouts::default(),
-    );
+    )
+    .with_force_ecu_reset(reboot_to_activate);
     // No-mix guard, scoped to this (possibly `--only`-filtered) plan: reject a
     // mix of rollbackable + irreversible components, reading each job's
     // x-sumo-update-mode off the device. `--only` is how a singleshot component
@@ -639,6 +646,45 @@ pub async fn flash_rollback(
     let mut ecus = [ecu_status(component, update_id, EcuState::Activated)];
     engine.rollback_all(&mut ecus).await?;
     Ok(format!("{:?}", ecus[0].state))
+}
+
+/// Commit a whole step's banked components in ONE verdict: the trial is a
+/// step-level transaction, so the engine's `commit_all` runs once over the set
+/// rather than once per component. `updates` is `(component, update_id)` pairs;
+/// returns each `(component, final state)`.
+pub async fn flash_commit_all(
+    rig_url: &str,
+    updates: &[(String, String)],
+    token: RigToken,
+) -> Result<Vec<(String, String)>, Error> {
+    let engine = verdict_engine(rig_url, token);
+    let mut ecus: Vec<EcuStatus> = updates
+        .iter()
+        .map(|(c, id)| ecu_status(c, id, EcuState::Activated))
+        .collect();
+    engine.commit_all(&mut ecus).await?;
+    Ok(ecus
+        .iter()
+        .map(|e| (e.component_id.clone(), format!("{:?}", e.state)))
+        .collect())
+}
+
+/// Roll a whole step's banked components back in ONE verdict — see [`flash_commit_all`].
+pub async fn flash_rollback_all(
+    rig_url: &str,
+    updates: &[(String, String)],
+    token: RigToken,
+) -> Result<Vec<(String, String)>, Error> {
+    let engine = verdict_engine(rig_url, token);
+    let mut ecus: Vec<EcuStatus> = updates
+        .iter()
+        .map(|(c, id)| ecu_status(c, id, EcuState::Activated))
+        .collect();
+    engine.rollback_all(&mut ecus).await?;
+    Ok(ecus
+        .iter()
+        .map(|e| (e.component_id.clone(), format!("{:?}", e.state)))
+        .collect())
 }
 
 // --- adapter helpers -------------------------------------------------------
