@@ -616,7 +616,7 @@ pub async fn flash_reset(
     update_id: &str,
     token: RigToken,
 ) -> Result<String, Error> {
-    let engine = verdict_engine(rig_url, token);
+    let engine = verdict_engine(rig_url, token, false);
     let mut ecus = [ecu_status(component, update_id, EcuState::Staged)];
     engine.reset_all(&mut ecus).await?;
     Ok(format!("{:?}", ecus[0].state))
@@ -629,7 +629,7 @@ pub async fn flash_commit(
     update_id: &str,
     token: RigToken,
 ) -> Result<String, Error> {
-    let engine = verdict_engine(rig_url, token);
+    let engine = verdict_engine(rig_url, token, false);
     let mut ecus = [ecu_status(component, update_id, EcuState::Activated)];
     engine.commit_all(&mut ecus).await?;
     Ok(format!("{:?}", ecus[0].state))
@@ -642,7 +642,7 @@ pub async fn flash_rollback(
     update_id: &str,
     token: RigToken,
 ) -> Result<String, Error> {
-    let engine = verdict_engine(rig_url, token);
+    let engine = verdict_engine(rig_url, token, false);
     let mut ecus = [ecu_status(component, update_id, EcuState::Activated)];
     engine.rollback_all(&mut ecus).await?;
     Ok(format!("{:?}", ecus[0].state))
@@ -657,7 +657,7 @@ pub async fn flash_commit_all(
     updates: &[(String, String)],
     token: RigToken,
 ) -> Result<Vec<(String, String)>, Error> {
-    let engine = verdict_engine(rig_url, token);
+    let engine = verdict_engine(rig_url, token, true);
     let mut ecus: Vec<EcuStatus> = updates
         .iter()
         .map(|(c, id)| ecu_status(c, id, EcuState::Activated))
@@ -675,7 +675,7 @@ pub async fn flash_rollback_all(
     updates: &[(String, String)],
     token: RigToken,
 ) -> Result<Vec<(String, String)>, Error> {
-    let engine = verdict_engine(rig_url, token);
+    let engine = verdict_engine(rig_url, token, true);
     let mut ecus: Vec<EcuStatus> = updates
         .iter()
         .map(|(c, id)| ecu_status(c, id, EcuState::Activated))
@@ -685,6 +685,25 @@ pub async fn flash_rollback_all(
         .iter()
         .map(|e| (e.component_id.clone(), format!("{:?}", e.state)))
         .collect())
+}
+
+/// Commit the whole node's in-trial set in ONE verdict, without enumerating
+/// components — the device resolves the in-trial set from NV. This is the
+/// manual `commit-trials` verb (and what `commit.sh` runs after a node-reboot
+/// update): the update *session* is the commit unit, never a single component.
+pub async fn flash_commit_trials(rig_url: &str, token: RigToken) -> Result<(), Error> {
+    verdict_engine(rig_url, token, true)
+        .commit_node_trials()
+        .await?;
+    Ok(())
+}
+
+/// Roll the whole node's in-trial set back in ONE verdict — see [`flash_commit_trials`].
+pub async fn flash_rollback_trials(rig_url: &str, token: RigToken) -> Result<(), Error> {
+    verdict_engine(rig_url, token, true)
+        .rollback_node_trials()
+        .await?;
+    Ok(())
 }
 
 // --- adapter helpers -------------------------------------------------------
@@ -704,13 +723,17 @@ async fn device_pubkey(ca_url: &str, device_id: &str) -> Result<String, Error> {
 
 /// An engine for the verdict verbs (reset/commit/rollback). These never classify
 /// a manifest, so the trust anchor is unused — an empty one is correct.
-fn verdict_engine(rig_url: &str, token: RigToken) -> FlashEngine {
+/// `force_ecu_reset` selects the node-level verdict (one verdict for the whole
+/// step, finalized from NV after a node reboot — the update *session* is the
+/// commit unit) over the per-component path (a live local-reset session).
+fn verdict_engine(rig_url: &str, token: RigToken, force_ecu_reset: bool) -> FlashEngine {
     FlashEngine::new(
         rig_url,
         Arc::new(token),
         Vec::new(),
         EngineTimeouts::default(),
     )
+    .with_force_ecu_reset(force_ecu_reset)
 }
 
 /// A single-component [`EcuStatus`] reconstructed from CLI args, so the verdict

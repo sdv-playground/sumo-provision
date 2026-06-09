@@ -241,6 +241,19 @@ enum RigCmd {
         #[command(flatten)]
         auth: AuthArgs,
     },
+    /// Commit the whole node's in-trial set in ONE verdict — the update session
+    /// is the commit unit, never a single component. Use this after a
+    /// node-reboot update (banked VMs): the device commits every component
+    /// currently in trial, resolved from NV (no per-component update id needed).
+    CommitTrials {
+        #[command(flatten)]
+        auth: AuthArgs,
+    },
+    /// Roll the whole node's in-trial set back in ONE verdict — see `commit-trials`.
+    RollbackTrials {
+        #[command(flatten)]
+        auth: AuthArgs,
+    },
     /// Reset a component so it boots its staged (trial) bank. `rig flash` already
     /// resets after staging; use this to re-issue the reboot for a staged update.
     Reset {
@@ -612,6 +625,16 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             let status =
                 orchestrator::flash_rollback(&args.url, &component, &update, token).await?;
             println!("{component} rolled back → {status}");
+        }
+        RigCmd::CommitTrials { auth } => {
+            let token = rig_token(&auth)?;
+            orchestrator::flash_commit_trials(&args.url, token).await?;
+            println!("node trials committed (the update session is the commit unit)");
+        }
+        RigCmd::RollbackTrials { auth } => {
+            let token = rig_token(&auth)?;
+            orchestrator::flash_rollback_trials(&args.url, token).await?;
+            println!("node trials rolled back");
         }
         RigCmd::Reset {
             component,
