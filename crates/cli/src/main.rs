@@ -214,6 +214,10 @@ enum RigCmd {
         /// Actually run the campaign (destructive). Without it, just report the plan.
         #[arg(long)]
         execute: bool,
+        /// Leave each banked step in trial instead of auto-committing it once the
+        /// system is healthy — for a manual verdict (`./commit.sh` / `rig commit`).
+        #[arg(long)]
+        no_commit: bool,
     },
     /// Commit a staged update once its trial boot is healthy.
     Commit {
@@ -507,6 +511,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             ca_url,
             auth,
             execute,
+            no_commit,
         } => {
             let plan = orchestrator::apply_plan(&args.url, &hub_url, &channel, None).await?;
             let shipping: Vec<&orchestrator::ComponentApply> = plan
@@ -529,12 +534,15 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                 println!("\n(plan only — re-run with --execute to run the campaign)");
                 return Ok(());
             }
-            // Step through: each singleshot alone, then the banked group. By the
-            // banked step the singleshots are committed + up-to-date, so a
-            // no-filter flash ships only the banked components.
+            // Step through: each singleshot alone, then the banked group. After each
+            // step, `finalize_step` gates on system health and (unless --no-commit)
+            // commits the banked trial BEFORE the next step — a multi-reboot chain
+            // must commit each good step rather than stack uncommitted trials (which
+            // the device's verdict watchdog would auto-revert). An unhealthy step
+            // rolls back and aborts the chain. By the banked step the singleshots are
+            // committed + up-to-date, so a no-filter flash ships only the banked ones.
             for c in &singleshot {
                 println!("\n== campaign step: {} (singleshot) ==", c.entity);
-                let token = rig_token(&auth)?;
                 let r = orchestrator::flash_execute(
                     &args.url,
                     &hub_url,
@@ -542,14 +550,14 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     &channel,
                     &auth.device,
                     Some(c.entity.as_str()),
-                    token,
+                    rig_token(&auth)?,
                 )
                 .await?;
                 print_flash_result(&r);
+                finalize_step(&args.url, &c.entity, &r, no_commit, &auth).await?;
             }
             if !banked.is_empty() {
                 println!("\n== campaign step: banked VMs ==");
-                let token = rig_token(&auth)?;
                 let r = orchestrator::flash_execute(
                     &args.url,
                     &hub_url,
@@ -557,16 +565,20 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     &channel,
                     &auth.device,
                     None,
-                    token,
+                    rig_token(&auth)?,
                 )
                 .await?;
                 print_flash_result(&r);
+                finalize_step(&args.url, "banked VMs", &r, no_commit, &auth).await?;
             }
-            if banked.is_empty() {
-                println!("\ncampaign complete — all components committed (write-through).");
-            } else {
-                println!("\ncampaign complete — banked components in trial; commit when healthy.");
-            }
+            println!(
+                "\ncampaign complete — {}",
+                if no_commit {
+                    "banked components in trial; commit when healthy (./commit.sh)."
+                } else {
+                    "each healthy step committed."
+                }
+            );
         }
         RigCmd::Commit {
             component,
@@ -778,6 +790,63 @@ fn print_bundle(b: &orchestrator::FlashBundle) {
         "would flash (per component): SOVD open_update → upload manifest + payloads → prepare → execute → commit"
     );
     println!("(dry run — no rig flash; the live flash authenticates to SOVD with a sovd-token-helper JWT)");
+}
+
+/// Minimal system-health gate for the campaign's per-step auto-commit.
+///
+/// NOTE — TO ELABORATE: "good system state" is not yet fully specified. The real
+/// gate should probe each running ECU's own health (heartbeat / app-level
+/// liveness) and confirm the WHOLE system came back after a node reboot, not just
+/// the components this step touched. For now we use the minimal definition agreed
+/// with the operator: every component this step reset came back up — the engine
+/// drove each to `Activated` (banked trial) or `Committed` (singleshot
+/// write-through), none left `Failed`/`RolledBack`. `flash_execute` already polls
+/// that, so an all-came-up result IS "each running ECU came up again". Grow the
+/// health contract here when it's defined.
+fn step_came_up(r: &orchestrator::FlashResult) -> bool {
+    !r.components.is_empty()
+        && r.components
+            .iter()
+            .all(|c| matches!(c.state.as_str(), "Activated" | "Committed"))
+}
+
+/// Health-gate a finished campaign step, then (unless `no_commit`) commit its
+/// banked trial so the next step builds on a committed baseline. Banked
+/// components sit in `Activated` (trial) and need an explicit commit; singleshot
+/// ones are already `Committed` (write-through), nothing to do. An unhealthy step
+/// rolls back whatever reached trial and aborts the campaign — never proceed on a
+/// bad baseline.
+async fn finalize_step(
+    rig_url: &str,
+    label: &str,
+    r: &orchestrator::FlashResult,
+    no_commit: bool,
+    auth: &AuthArgs,
+) -> anyhow::Result<()> {
+    let trial: Vec<(&str, &str)> = r
+        .components
+        .iter()
+        .filter(|c| c.state == "Activated")
+        .filter_map(|c| c.update_id.as_deref().map(|id| (c.entity.as_str(), id)))
+        .collect();
+    if !step_came_up(r) {
+        eprintln!("  step '{label}' unhealthy — an ECU did not come up; rolling back + aborting.");
+        for (entity, id) in &trial {
+            match orchestrator::flash_rollback(rig_url, entity, id, rig_token(auth)?).await {
+                Ok(s) => eprintln!("    rolled back {entity} → {s}"),
+                Err(e) => eprintln!("    rollback {entity} failed: {e}"),
+            }
+        }
+        anyhow::bail!("campaign aborted: step '{label}' left the system unhealthy");
+    }
+    if no_commit || trial.is_empty() {
+        return Ok(()); // singleshot is write-through; or operator wants a manual verdict
+    }
+    for (entity, id) in &trial {
+        let status = orchestrator::flash_commit(rig_url, entity, id, rig_token(auth)?).await?;
+        println!("  committed {entity} (healthy) → {status}");
+    }
+    Ok(())
 }
 
 fn print_flash_result(r: &orchestrator::FlashResult) {
