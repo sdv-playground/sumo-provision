@@ -23,3 +23,6 @@
 # Editor / OS
 .DS_Store
 *.swp
+
+# Per-dev working notes, not version-controlled
+tasks/
