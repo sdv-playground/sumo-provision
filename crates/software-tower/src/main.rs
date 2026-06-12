@@ -164,6 +164,11 @@ fn load_or_generate_signer(path: &Path) -> anyhow::Result<signer::Signer> {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, s.to_cbor())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         tracing::info!(path = %path.display(), "generated sw-authority signing key");
         Ok(s)
     }
