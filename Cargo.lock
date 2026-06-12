@@ -2828,7 +2828,7 @@ dependencies = [
 [[package]]
 name = "sumo-sovd-flash-engine"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#a35e599320cc2576848c6f1bb412894de0320650"
+source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#8c908cc600e787c45186e696720bec197be78e21"
 dependencies = [
  "async-trait",
  "reqwest",
