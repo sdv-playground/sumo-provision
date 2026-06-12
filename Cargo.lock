@@ -2493,7 +2493,7 @@ dependencies = [
 [[package]]
 name = "sovd-client"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#7226fdbcbe60543951605e8486a3399f96008890"
+source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#9aa69eadb137a444b8f16dfaa77d853b3c95629d"
 dependencies = [
  "anyhow",
  "axum",
@@ -2516,7 +2516,7 @@ dependencies = [
 [[package]]
 name = "sovd-core"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#7226fdbcbe60543951605e8486a3399f96008890"
+source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#9aa69eadb137a444b8f16dfaa77d853b3c95629d"
 dependencies = [
  "async-trait",
  "bytes",
