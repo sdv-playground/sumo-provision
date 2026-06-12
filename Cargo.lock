@@ -1097,7 +1097,7 @@ dependencies = [
 [[package]]
 name = "hsm"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#3ee32367fe595d9f9477c769f76dfb78518267d7"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#e2c0d0ca3e9c4e61fd0f3a522c6088c5dacd57c8"
 dependencies = [
  "ciborium",
  "coset",
@@ -2493,7 +2493,7 @@ dependencies = [
 [[package]]
 name = "sovd-client"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#9eb1a9ab3a8cca410ca6834f7c9e20c32dec4d3b"
+source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#7226fdbcbe60543951605e8486a3399f96008890"
 dependencies = [
  "anyhow",
  "axum",
@@ -2516,7 +2516,7 @@ dependencies = [
 [[package]]
 name = "sovd-core"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#9eb1a9ab3a8cca410ca6834f7c9e20c32dec4d3b"
+source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#7226fdbcbe60543951605e8486a3399f96008890"
 dependencies = [
  "async-trait",
  "bytes",
