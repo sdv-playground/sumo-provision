@@ -2767,7 +2767,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sumo-codec"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
 dependencies = [
  "ciborium",
  "coset",
@@ -2776,7 +2776,7 @@ dependencies = [
 [[package]]
 name = "sumo-crypto"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2797,7 +2797,7 @@ dependencies = [
 [[package]]
 name = "sumo-offboard"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
 dependencies = [
  "ciborium",
  "coset",
@@ -2816,7 +2816,7 @@ dependencies = [
 [[package]]
 name = "sumo-onboard"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
 dependencies = [
  "ciborium",
  "coset",
@@ -2828,7 +2828,7 @@ dependencies = [
 [[package]]
 name = "sumo-sovd-flash-engine"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#281acd9c4a7df79b16042dbfd3ef4323f7fac742"
+source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#a35e599320cc2576848c6f1bb412894de0320650"
 dependencies = [
  "async-trait",
  "reqwest",
