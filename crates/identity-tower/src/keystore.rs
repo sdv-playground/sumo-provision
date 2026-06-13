@@ -105,9 +105,15 @@ pub fn mint_keystore(
         } else {
             Some(match role {
                 KeyRole::SoftwareAuthority => sw_authority_sec1.to_vec(),
-                // key-authority + platform/application all default to this CA's
-                // key for the dev flow; only firmware (sw-authority) is load-
-                // bearing here. Add distinct anchors when those tiers go live.
+                // Dev HC issuer = the well-known factory key (scalar=1, public):
+                // any dev tooling can mint a FactoryReset token, so a dev rig is
+                // always resettable even if Tower 1's storage is lost. Production
+                // swaps in the real Tower-1/OEM HC root here (then key-escrowed).
+                // See docs/design/authorization.md §6.
+                KeyRole::HighConsequenceIssuer => FACTORY_SIGNING_PUBLIC.to_vec(),
+                // key-authority + platform/application/operational-issuer default
+                // to this CA's key for the dev flow; only firmware (sw-authority)
+                // is load-bearing here. Add distinct anchors when those tiers go live.
                 _ => key_authority_pub_sec1.to_vec(),
             })
         };
