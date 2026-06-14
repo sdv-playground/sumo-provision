@@ -48,6 +48,20 @@ struct Args {
     /// CA root certificate (X.509 DER). Self-signed on first run.
     #[arg(long, env = "SUMO_CA_CERT", default_value = "data/ca-cert.der")]
     ca_cert: PathBuf,
+
+    /// Identity-root CA signing key (PKCS#8 DER, P-256). Generated on first run.
+    /// A DISTINCT CA from the key-authority above — it signs device TLS leaf
+    /// certs; its root is the fleet-wide identity trust anchor.
+    #[arg(long, env = "SUMO_IDENTITY_KEY", default_value = "data/identity.key")]
+    identity_key: PathBuf,
+
+    /// Identity-root CA certificate (X.509 DER). Self-signed on first run.
+    #[arg(
+        long,
+        env = "SUMO_IDENTITY_CERT",
+        default_value = "data/identity-cert.der"
+    )]
+    identity_cert: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -79,8 +93,21 @@ async fn main() -> anyhow::Result<()> {
     sqlx::migrate!("./migrations").run(&pool).await?;
     tracing::info!("device roster ready (postgres)");
 
-    let ca = Arc::new(load_or_generate_ca(&args.ca_key, &args.ca_cert)?);
-    let state = AppState { pool, ca };
+    let key_authority_ca = Arc::new(load_or_generate_ca(
+        &args.ca_key,
+        &args.ca_cert,
+        ca::KEY_AUTHORITY_ROOT_DN,
+    )?);
+    let identity_ca = Arc::new(load_or_generate_ca(
+        &args.identity_key,
+        &args.identity_cert,
+        ca::IDENTITY_ROOT_DN,
+    )?);
+    let state = AppState {
+        pool,
+        key_authority_ca,
+        identity_ca,
+    };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -132,13 +159,13 @@ async fn connect_with_retry(url: &str) -> anyhow::Result<sqlx::PgPool> {
 /// Load the device CA from disk, or generate + persist it on first run (mirrors
 /// Tower 2's signer bootstrap). The CA private key is crypto-critical — kept in
 /// the gitignored `data/` dir at `0600`.
-fn load_or_generate_ca(key: &Path, cert: &Path) -> anyhow::Result<ca::Ca> {
+fn load_or_generate_ca(key: &Path, cert: &Path, root_dn: &str) -> anyhow::Result<ca::Ca> {
     if key.exists() && cert.exists() {
         ca::Ca::load(key, cert)
     } else {
-        let authority = ca::Ca::generate()?;
+        let authority = ca::Ca::generate(root_dn)?;
         authority.save(key, cert)?;
-        tracing::info!(key = %key.display(), cert = %cert.display(), "generated device CA root");
+        tracing::info!(key = %key.display(), cert = %cert.display(), dn = root_dn, "generated CA root");
         Ok(authority)
     }
 }

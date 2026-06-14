@@ -16,7 +16,12 @@ use crate::ca::Ca;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
-    pub ca: Arc<Ca>,
+    /// Signs HSM key material (keystore envelopes); its public half is the
+    /// `key-authority` anchor provisioned into each device.
+    pub key_authority_ca: Arc<Ca>,
+    /// Signs device TLS leaf certs — the identity root, a distinct CA whose root
+    /// every node pins to verify a peer's leaf.
+    pub identity_ca: Arc<Ca>,
 }
 
 /// The roster columns projected into a [`wire::Device`].
@@ -53,9 +58,10 @@ pub async fn enroll_device(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<EnrollResponse>, AppError> {
-    let issued =
-        s.ca.issue_leaf(&id, &body)
-            .map_err(|e| AppError::BadRequest(format!("CSR rejected: {e}")))?;
+    let issued = s
+        .identity_ca
+        .issue_leaf(&id, &body)
+        .map_err(|e| AppError::BadRequest(format!("CSR rejected: {e}")))?;
     // Store the device pubkey as hex(COSE_Key) — the form Tower 2's build_envelope
     // and the keystore mint both consume (not the raw SEC1 point from the CSR).
     let sec1: [u8; 65] = hex::decode(&issued.pubkey_hex)
@@ -89,11 +95,12 @@ pub async fn enroll_device(
     }))
 }
 
-/// `GET /admin/ca/cert` — the CA root certificate (PEM). The trust anchor a
-/// verifier pins to validate the device certs this CA issues (e.g. an MQTT
-/// broker's client-cert trust store).
+/// `GET /admin/ca/cert` — the device **identity root** certificate (PEM). The
+/// trust anchor a verifier pins to validate the device certs this tower issues
+/// (a peer node's vHSM, an MQTT broker's client-cert trust store). Distinct from
+/// the key-authority root, which is provisioned into the device keystore instead.
 pub async fn ca_cert(State(s): State<AppState>) -> Result<impl IntoResponse, AppError> {
-    let pem = s.ca.root_cert_pem().map_err(AppError::Internal)?;
+    let pem = s.identity_ca.root_cert_pem().map_err(AppError::Internal)?;
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/x-pem-file")],
         pem,

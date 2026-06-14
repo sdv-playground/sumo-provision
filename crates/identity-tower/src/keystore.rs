@@ -65,7 +65,10 @@ pub async fn mint_keystore_endpoint(
         .map_err(|_| AppError::BadRequest("device pubkey is not hex".into()))?;
     let sw_authority_cose = hex::decode(req.sw_authority_pubkey.trim())
         .map_err(|_| AppError::BadRequest("sw_authority_pubkey is not hex".into()))?;
-    let ka_sec1 = s.ca.public_sec1().map_err(AppError::Internal)?;
+    let ka_sec1 = s
+        .key_authority_ca
+        .public_sec1()
+        .map_err(AppError::Internal)?;
 
     let suit = mint_keystore(
         &device_decrypt_cose,

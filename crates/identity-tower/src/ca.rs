@@ -24,7 +24,14 @@ use x509_cert::spki::SubjectPublicKeyInfoOwned;
 use x509_cert::time::Validity;
 use x509_cert::Certificate;
 
-const ROOT_DN: &str = "CN=sumo-ca root,O=sumo";
+/// The key-authority root DN — signs HSM key material (keystore envelopes); its
+/// public half is the `key-authority` anchor provisioned into each device.
+pub const KEY_AUTHORITY_ROOT_DN: &str = "CN=sumo-ca root,O=sumo";
+/// The device **identity** root DN — a DISTINCT CA: it signs device TLS leaf
+/// certs, and its public half is the fleet-wide identity trust anchor every node
+/// pins to verify a peer's leaf. Kept separate from key-authority and
+/// sw-authority so the identity trust domain never overlaps the others.
+pub const IDENTITY_ROOT_DN: &str = "CN=sumo identity root,O=sumo";
 const ROOT_VALIDITY: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
 const LEAF_VALIDITY: Duration = Duration::from_secs(825 * 24 * 3600); // CA/B max
 
@@ -47,9 +54,9 @@ pub struct IssuedCert {
 
 impl Ca {
     /// Generate a fresh P-256 CA: random key + self-signed root.
-    pub fn generate() -> anyhow::Result<Self> {
+    pub fn generate(root_dn: &str) -> anyhow::Result<Self> {
         let signing_key = SigningKey::random(&mut OsRng);
-        let issuer = Name::from_str(ROOT_DN)?;
+        let issuer = Name::from_str(root_dn)?;
         let spki = SubjectPublicKeyInfoOwned::from_key(*signing_key.verifying_key())?;
         let builder = CertificateBuilder::new(
             Profile::Root,
@@ -211,7 +218,7 @@ mod tests {
 
     #[test]
     fn issues_clientauth_leaf_that_chains_to_root() {
-        let ca = Ca::generate().unwrap();
+        let ca = Ca::generate(KEY_AUTHORITY_ROOT_DN).unwrap();
         let (_dk, csr) = fixture_csr("rig-001");
         let issued = ca.issue_leaf("rig-001", &csr).unwrap();
 
@@ -237,7 +244,7 @@ mod tests {
 
     #[test]
     fn rejects_tampered_csr() {
-        let ca = Ca::generate().unwrap();
+        let ca = Ca::generate(KEY_AUTHORITY_ROOT_DN).unwrap();
         let (_dk, mut csr) = fixture_csr("rig-002");
         let n = csr.len();
         csr[n - 1] ^= 0xff; // corrupt the signature
@@ -249,9 +256,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("ca-authority.key");
         let cert = dir.path().join("ca-cert.der");
-        let ca = Ca::generate().unwrap();
+        let ca = Ca::generate(KEY_AUTHORITY_ROOT_DN).unwrap();
         ca.save(&key, &cert).unwrap();
         let reloaded = Ca::load(&key, &cert).unwrap();
         assert_eq!(reloaded.issuer, ca.issuer);
+    }
+
+    #[test]
+    fn identity_root_is_distinct_from_key_authority() {
+        let key_authority = Ca::generate(KEY_AUTHORITY_ROOT_DN).unwrap();
+        let identity = Ca::generate(IDENTITY_ROOT_DN).unwrap();
+        // Distinct keys → distinct trust domains.
+        assert_ne!(
+            key_authority.public_sec1().unwrap(),
+            identity.public_sec1().unwrap()
+        );
+
+        // A device leaf chains to the IDENTITY root, never the key-authority one.
+        let (_dk, csr) = fixture_csr("node-7");
+        let issued = identity.issue_leaf("node-7", &csr).unwrap();
+        let leaf = Certificate::from_der(&issued.der).unwrap();
+        assert_eq!(leaf.tbs_certificate.issuer, identity.issuer);
+        assert_ne!(leaf.tbs_certificate.issuer, key_authority.issuer);
+        assert!(format!("{}", identity.issuer).contains("identity root"));
     }
 }
