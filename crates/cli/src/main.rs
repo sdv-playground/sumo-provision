@@ -127,6 +127,14 @@ enum CaCmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Fetch the identity-root CA certificate (PEM) — the fleet trust anchor a
+    /// node pins to verify a peer's `tls-identity` leaf. Ship it in the policy
+    /// partition's `roots/` as `device-identity-root.pem`.
+    CaCert {
+        /// Write the PEM here (default: stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -445,6 +453,16 @@ async fn run_ca(args: CaArgs) -> anyhow::Result<()> {
                     );
                 }
                 None => std::io::stdout().write_all(&suit)?,
+            }
+        }
+        CaCmd::CaCert { out } => {
+            let pem = ca.ca_cert().await?;
+            match &out {
+                Some(p) => {
+                    std::fs::write(p, pem.as_bytes())?;
+                    eprintln!("wrote identity-root CA cert to {}", p.display());
+                }
+                None => print!("{pem}"),
             }
         }
     }

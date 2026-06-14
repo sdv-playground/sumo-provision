@@ -342,6 +342,22 @@ impl IdentityClient {
             .await?
             .to_vec())
     }
+
+    /// `GET /admin/ca/cert` — the identity-root CA certificate (PEM). This is the
+    /// fleet trust anchor a node pins to verify a peer's `tls-identity` leaf in
+    /// cross-node mTLS — a DISTINCT CA from `key-authority`/`sw-authority`. Ship
+    /// it in the policy partition's `roots/` as `device-identity-root.pem`.
+    pub async fn ca_cert(&self) -> Result<String, ClientError> {
+        Ok(self
+            .tower
+            .http
+            .get(format!("{}/admin/ca/cert", self.tower.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?)
+    }
 }
 
 /// A client for `sovd-token-helper` — mints short-lived SOVD bearer JWTs that
