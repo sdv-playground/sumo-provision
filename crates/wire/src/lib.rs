@@ -146,15 +146,8 @@ pub struct Device {
     /// The device's public key, once known (filled at enrollment).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pubkey: Option<String>,
-    /// The CA-issued device cert's serial (hex), once enrolled.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cert_serial: Option<String>,
-    /// The device cert's expiry (RFC3339), once enrolled.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cert_not_after: Option<String>,
-    /// SHA-256 fingerprint of the device cert (`sha256:<hex>`), once enrolled.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cert_fingerprint: Option<String>,
+    // Device leaf certs are now per-(device, key_id) — see the device_certs
+    // table — so the roster view no longer carries a single cert's metadata.
 }
 
 /// `POST /admin/devices` body — register (or update) a device. Idempotent on
@@ -174,14 +167,21 @@ pub struct RegisterDevice {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnrollResponse {
     pub id: String,
-    /// The signed device certificate, PEM.
-    pub certificate_pem: String,
-    /// Certificate serial number (hex).
-    pub serial: String,
-    /// Expiry (RFC3339).
-    pub not_after: String,
-    /// SHA-256 fingerprint (`sha256:<hex>`).
-    pub fingerprint: String,
+    /// Which key slot was enrolled (`device-decrypt`, `tls-identity`, …).
+    pub key_id: String,
+    /// The signed device certificate, PEM — `None` for `device-decrypt`, whose
+    /// enrollment is a pubkey + proof-of-possession registration with no cert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_pem: Option<String>,
+    /// Certificate serial number (hex), when a cert was issued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    /// Expiry (RFC3339), when a cert was issued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_after: Option<String>,
+    /// SHA-256 fingerprint (`sha256:<hex>`), when a cert was issued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 // --- vehicle model ---------------------------------------------------------

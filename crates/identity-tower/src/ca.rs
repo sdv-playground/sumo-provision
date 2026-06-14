@@ -7,16 +7,18 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use const_oid::db::rfc5280::ID_KP_CLIENT_AUTH;
+use const_oid::db::rfc5280::{ID_KP_CLIENT_AUTH, ID_KP_SERVER_AUTH};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{DerSignature, SigningKey, VerifyingKey};
 use p256::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+use x509_cert::der::asn1::Ia5String;
 use x509_cert::der::pem::LineEnding;
 use x509_cert::der::{Decode, DecodePem, Encode, EncodePem};
-use x509_cert::ext::pkix::ExtendedKeyUsage;
+use x509_cert::ext::pkix::name::GeneralName;
+use x509_cert::ext::pkix::{ExtendedKeyUsage, SubjectAltName};
 use x509_cert::name::Name;
 use x509_cert::request::CertReq;
 use x509_cert::serial_number::SerialNumber;
@@ -49,7 +51,17 @@ pub struct IssuedCert {
     pub serial_hex: String,
     pub not_after: String,   // RFC3339
     pub fingerprint: String, // sha256:<hex>
-    pub pubkey_hex: String,  // 65-byte uncompressed EC point, hex
+}
+
+/// What a device leaf is used for — selects its EKU (and SAN).
+#[derive(Debug, Clone, Copy)]
+pub enum LeafUsage {
+    /// Plain device clientAuth identity (the default leaf).
+    Client,
+    /// The node's cross-node mTLS identity — clientAuth + serverAuth + a
+    /// dNSName SAN (the node is both the dialing client and the listening
+    /// server).
+    Mtls,
 }
 
 impl Ca {
@@ -119,18 +131,16 @@ impl Ca {
             .map_err(|_| anyhow::anyhow!("CA public key is not a 65-byte P-256 point"))
     }
 
-    /// Parse + POP-verify a PKCS#10 CSR (DER or PEM) and issue a `clientAuth`
-    /// leaf bound to `device_id`, signed by this CA.
-    pub fn issue_leaf(&self, device_id: &str, csr_bytes: &[u8]) -> anyhow::Result<IssuedCert> {
+    /// Parse + POP-verify a PKCS#10 CSR (DER or PEM) and issue a leaf bound to
+    /// `device_id`, signed by this CA. `usage` selects the EKU (and, for the
+    /// node's mTLS identity, a SAN) — see [`LeafUsage`].
+    pub fn issue_leaf(
+        &self,
+        device_id: &str,
+        csr_bytes: &[u8],
+        usage: LeafUsage,
+    ) -> anyhow::Result<IssuedCert> {
         let csr = parse_and_verify_csr(csr_bytes)?;
-        let pubkey_hex = hex::encode(
-            csr.info
-                .public_key
-                .subject_public_key
-                .as_bytes()
-                .ok_or_else(|| anyhow::anyhow!("CSR public key is not octet-aligned"))?,
-        );
-
         let subject = Name::from_str(&format!("CN={device_id}"))?;
         let serial = random_serial()?;
         let mut builder = CertificateBuilder::new(
@@ -145,7 +155,27 @@ impl Ca {
             csr.info.public_key.clone(),
             &self.signing_key,
         )?;
-        builder.add_extension(&ExtendedKeyUsage(vec![ID_KP_CLIENT_AUTH]))?;
+        let eku = match usage {
+            LeafUsage::Client => vec![ID_KP_CLIENT_AUTH],
+            LeafUsage::Mtls => vec![ID_KP_CLIENT_AUTH, ID_KP_SERVER_AUTH],
+        };
+        builder.add_extension(&ExtendedKeyUsage(eku))?;
+        if matches!(usage, LeafUsage::Mtls) {
+            // The node's mTLS leaf is presented BOTH when dialing a peer
+            // (clientAuth) and when listening (serverAuth), so the dialer
+            // verifies a SAN against its ServerName. We use the device id as the
+            // dNSName — same as the CN and the cross-node principal — and the
+            // dialer connects with ServerName = device_id.
+            //
+            // TODO(vehicle): revisit this SAN in a real vehicle context. It could
+            // be `vin.ecu_name` (vehicle-scoped, human-meaningful), but then
+            // swapping an ECU into another vehicle as a spare part forces a
+            // re-issue/rename. The device id (HSM thumbprint) is
+            // vehicle-independent and survives the swap — decide the trade-off
+            // later.
+            let san = GeneralName::DnsName(Ia5String::try_from(device_id.to_string())?);
+            builder.add_extension(&SubjectAltName(vec![san]))?;
+        }
         let cert: Certificate = builder.build::<DerSignature>()?;
 
         let der = cert.to_der()?;
@@ -155,9 +185,24 @@ impl Ca {
             serial_hex: hex::encode(serial.as_bytes()),
             not_after,
             fingerprint: wire::ContentHash::of(&der).to_prefixed(),
-            pubkey_hex,
             der,
         })
+    }
+
+    /// Parse + POP-verify a CSR and return the requester's public key (65-byte
+    /// uncompressed SEC1 point, hex) WITHOUT issuing a cert. Used for the
+    /// `device-decrypt` registration: the device proves possession of its
+    /// decryption key and we record the pubkey (the keystore-encryption
+    /// recipient) — no certificate is wanted for that slot.
+    pub fn verify_csr_pubkey(&self, csr_bytes: &[u8]) -> anyhow::Result<String> {
+        let csr = parse_and_verify_csr(csr_bytes)?;
+        let bytes = csr
+            .info
+            .public_key
+            .subject_public_key
+            .as_bytes()
+            .ok_or_else(|| anyhow::anyhow!("CSR public key is not octet-aligned"))?;
+        Ok(hex::encode(bytes))
     }
 }
 
@@ -220,7 +265,7 @@ mod tests {
     fn issues_clientauth_leaf_that_chains_to_root() {
         let ca = Ca::generate(KEY_AUTHORITY_ROOT_DN).unwrap();
         let (_dk, csr) = fixture_csr("rig-001");
-        let issued = ca.issue_leaf("rig-001", &csr).unwrap();
+        let issued = ca.issue_leaf("rig-001", &csr, LeafUsage::Client).unwrap();
 
         let leaf = Certificate::from_der(&issued.der).unwrap();
         assert_eq!(leaf.tbs_certificate.issuer, ca.issuer);
@@ -248,7 +293,7 @@ mod tests {
         let (_dk, mut csr) = fixture_csr("rig-002");
         let n = csr.len();
         csr[n - 1] ^= 0xff; // corrupt the signature
-        assert!(ca.issue_leaf("rig-002", &csr).is_err());
+        assert!(ca.issue_leaf("rig-002", &csr, LeafUsage::Client).is_err());
     }
 
     #[test]
@@ -273,11 +318,25 @@ mod tests {
         );
 
         // A device leaf chains to the IDENTITY root, never the key-authority one.
+        // Issue the mTLS variant so we also exercise the serverAuth + SAN path.
         let (_dk, csr) = fixture_csr("node-7");
-        let issued = identity.issue_leaf("node-7", &csr).unwrap();
+        let issued = identity
+            .issue_leaf("node-7", &csr, LeafUsage::Mtls)
+            .unwrap();
         let leaf = Certificate::from_der(&issued.der).unwrap();
         assert_eq!(leaf.tbs_certificate.issuer, identity.issuer);
         assert_ne!(leaf.tbs_certificate.issuer, key_authority.issuer);
         assert!(format!("{}", identity.issuer).contains("identity root"));
+
+        // The mTLS leaf carries a subjectAltName (the dNSName the dialer's
+        // ServerName matches) — clientAuth-only leaves don't.
+        let has_san = leaf
+            .tbs_certificate
+            .extensions
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|e| e.extn_id == const_oid::db::rfc5280::ID_CE_SUBJECT_ALT_NAME);
+        assert!(has_san, "mTLS leaf must carry a SAN");
     }
 }

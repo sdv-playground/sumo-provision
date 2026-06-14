@@ -70,14 +70,25 @@ pub async fn mint_keystore_endpoint(
         .public_sec1()
         .map_err(AppError::Internal)?;
 
-    // tls-identity leaf: delivered on re-provision once the device has enrolled
-    // its tls-identity CSR (per-key enrollment, a separate flow). None until then.
+    // The device's tls-identity leaf, if it's been enrolled — delivered in the
+    // keystore envelope (schema v3) so the cross-node mTLS listener finds its
+    // cert. `None` until the device enrolls its tls-identity CSR (a re-provision
+    // after first boot then carries the leaf).
+    let tls_leaf: Option<Vec<u8>> = sqlx::query(
+        "SELECT cert_der FROM device_certs WHERE device_id = $1 AND key_id = 'tls-identity'",
+    )
+    .bind(&id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|e| AppError::Internal(e.into()))?
+    .map(|r| r.get::<Vec<u8>, _>("cert_der"));
+
     let suit = mint_keystore(
         &device_decrypt_cose,
         &sw_authority_cose,
         &ka_sec1,
         req.security_version,
-        None,
+        tls_leaf.as_deref(),
     )
     .map_err(AppError::Internal)?;
     Ok((

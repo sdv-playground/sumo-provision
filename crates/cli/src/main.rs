@@ -97,16 +97,21 @@ enum CaCmd {
         /// Device id.
         id: String,
     },
-    /// Enroll a registered device: submit its CSR (DER PKCS#10) and get back a
-    /// signed clientAuth device cert (the CSR response), stored in Tower 1.
+    /// Enroll one of a registered device's key slots: submit its CSR (DER
+    /// PKCS#10). `device-decrypt` records the pubkey (no cert); a cert-bearing
+    /// slot (`tls-identity`, …) gets a leaf back, stored in Tower 1.
     Enroll {
         /// Device id (register it first).
         id: String,
-        /// Device CSR file (DER PKCS#10) — e.g. captured from the rig's
-        /// `hsm/x-sumo-csr`.
+        /// Which key slot the CSR is for.
+        #[arg(long, default_value = "device-decrypt")]
+        key_id: String,
+        /// CSR file for that slot (DER PKCS#10) — e.g. captured from the rig's
+        /// `…/operations/x-sumo-csr/executions`.
         #[arg(long)]
         csr: PathBuf,
-        /// Write the issued certificate PEM here (default: stdout).
+        /// Write the issued certificate PEM here (default: stdout). Ignored for
+        /// `device-decrypt` (no cert).
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -400,20 +405,32 @@ async fn run_ca(args: CaArgs) -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("device '{id}' not registered"))?;
             print_device(&dev);
         }
-        CaCmd::Enroll { id, csr, out } => {
+        CaCmd::Enroll {
+            id,
+            key_id,
+            csr,
+            out,
+        } => {
             let csr_der = std::fs::read(&csr)?;
-            let resp = ca.enroll(&id, &csr_der).await?;
-            match &out {
-                Some(p) => {
-                    std::fs::write(p, resp.certificate_pem.as_bytes())?;
+            let resp = ca.enroll(&id, &key_id, &csr_der).await?;
+            match (&resp.certificate_pem, &out) {
+                (Some(pem), Some(p)) => {
+                    std::fs::write(p, pem.as_bytes())?;
                     eprintln!("wrote device cert to {}", p.display());
                 }
-                None => print!("{}", resp.certificate_pem),
+                (Some(pem), None) => print!("{pem}"),
+                (None, _) => {} // device-decrypt: registration, no cert
             }
-            eprintln!(
-                "enrolled '{}' — cert serial {} (expires {})",
-                resp.id, resp.serial, resp.not_after
-            );
+            match (&resp.serial, &resp.not_after) {
+                (Some(serial), Some(na)) => eprintln!(
+                    "enrolled '{}' key '{}' — cert serial {serial} (expires {na})",
+                    resp.id, resp.key_id
+                ),
+                _ => eprintln!(
+                    "enrolled '{}' key '{}' (registration, no cert)",
+                    resp.id, resp.key_id
+                ),
+            }
         }
         CaCmd::MintKeystore { id, hub_url, out } => {
             let sw_pubkey = SoftwareClient::new(&hub_url).signer_pubkey().await?;

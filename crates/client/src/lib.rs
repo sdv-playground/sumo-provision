@@ -295,13 +295,23 @@ impl IdentityClient {
         Ok(Some(resp.error_for_status()?.json().await?))
     }
 
-    /// `POST /admin/devices/{id}/enroll` — submit the device CSR (DER PKCS#10);
-    /// Tower 1 issues + stores a `clientAuth` device cert and returns it.
-    pub async fn enroll(&self, id: &str, csr_der: &[u8]) -> Result<EnrollResponse, ClientError> {
+    /// `POST /admin/devices/{id}/enroll?key_id=<slot>` — submit the slot's CSR
+    /// (DER PKCS#10). For `device-decrypt` Tower 1 records the pubkey (no cert);
+    /// for a cert-bearing slot (`tls-identity`, …) it issues + stores a leaf and
+    /// returns it.
+    pub async fn enroll(
+        &self,
+        id: &str,
+        key_id: &str,
+        csr_der: &[u8],
+    ) -> Result<EnrollResponse, ClientError> {
         Ok(self
             .tower
             .http
-            .post(format!("{}/admin/devices/{}/enroll", self.tower.base, id))
+            .post(format!(
+                "{}/admin/devices/{}/enroll?key_id={}",
+                self.tower.base, id, key_id
+            ))
             .body(csr_der.to_vec())
             .send()
             .await?

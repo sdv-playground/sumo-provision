@@ -3,14 +3,15 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use serde::Deserialize;
 use sqlx::{PgPool, Row};
 use wire::{Device, EnrollResponse, RegisterDevice};
 
-use crate::ca::Ca;
+use crate::ca::{Ca, LeafUsage};
 
 /// Shared state: the roster database pool + the device CA.
 #[derive(Clone)]
@@ -24,9 +25,9 @@ pub struct AppState {
     pub identity_ca: Arc<Ca>,
 }
 
-/// The roster columns projected into a [`wire::Device`].
-const DEVICE_COLS: &str =
-    "id, model, status, pubkey, cert_serial, cert_not_after, cert_fingerprint";
+/// The roster columns projected into a [`wire::Device`]. Leaf certs are
+/// per-(device, key_id) in `device_certs`, not on the roster row.
+const DEVICE_COLS: &str = "id, model, status, pubkey";
 
 /// `POST /admin/devices` — register (or update) a device. Idempotent on `id`.
 pub async fn register_device(
@@ -49,33 +50,98 @@ pub async fn register_device(
     Ok(Json(device_from_row(&row)))
 }
 
-/// `POST /admin/devices/{id}/enroll` — body is the device CSR (raw DER PKCS#10;
-/// PEM accepted). Verifies proof-of-possession, issues a `clientAuth` device
-/// certificate (the CSR response), stores it, and returns it. The device must be
-/// registered first (`404` otherwise).
+/// `?key_id=` selector for [`enroll_device`].
+#[derive(Deserialize)]
+pub struct EnrollParams {
+    /// Which device key slot the CSR is for. Defaults to `device-decrypt` (the
+    /// registration key) so existing callers keep working.
+    #[serde(default = "default_enroll_key_id")]
+    pub key_id: String,
+}
+
+fn default_enroll_key_id() -> String {
+    "device-decrypt".to_string()
+}
+
+/// `POST /admin/devices/{id}/enroll?key_id=<slot>` — body is the slot's CSR (DER
+/// PKCS#10; PEM accepted). Two shapes per slot:
+///
+/// - `device-decrypt` (default): a REGISTRATION, not a cert. Verify
+///   proof-of-possession + record the decryption pubkey (the keystore-encryption
+///   recipient). No certificate is issued for this slot.
+/// - any cert-bearing slot (`tls-identity`, …): issue a leaf — `tls-identity`
+///   gets the mTLS profile (clientAuth + serverAuth + SAN) — and store it
+///   per-(device, key_id) in `device_certs`. The device must be registered
+///   first (`404` otherwise).
 pub async fn enroll_device(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(params): Query<EnrollParams>,
     body: Bytes,
 ) -> Result<Json<EnrollResponse>, AppError> {
+    let key_id = params.key_id;
+
+    if key_id == "device-decrypt" {
+        // Registration: PoP + record the decryption pubkey. No cert wanted.
+        let pubkey_hex = s
+            .identity_ca
+            .verify_csr_pubkey(&body)
+            .map_err(|e| AppError::BadRequest(format!("CSR rejected: {e}")))?;
+        // Store as hex(COSE_Key) — the form Tower 2's build_envelope and the
+        // keystore mint both consume (not the raw SEC1 point from the CSR).
+        let sec1: [u8; 65] = hex::decode(&pubkey_hex)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| AppError::BadRequest("CSR key is not a 65-byte P-256 point".into()))?;
+        let pubkey_cose_hex = hex::encode(crate::keystore::sec1_to_cose(&sec1));
+        let res = sqlx::query("UPDATE devices SET status='enrolled', pubkey=$2 WHERE id=$1")
+            .bind(&id)
+            .bind(&pubkey_cose_hex)
+            .execute(&s.pool)
+            .await
+            .map_err(db)?;
+        if res.rows_affected() == 0 {
+            return Err(AppError::NotFound); // register the device before enrolling it
+        }
+        return Ok(Json(EnrollResponse {
+            id,
+            key_id,
+            certificate_pem: None,
+            serial: None,
+            not_after: None,
+            fingerprint: None,
+        }));
+    }
+
+    // A cert-bearing slot: issue the leaf with the right usage + store it.
+    let usage = if key_id == "tls-identity" {
+        LeafUsage::Mtls
+    } else {
+        LeafUsage::Client
+    };
     let issued = s
         .identity_ca
-        .issue_leaf(&id, &body)
+        .issue_leaf(&id, &body, usage)
         .map_err(|e| AppError::BadRequest(format!("CSR rejected: {e}")))?;
-    // Store the device pubkey as hex(COSE_Key) — the form Tower 2's build_envelope
-    // and the keystore mint both consume (not the raw SEC1 point from the CSR).
-    let sec1: [u8; 65] = hex::decode(&issued.pubkey_hex)
-        .ok()
-        .and_then(|v| v.try_into().ok())
-        .ok_or_else(|| AppError::BadRequest("CSR key is not a 65-byte P-256 point".into()))?;
-    let pubkey_cose_hex = hex::encode(crate::keystore::sec1_to_cose(&sec1));
-    let res = sqlx::query(
-        "UPDATE devices SET status='enrolled', pubkey=$2, cert_der=$3, \
-           cert_serial=$4, cert_not_after=$5, cert_fingerprint=$6, enrolled_at=now() \
-         WHERE id=$1",
+    // The device must already be registered (its device-decrypt enrolled).
+    let known = sqlx::query("SELECT 1 FROM devices WHERE id=$1")
+        .bind(&id)
+        .fetch_optional(&s.pool)
+        .await
+        .map_err(db)?;
+    if known.is_none() {
+        return Err(AppError::NotFound);
+    }
+    sqlx::query(
+        "INSERT INTO device_certs \
+           (device_id, key_id, cert_der, cert_serial, cert_not_after, cert_fingerprint) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (device_id, key_id) DO UPDATE SET \
+           cert_der = $3, cert_serial = $4, cert_not_after = $5, \
+           cert_fingerprint = $6, enrolled_at = now()",
     )
     .bind(&id)
-    .bind(&pubkey_cose_hex)
+    .bind(&key_id)
     .bind(&issued.der)
     .bind(&issued.serial_hex)
     .bind(&issued.not_after)
@@ -83,15 +149,13 @@ pub async fn enroll_device(
     .execute(&s.pool)
     .await
     .map_err(db)?;
-    if res.rows_affected() == 0 {
-        return Err(AppError::NotFound); // register the device before enrolling it
-    }
     Ok(Json(EnrollResponse {
         id,
-        certificate_pem: issued.pem,
-        serial: issued.serial_hex,
-        not_after: issued.not_after,
-        fingerprint: issued.fingerprint,
+        key_id,
+        certificate_pem: Some(issued.pem),
+        serial: Some(issued.serial_hex),
+        not_after: Some(issued.not_after),
+        fingerprint: Some(issued.fingerprint),
     }))
 }
 
@@ -138,9 +202,6 @@ fn device_from_row(r: &sqlx::postgres::PgRow) -> Device {
         model: r.get("model"),
         status: r.get("status"),
         pubkey: r.get("pubkey"),
-        cert_serial: r.get("cert_serial"),
-        cert_not_after: r.get("cert_not_after"),
-        cert_fingerprint: r.get("cert_fingerprint"),
     }
 }
 
