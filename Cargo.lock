@@ -1097,7 +1097,7 @@ dependencies = [
 [[package]]
 name = "hsm"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#5e04c1190e44dc9efbd874cf02f3ad9791036599"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#cbeabe7571486fcbea22c2a65f6571faf63e7a6f"
 dependencies = [
  "ciborium",
  "coset",
