@@ -13,8 +13,8 @@ use axum::Json;
 use coset::iana;
 use coset::CborSerializable;
 use hsm::payload::{
-    self, HsmKeystore, KeySlot, FACTORY_SIGNING_PUBLIC, FACTORY_SIGNING_SCALAR, KEY_TYPE_EC_P256,
-    OP_GET_PUBKEY, OP_SIGN, OP_VERIFY,
+    self, HsmKeystore, KeySlot, LeafCert, FACTORY_SIGNING_PUBLIC, FACTORY_SIGNING_SCALAR,
+    KEY_TYPE_EC_P256, OP_GET_PUBKEY, OP_SIGN, OP_VERIFY,
 };
 use hsm::KeyRole;
 use serde::Deserialize;
@@ -70,11 +70,14 @@ pub async fn mint_keystore_endpoint(
         .public_sec1()
         .map_err(AppError::Internal)?;
 
+    // tls-identity leaf: delivered on re-provision once the device has enrolled
+    // its tls-identity CSR (per-key enrollment, a separate flow). None until then.
     let suit = mint_keystore(
         &device_decrypt_cose,
         &sw_authority_cose,
         &ka_sec1,
         req.security_version,
+        None,
     )
     .map_err(AppError::Internal)?;
     Ok((
@@ -83,21 +86,21 @@ pub async fn mint_keystore_endpoint(
     ))
 }
 
-/// Mint the factory HSM trust-anchor keystore as a signed + encrypted SUIT
-/// envelope (component `["hsm","keys"]`, integrated `#hsm-keys` payload).
+/// Build the in-memory keystore (slots + any leaf certs) the envelope carries.
+/// Split out from [`mint_keystore`] so the slot/cert shaping is unit-testable
+/// without the SUIT encrypt/sign machinery.
 ///
-/// - `device_decrypt_cose`    — device decrypt pubkey, COSE_Key CBOR (ECDH recipient).
-/// - `sw_authority_cose`      — Tower 2 signer pubkey, COSE_Key CBOR (sw-authority anchor).
-/// - `key_authority_pub_sec1` — this CA's pubkey, SEC1 (key-authority anchor).
-/// - `security_version`       — anti-rollback floor / SUIT sequence number.
-pub fn mint_keystore(
-    device_decrypt_cose: &[u8],
-    sw_authority_cose: &[u8],
+/// `tls_identity_leaf` (DER), when present, is attached as the signed leaf for
+/// the device's `tls-identity` slot — a public artifact, inert without the HSM
+/// private key, delivered on the one keystore channel (schema v3). It's `None`
+/// on first provision; the orchestrator supplies it on re-provision once the
+/// device's `tls-identity` CSR has been enrolled.
+fn assemble_keystore(
+    sw_authority_sec1: &[u8; 65],
     key_authority_pub_sec1: &[u8; 65],
     security_version: u64,
-) -> anyhow::Result<Vec<u8>> {
-    let sw_authority_sec1 = cose_to_sec1(sw_authority_cose)?;
-
+    tls_identity_leaf: Option<&[u8]>,
+) -> HsmKeystore {
     // Slots are driven by the canonical mandatory role set (the device wire
     // contract). Trust anchors carry a public key; device-generated slots carry
     // none (the HSM creates those keypairs locally during provisioning).
@@ -134,12 +137,45 @@ pub fn mint_keystore(
         });
     }
 
-    let keystore = HsmKeystore {
+    let mut certificates = Vec::new();
+    if let Some(leaf) = tls_identity_leaf {
+        certificates.push(LeafCert {
+            key_id: KeyRole::TlsIdentity.key_id().to_string(),
+            certificate: leaf.to_vec(),
+        });
+    }
+
+    HsmKeystore {
         schema_version: payload::SCHEMA_VERSION,
         security_version,
         identities: Vec::new(),
         slots,
-    };
+        certificates,
+    }
+}
+
+/// Mint the factory HSM trust-anchor keystore as a signed + encrypted SUIT
+/// envelope (component `["hsm","keys"]`, integrated `#hsm-keys` payload).
+///
+/// - `device_decrypt_cose`    — device decrypt pubkey, COSE_Key CBOR (ECDH recipient).
+/// - `sw_authority_cose`      — Tower 2 signer pubkey, COSE_Key CBOR (sw-authority anchor).
+/// - `key_authority_pub_sec1` — this CA's pubkey, SEC1 (key-authority anchor).
+/// - `security_version`       — anti-rollback floor / SUIT sequence number.
+/// - `tls_identity_leaf`      — the device's signed `tls-identity` leaf (DER), or `None`.
+pub fn mint_keystore(
+    device_decrypt_cose: &[u8],
+    sw_authority_cose: &[u8],
+    key_authority_pub_sec1: &[u8; 65],
+    security_version: u64,
+    tls_identity_leaf: Option<&[u8]>,
+) -> anyhow::Result<Vec<u8>> {
+    let sw_authority_sec1 = cose_to_sec1(sw_authority_cose)?;
+    let keystore = assemble_keystore(
+        &sw_authority_sec1,
+        key_authority_pub_sec1,
+        security_version,
+        tls_identity_leaf,
+    );
     let cbor = payload::encode(&keystore).map_err(|e| anyhow!("encode HSM keystore: {e}"))?;
     // The SUIT image digest/size describe the PLAINTEXT keystore CBOR (what the
     // device recovers after decrypt + decompress).
@@ -231,12 +267,35 @@ mod tests {
         let sw_cose = sw.public_key_bytes();
         let ka_sec1 = cose_to_sec1(&dev_cose).unwrap();
 
-        let suit = mint_keystore(&dev_cose, &sw_cose, &ka_sec1, 1).unwrap();
+        let suit = mint_keystore(&dev_cose, &sw_cose, &ka_sec1, 1, None).unwrap();
         assert!(!suit.is_empty(), "minted keystore SUIT must be non-empty");
 
         // SEC1 <-> COSE roundtrip (the enrol pubkey conversion path).
         let sec1 = cose_to_sec1(&dev_cose).unwrap();
         let cose = sec1_to_cose(&sec1);
         assert_eq!(cose_to_sec1(&cose).unwrap(), sec1);
+    }
+
+    #[test]
+    fn assemble_keystore_embeds_tls_leaf_when_provided() {
+        let sw = [0x04u8; 65];
+        let ka = [0x04u8; 65];
+        let leaf = vec![0x30, 0x82, 0x01, 0x00, 0xAB];
+
+        let ks = assemble_keystore(&sw, &ka, 1, Some(&leaf));
+        let tls = ks
+            .certificates
+            .iter()
+            .find(|c| c.key_id == KeyRole::TlsIdentity.key_id())
+            .expect("tls-identity leaf attached");
+        assert_eq!(tls.certificate, leaf);
+        // The slot it certifies exists (else payload::decode would reject it).
+        assert!(ks
+            .slots
+            .iter()
+            .any(|s| s.key_id == KeyRole::TlsIdentity.key_id()));
+
+        // No leaf → empty certificates (first-provision shape).
+        assert!(assemble_keystore(&sw, &ka, 1, None).certificates.is_empty());
     }
 }
