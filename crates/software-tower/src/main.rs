@@ -107,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
             "/admin/vehicle-releases",
             post(releases::create_vehicle_release),
         )
+        .route("/admin/channels", get(releases::list_channels))
         .route(
             "/admin/channel-targets",
             put(releases::set_channel_target).get(releases::get_channel_target),

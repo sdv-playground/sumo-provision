@@ -16,6 +16,7 @@
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 use wire::{ArtifactRef, ContentHash, Entity, Part, Tree};
@@ -47,6 +48,8 @@ pub struct NewVehicleRelease {
     pub tag: String,
     pub version: String,
     pub members: Vec<i64>,
+    #[serde(default)]
+    pub config_snapshot: Option<Value>,
 }
 
 /// `PUT /admin/channel-targets` body — point a (channel, target_type, profile)
@@ -56,6 +59,7 @@ pub struct SetChannelTarget {
     pub channel: String,
     pub target_type: String,
     pub profile: String,
+    #[serde(alias = "target_release_id")]
     pub vehicle_release_id: i64,
 }
 
@@ -96,8 +100,17 @@ impl ReleaseRef {
 #[derive(Serialize)]
 pub struct ChannelTargetState {
     pub channel: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Deprecated compatibility field. Prefer `target_release`.
     pub vehicle: Option<VehicleRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_release: Option<VehicleRef>,
     pub tree_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_snapshot: Option<Value>,
 }
 
 /// `PUT /admin/channel-targets` response — the resolved tuple + the tree hash
@@ -111,7 +124,7 @@ pub struct ChannelTargetRef {
     pub tree_hash: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct VehicleRef {
     pub id: i64,
     pub tag: String,
@@ -193,16 +206,29 @@ pub async fn create_vehicle_release(
     .await
     .map_err(db)?
     {
+        if req.config_snapshot.is_some() {
+            sqlx::query(
+                "UPDATE vehicle_releases \
+                 SET config_snapshot = COALESCE(config_snapshot, $2) \
+                 WHERE id = $1",
+            )
+            .bind(row.get::<i64, _>("id"))
+            .bind(req.config_snapshot)
+            .execute(pool)
+            .await
+            .map_err(db)?;
+        }
         return Ok(Json(ReleaseRef::from_row(&row, true)));
     }
 
     let row = sqlx::query(
-        "INSERT INTO vehicle_releases (tag, version, identity_hash) \
-         VALUES ($1, $2, $3) RETURNING id, version, created_at::text AS created_at",
+        "INSERT INTO vehicle_releases (tag, version, identity_hash, config_snapshot) \
+         VALUES ($1, $2, $3, $4) RETURNING id, version, created_at::text AS created_at",
     )
     .bind(&req.tag)
     .bind(&req.version)
     .bind(&identity)
+    .bind(req.config_snapshot)
     .fetch_one(pool)
     .await
     .map_err(db)?;
@@ -257,6 +283,46 @@ pub async fn set_channel_target(
     }))
 }
 
+/// `GET /admin/channels` — list channel targets and their current target releases.
+pub async fn list_channels(
+    State(s): State<AppState>,
+) -> Result<Json<Vec<ChannelTargetState>>, AppError> {
+    let pool = s.pool()?;
+    let rows = sqlx::query(
+        "SELECT ct.channel, ct.target_type, ct.profile, ct.tree_hash, \
+                v.config_snapshot, v.id, v.tag, v.version, \
+                v.created_at::text AS created_at \
+         FROM channel_targets ct JOIN vehicle_releases v ON v.id = ct.vehicle_release_id \
+         ORDER BY ct.channel, ct.target_type, ct.profile",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+
+    let targets = rows
+        .into_iter()
+        .map(|r| {
+            let target_release = VehicleRef {
+                id: r.get("id"),
+                tag: r.get("tag"),
+                version: r.get("version"),
+                created_at: r.get("created_at"),
+            };
+            ChannelTargetState {
+                channel: r.get("channel"),
+                target_type: Some(r.get("target_type")),
+                profile: Some(r.get("profile")),
+                vehicle: Some(target_release.clone()),
+                target_release: Some(target_release),
+                tree_hash: Some(r.get("tree_hash")),
+                config_snapshot: r.get("config_snapshot"),
+            }
+        })
+        .collect();
+
+    Ok(Json(targets))
+}
+
 /// `GET /admin/channel-targets?channel=&target_type=&profile=` — the resolved
 /// target's current vehicle release (the build-number source for a reconcile) +
 /// its tree hash. `target_type`/`profile` are optional (default: the channel's
@@ -267,7 +333,8 @@ pub async fn get_channel_target(
 ) -> Result<Json<ChannelTargetState>, AppError> {
     let pool = s.pool()?;
     let row = sqlx::query(
-        "SELECT v.id, v.tag, v.version, v.created_at::text AS created_at, ct.tree_hash \
+        "SELECT ct.target_type, ct.profile, v.config_snapshot, v.id, v.tag, v.version, \
+                v.created_at::text AS created_at, ct.tree_hash \
          FROM channel_targets ct JOIN vehicle_releases v ON v.id = ct.vehicle_release_id \
          WHERE ct.channel = $1 \
            AND ($2::text IS NULL OR ct.target_type = $2) \
@@ -281,8 +348,10 @@ pub async fn get_channel_target(
     .await
     .map_err(db)?;
 
-    let (vehicle, tree_hash) = match row {
+    let (target_type, profile, target_release, tree_hash, config_snapshot) = match row {
         Some(r) => (
+            Some(r.get("target_type")),
+            Some(r.get("profile")),
             Some(VehicleRef {
                 id: r.get("id"),
                 tag: r.get("tag"),
@@ -290,13 +359,18 @@ pub async fn get_channel_target(
                 created_at: r.get("created_at"),
             }),
             Some(r.get::<String, _>("tree_hash")),
+            r.get("config_snapshot"),
         ),
-        None => (None, None),
+        None => (None, None, None, None, None),
     };
     Ok(Json(ChannelTargetState {
         channel: sel.channel,
-        vehicle,
+        target_type,
+        profile,
+        vehicle: target_release.clone(),
+        target_release,
         tree_hash,
+        config_snapshot,
     }))
 }
 
@@ -500,7 +574,18 @@ fn db(e: sqlx::Error) -> AppError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::{get, post, put};
+    use axum::Router;
+    use tower::ServiceExt;
+
+    use crate::content::AppState;
+    use crate::signer::Signer;
+    use crate::store::{FsBlobStore, PgIndex};
 
     fn part(id: &str, kind: &str, content: &str) -> NewPart {
         NewPart {
@@ -544,6 +629,128 @@ mod tests {
     }
 
     #[test]
+    fn set_channel_target_accepts_target_release_alias() {
+        let req: SetChannelTarget = serde_json::from_value(serde_json::json!({
+            "channel": "bleeding",
+            "target_type": "managed-cvc-rig",
+            "profile": "default",
+            "target_release_id": 42
+        }))
+        .unwrap();
+
+        assert_eq!(req.channel, "bleeding");
+        assert_eq!(req.target_type, "managed-cvc-rig");
+        assert_eq!(req.profile, "default");
+        assert_eq!(req.vehicle_release_id, 42);
+    }
+
+    #[test]
+    fn new_vehicle_release_accepts_optional_config_snapshot() {
+        let req: NewVehicleRelease = serde_json::from_value(serde_json::json!({
+            "tag": "managed-cvc-rig",
+            "version": "1.0.0-dev.1",
+            "members": [1, 2],
+            "config_snapshot": {
+                "schema": "sumo-target-config/v1",
+                "deployment": {"channel": "bleeding", "profile": "default"}
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(req.tag, "managed-cvc-rig");
+        assert_eq!(
+            req.config_snapshot.unwrap()["schema"],
+            "sumo-target-config/v1"
+        );
+    }
+
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx::test"]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn vehicle_release_snapshot_survives_reuse_and_channel_reads(pool: PgPool) {
+        let app = test_app(pool);
+        let component_id = create_component(&app).await;
+        let original_snapshot = serde_json::json!({
+            "schema": "sumo-target-config/v1",
+            "target_type": {"name": "managed-cvc", "kind": "vehicle"},
+            "deployment": {"channel": "bleeding", "profile": "default"},
+            "labels": {"tower": "2"},
+            "components": {
+                "ecu-a": {
+                    "kind": "adaptive-app",
+                    "version": "1.0.0",
+                    "parts": [{"id": "app", "kind": "binary", "source": "app.bin"}]
+                }
+            }
+        });
+        let replacement_snapshot = serde_json::json!({
+            "schema": "sumo-target-config/v1",
+            "deployment": {"channel": "bleeding", "profile": "replacement"}
+        });
+
+        let release = post_json(
+            &app,
+            "/admin/vehicle-releases",
+            serde_json::json!({
+                "tag": "managed-cvc",
+                "version": "1.0.0",
+                "members": [component_id],
+                "config_snapshot": original_snapshot,
+            }),
+        )
+        .await;
+        assert_eq!(release["reused"], false);
+        let release_id = release["id"].as_i64().unwrap();
+
+        put_json(
+            &app,
+            "/admin/channel-targets",
+            serde_json::json!({
+                "channel": "bleeding",
+                "target_type": "managed-cvc-rig",
+                "profile": "default",
+                "target_release_id": release_id
+            }),
+        )
+        .await;
+
+        let reused = post_json(
+            &app,
+            "/admin/vehicle-releases",
+            serde_json::json!({
+                "tag": "managed-cvc",
+                "version": "2.0.0",
+                "members": [component_id],
+                "config_snapshot": replacement_snapshot,
+            }),
+        )
+        .await;
+        assert_eq!(reused["id"], release_id);
+        assert_eq!(reused["reused"], true);
+
+        let channel = get_json(
+            &app,
+            "/admin/channel-targets?channel=bleeding&target_type=managed-cvc-rig&profile=default",
+        )
+        .await;
+        assert_eq!(channel["target_release"]["id"], release_id);
+        assert_eq!(
+            channel["config_snapshot"]["deployment"]["profile"],
+            "default"
+        );
+        assert_eq!(channel["config_snapshot"]["labels"]["tower"], "2");
+
+        let channels = get_json(&app, "/admin/channels").await;
+        assert_eq!(channels[0]["channel"], "bleeding");
+        assert_eq!(channels[0]["target_type"], "managed-cvc-rig");
+        assert_eq!(channels[0]["profile"], "default");
+        assert_eq!(channels[0]["target_release"]["id"], release_id);
+        assert_eq!(
+            channels[0]["config_snapshot"]["deployment"]["profile"],
+            "default"
+        );
+    }
+
+    #[test]
     fn vehicle_identity_ignores_order_and_dupes() {
         assert_eq!(vehicle_identity(&[1, 2, 3]), vehicle_identity(&[3, 2, 1]));
         assert_eq!(
@@ -551,5 +758,93 @@ mod tests {
             vehicle_identity(&[1, 2, 3])
         );
         assert_ne!(vehicle_identity(&[1, 2]), vehicle_identity(&[1, 2, 3]));
+    }
+
+    fn test_app(pool: PgPool) -> Router {
+        let blob_dir = tempfile::tempdir().unwrap().keep();
+        let signer = Signer::generate().unwrap();
+        let state = AppState {
+            blobs: Arc::new(FsBlobStore::new(blob_dir)),
+            index: Arc::new(PgIndex::new(pool.clone())),
+            pool: Some(pool),
+            signer: Arc::new(signer),
+        };
+
+        Router::new()
+            .route("/admin/component-releases", post(create_component_release))
+            .route("/admin/vehicle-releases", post(create_vehicle_release))
+            .route("/admin/channels", get(list_channels))
+            .route(
+                "/admin/channel-targets",
+                put(set_channel_target).get(get_channel_target),
+            )
+            .with_state(state)
+    }
+
+    async fn create_component(app: &Router) -> i64 {
+        let response = post_json(
+            app,
+            "/admin/component-releases",
+            serde_json::json!({
+                "entity_path": "ecu-a",
+                "entity_kind": "adaptive-app",
+                "version": "1.0.0",
+                "parts": [{
+                    "id": "app",
+                    "kind": "binary",
+                    "content": ContentHash::of(b"app").to_prefixed(),
+                }],
+            }),
+        )
+        .await;
+        response["id"].as_i64().unwrap()
+    }
+
+    async fn get_json(app: &Router, uri: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn post_json(app: &Router, uri: &str, body: Value) -> Value {
+        json_request(app, Request::post(uri), body, StatusCode::OK).await
+    }
+
+    async fn put_json(app: &Router, uri: &str, body: Value) -> Value {
+        json_request(app, Request::put(uri), body, StatusCode::OK).await
+    }
+
+    async fn json_request(
+        app: &Router,
+        builder: axum::http::request::Builder,
+        body: Value,
+        status: StatusCode,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                builder
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        }
     }
 }

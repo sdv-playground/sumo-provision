@@ -15,6 +15,7 @@ tokio-util = { workspace = true }
 axum = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -31,5 +32,4 @@ hex = { workspace = true }
 tempfile = { workspace = true }
 sumo-onboard = { workspace = true }
 coset = { workspace = true }
-serde_json = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
