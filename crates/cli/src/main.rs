@@ -60,6 +60,12 @@ enum HubCmd {
     Channel {
         /// Channel name (e.g. `bleeding`).
         name: String,
+        /// Narrow to this target type when the channel serves several.
+        #[arg(long)]
+        target_type: Option<String>,
+        /// Narrow to this profile when the channel serves several.
+        #[arg(long)]
+        profile: Option<String>,
         /// Emit the tree as JSON.
         #[arg(long)]
         json: bool,
@@ -162,6 +168,12 @@ enum RigCmd {
         /// Desired tree from a Tower 2 channel (e.g. `bleeding`).
         #[arg(long, required_unless_present = "release")]
         channel: Option<String>,
+        /// Narrow `--channel` to this target type when it serves several.
+        #[arg(long, conflicts_with = "release")]
+        target_type: Option<String>,
+        /// Narrow `--channel` to this profile when it serves several.
+        #[arg(long, conflicts_with = "release")]
+        profile: Option<String>,
         /// Tower 2 base URL (used with `--channel`).
         #[arg(long, env = "SUMO_HUB_URL", default_value = "http://localhost:8081")]
         hub_url: String,
@@ -173,9 +185,8 @@ enum RigCmd {
     /// Plan how to bring the rig to a channel's desired state: the ship-set
     /// resolved against Tower 2 (read-only — does not flash).
     Apply {
-        /// Desired state from a Tower 2 channel (e.g. `bleeding`).
-        #[arg(long)]
-        channel: String,
+        #[command(flatten)]
+        sel: ChannelSel,
         /// Tower 2 base URL.
         #[arg(long, env = "SUMO_HUB_URL", default_value = "http://localhost:8081")]
         hub_url: String,
@@ -186,9 +197,8 @@ enum RigCmd {
     /// Assemble the flash bundle (signed envelopes + payloads) for a device —
     /// dry by default; `--execute` flashes the rig over SOVD (destructive).
     Flash {
-        /// Desired state from a Tower 2 channel.
-        #[arg(long)]
-        channel: String,
+        #[command(flatten)]
+        sel: ChannelSel,
         /// Tower 2 base URL.
         #[arg(long, env = "SUMO_HUB_URL", default_value = "http://localhost:8081")]
         hub_url: String,
@@ -213,9 +223,8 @@ enum RigCmd {
     /// singleshot component its own step, then the banked group), reports the
     /// plan, and with `--execute` runs the steps in order.
     Campaign {
-        /// Desired state from a Tower 2 channel.
-        #[arg(long)]
-        channel: String,
+        #[command(flatten)]
+        sel: ChannelSel,
         /// Tower 2 base URL.
         #[arg(long, env = "SUMO_HUB_URL", default_value = "http://localhost:8081")]
         hub_url: String,
@@ -293,6 +302,34 @@ enum RigCmd {
     },
 }
 
+/// A channel-target selector for the rig commands: the channel, plus the
+/// optional `(target_type, profile)` narrowing for a channel that serves several
+/// targets (the multi-profile selector — Tower 2 migration `0005`). Omit both to
+/// resolve the channel's single target.
+#[derive(Args, Debug)]
+struct ChannelSel {
+    /// Desired state from a Tower 2 channel (e.g. `bleeding`).
+    #[arg(long)]
+    channel: String,
+    /// Narrow to this target type when the channel serves several (e.g.
+    /// `managed-cvc`).
+    #[arg(long)]
+    target_type: Option<String>,
+    /// Narrow to this profile when the channel serves several (e.g. `autosd`).
+    #[arg(long)]
+    profile: Option<String>,
+}
+
+impl ChannelSel {
+    fn target(&self) -> orchestrator::ChannelTarget {
+        orchestrator::ChannelTarget {
+            channel: self.channel.clone(),
+            target_type: self.target_type.clone(),
+            profile: self.profile.clone(),
+        }
+    }
+}
+
 /// Auth for the SOVD flash wire: a device id (the token `aud` + envelope
 /// recipient) and either a bearer JWT or minter creds to mint one.
 #[derive(Args, Debug)]
@@ -358,9 +395,14 @@ async fn run_hub(args: HubArgs) -> anyhow::Result<()> {
                 None => std::io::stdout().write_all(&bytes)?,
             }
         }
-        HubCmd::Channel { name, json } => {
+        HubCmd::Channel {
+            name,
+            target_type,
+            profile,
+            json,
+        } => {
             let tree = hub
-                .channel_tree(&name)
+                .channel_target_tree(&name, target_type.as_deref(), profile.as_deref())
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("channel '{name}' not found on {}", args.url))?;
             if json {
@@ -491,6 +533,8 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
         RigCmd::Diff {
             release,
             channel,
+            target_type,
+            profile,
             hub_url,
             plan,
         } => {
@@ -498,7 +542,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             let desired = match (release, channel) {
                 (Some(path), _) => serde_json::from_reader(std::fs::File::open(&path)?)?,
                 (None, Some(name)) => SoftwareClient::new(&hub_url)
-                    .channel_tree(&name)
+                    .channel_target_tree(&name, target_type.as_deref(), profile.as_deref())
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("channel '{name}' not found on {hub_url}"))?,
                 (None, None) => unreachable!("clap requires --release or --channel"),
@@ -510,11 +554,11 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             }
         }
         RigCmd::Apply {
-            channel,
+            sel,
             hub_url,
             json,
         } => {
-            let plan = orchestrator::apply_plan(&args.url, &hub_url, &channel, None).await?;
+            let plan = orchestrator::apply_plan(&args.url, &hub_url, &sel.target(), None).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
@@ -522,7 +566,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             }
         }
         RigCmd::Flash {
-            channel,
+            sel,
             hub_url,
             ca_url,
             auth,
@@ -530,13 +574,14 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             execute,
             json,
         } => {
+            let target = sel.target();
             if execute {
                 let token = rig_token(&auth)?;
                 let result = orchestrator::flash_execute(
                     &args.url,
                     &hub_url,
                     &ca_url,
-                    &channel,
+                    &target,
                     &auth.device,
                     only.as_deref(),
                     false, // `rig flash`: respect each component's declared reset_kind
@@ -553,7 +598,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     &args.url,
                     &hub_url,
                     &ca_url,
-                    &channel,
+                    &target,
                     &auth.device,
                     only.as_deref(),
                 )
@@ -566,21 +611,22 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             }
         }
         RigCmd::Campaign {
-            channel,
+            sel,
             hub_url,
             ca_url,
             auth,
             execute,
             no_commit,
         } => {
-            let plan = orchestrator::apply_plan(&args.url, &hub_url, &channel, None).await?;
+            let target = sel.target();
+            let plan = orchestrator::apply_plan(&args.url, &hub_url, &target, None).await?;
             let shipping: Vec<&orchestrator::ComponentApply> = plan
                 .components
                 .iter()
                 .filter(|c| !c.ship.is_empty())
                 .collect();
             if shipping.is_empty() {
-                println!("up to date — nothing to flash for channel '{channel}'");
+                println!("up to date — nothing to flash for channel '{}'", sel.channel);
                 return Ok(());
             }
             // Singleshot (irreversible) components each flash in their own
@@ -589,7 +635,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             let (singleshot, banked): (Vec<&orchestrator::ComponentApply>, Vec<_>) = shipping
                 .into_iter()
                 .partition(|c| c.supports_rollback == Some(false));
-            print_campaign(&channel, &auth.device, &singleshot, &banked);
+            print_campaign(&sel.channel, &auth.device, &singleshot, &banked);
             if !execute {
                 println!("\n(plan only — re-run with --execute to run the campaign)");
                 return Ok(());
@@ -607,7 +653,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     &args.url,
                     &hub_url,
                     &ca_url,
-                    &channel,
+                    &target,
                     &auth.device,
                     Some(c.entity.as_str()),
                     false, // singleshot (rt) reboots via its own declared reset_kind
@@ -623,7 +669,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     &args.url,
                     &hub_url,
                     &ca_url,
-                    &channel,
+                    &target,
                     &auth.device,
                     None,
                     true, // banked step: activate the whole step with ONE node reboot

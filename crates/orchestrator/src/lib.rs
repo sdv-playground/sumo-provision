@@ -234,25 +234,64 @@ impl ApplyPlan {
     }
 }
 
-/// Plan how to bring the rig at `rig_url` to the desired state on `channel`
+/// Which channel target to resolve: a `channel`, optionally narrowed to one
+/// `(target_type, profile)` when that channel serves several targets — the
+/// multi-profile selector (software-tower migration `0005`). Both `None`
+/// resolves the channel's single target, the common case.
+#[derive(Debug, Clone)]
+pub struct ChannelTarget {
+    pub channel: String,
+    pub target_type: Option<String>,
+    pub profile: Option<String>,
+}
+
+impl ChannelTarget {
+    /// A channel with no `(target_type, profile)` narrowing — its single target.
+    pub fn channel(channel: impl Into<String>) -> Self {
+        Self {
+            channel: channel.into(),
+            target_type: None,
+            profile: None,
+        }
+    }
+
+    /// Human label for diagnostics: the channel, plus any narrowing in parens.
+    fn label(&self) -> String {
+        match (&self.target_type, &self.profile) {
+            (None, None) => self.channel.clone(),
+            (tt, pf) => format!(
+                "{} (target_type={}, profile={})",
+                self.channel,
+                tt.as_deref().unwrap_or("*"),
+                pf.as_deref().unwrap_or("*"),
+            ),
+        }
+    }
+}
+
+/// Plan how to bring the rig at `rig_url` to the desired state on `target`
 /// (resolved from Tower 2 at `hub_url`). Reads the rig over SOVD, resolves the
-/// channel's desired tree, computes the per-component [`wire::flash_plan`], and
+/// target's desired tree, computes the per-component [`wire::flash_plan`], and
 /// resolves each shipped part against Tower 2's index — confirming Tower 2 can
 /// actually serve it and totalling the transfer. This is the read/resolve half
 /// of apply; flashing drives the SOVD `/updates` wire per component from it.
 pub async fn apply_plan(
     rig_url: &str,
     hub_url: &str,
-    channel: &str,
+    target: &ChannelTarget,
     only: Option<&str>,
 ) -> Result<ApplyPlan, Error> {
     let observed = read_rig_state(rig_url).await?;
     let hub = SoftwareClient::new(hub_url);
     let desired = hub
-        .channel_tree(channel)
+        .channel_target_tree(
+            &target.channel,
+            target.target_type.as_deref(),
+            target.profile.as_deref(),
+        )
         .await?
         .ok_or_else(|| Error::ChannelNotFound {
-            channel: channel.to_string(),
+            channel: target.label(),
         })?;
     let plan = wire::flash_plan(&observed, &desired);
 
@@ -297,7 +336,7 @@ pub async fn apply_plan(
         }
     }
     Ok(ApplyPlan {
-        channel: channel.to_string(),
+        channel: target.channel.clone(),
         components,
     })
 }
@@ -330,7 +369,7 @@ pub struct FlashBundle {
     pub components: Vec<ComponentFlash>,
 }
 
-/// Assemble the per-device flash bundle to bring the rig to `channel`'s desired
+/// Assemble the per-device flash bundle to bring the rig to `target`'s desired
 /// state: the ship-set ([`apply_plan`]), then a signed SUIT envelope per
 /// component (built by Tower 2, with the CEK re-wrapped to the device's Tower 1
 /// key) plus its payload references — exactly what the flash would upload over
@@ -339,11 +378,11 @@ pub async fn flash_bundle(
     rig_url: &str,
     hub_url: &str,
     ca_url: &str,
-    channel: &str,
+    target: &ChannelTarget,
     device_id: &str,
     only: Option<&str>,
 ) -> Result<FlashBundle, Error> {
-    let plan = apply_plan(rig_url, hub_url, channel, only).await?;
+    let plan = apply_plan(rig_url, hub_url, target, only).await?;
     let pubkey = device_pubkey(ca_url, device_id).await?;
 
     let hub = SoftwareClient::new(hub_url);
@@ -375,7 +414,7 @@ pub async fn flash_bundle(
         });
     }
     Ok(FlashBundle {
-        channel: channel.to_string(),
+        channel: target.channel.clone(),
         device: device_id.to_string(),
         components,
     })
@@ -466,7 +505,7 @@ pub struct FlashResult {
     pub components: Vec<ComponentFlashResult>,
 }
 
-/// Build the engine [`FlashPlan`] to bring the rig to `channel`'s desired state,
+/// Build the engine [`FlashPlan`] to bring the rig to `target`'s desired state,
 /// plus the SUIT trust anchor the engine validates manifests against. For each
 /// shipping component: a Tower-2 signed envelope (CEK re-wrapped to the device)
 /// and its ciphertext payloads fetched from Tower 2. Payloads are buffered
@@ -476,11 +515,11 @@ pub async fn build_flash_plan(
     rig_url: &str,
     hub_url: &str,
     ca_url: &str,
-    channel: &str,
+    target: &ChannelTarget,
     device_id: &str,
     only: Option<&str>,
 ) -> Result<(FlashPlan, Vec<u8>), Error> {
-    let plan = apply_plan(rig_url, hub_url, channel, only).await?;
+    let plan = apply_plan(rig_url, hub_url, target, only).await?;
     let pubkey = device_pubkey(ca_url, device_id).await?;
     let hub = SoftwareClient::new(hub_url);
     let trust_anchor = hub.signer_pubkey().await?;
@@ -520,7 +559,7 @@ pub async fn build_flash_plan(
     Ok((FlashPlan { jobs }, trust_anchor))
 }
 
-/// Drive the rig to `channel`'s desired state over SOVD via the shared flash
+/// Drive the rig to `target`'s desired state over SOVD via the shared flash
 /// engine: build the plan, stage every shipping component, then reset. The engine
 /// reads each component's `reset_kind` off the wire and coalesces a
 /// `RequiresEcuReset` (RT / host-OS) into a single node reboot — so the new
@@ -532,14 +571,14 @@ pub async fn flash_execute(
     rig_url: &str,
     hub_url: &str,
     ca_url: &str,
-    channel: &str,
+    target: &ChannelTarget,
     device_id: &str,
     only: Option<&str>,
     reboot_to_activate: bool,
     token: RigToken,
 ) -> Result<FlashResult, Error> {
     let (plan, trust_anchor) =
-        build_flash_plan(rig_url, hub_url, ca_url, channel, device_id, only).await?;
+        build_flash_plan(rig_url, hub_url, ca_url, target, device_id, only).await?;
     // `reboot_to_activate` (the workshop campaign) activates the whole step via one
     // node reboot — both banks boot their new images together, no racy per-VM
     // relaunch. The onboard/field path leaves it false (no orchestrator reboot;
@@ -559,7 +598,7 @@ pub async fn flash_execute(
     let mut ecus = engine.stage_all(&plan).await?;
     engine.reset_all(&mut ecus).await?;
     Ok(FlashResult {
-        channel: channel.to_string(),
+        channel: target.channel.clone(),
         device: device_id.to_string(),
         components: ecus.iter().map(component_result).collect(),
     })
