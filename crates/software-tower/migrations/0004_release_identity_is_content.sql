@@ -1,0 +1,29 @@
+-- Release identity is CONTENT, not version.
+--
+-- Per the multi-profile spec (docs/sumo-provision-multi-profile-update-draft.md
+-- §2.1 "artifact identity is content identity; environment/profile names must not
+-- be part of artifact identity") and migration 0003's own intent ("the version is
+-- just a human label … resolve by identity hash"):
+--
+-- A release's identity is the hash of its content — `(entity_path, identity_hash)`
+-- for a component, `(tag, identity_hash)` for a target/vehicle (both indexed in
+-- 0003). The `version` is a human label only.
+--
+-- The original `UNIQUE (entity_path, version)` and `UNIQUE (tag, version)` from
+-- 0002 contradict that: they force ONE content per version. The seed auto-numbers
+-- versions per channel build, so two channels/profiles that build the same entity
+-- at the same build number (both "1.0.0-dev.1") with DIFFERENT content collide on
+-- those constraints — even though, by content identity, they are simply two
+-- different releases that should coexist.
+--
+-- Drop them. Result:
+--   • same content across channels  -> ONE shared release (reused on identity_hash)
+--   • different content             -> coexist (distinct identity_hash, same label)
+--   • large artifacts (rootfs, …)   -> still deduped by content_hash; a release is
+--                                      only a manifest of part -> content_hash, so
+--                                      nothing is duplicated.
+-- The (channel, target_type, profile) target dimension lives at RESOLUTION (the
+-- spec's channel_targets tuple; the seed already records target_type/profile in
+-- the vehicle release's config_snapshot), NOT in release identity.
+ALTER TABLE component_releases DROP CONSTRAINT IF EXISTS component_releases_entity_path_version_key;
+ALTER TABLE vehicle_releases   DROP CONSTRAINT IF EXISTS vehicle_releases_tag_version_key;
