@@ -163,13 +163,36 @@ impl SoftwareClient {
         Ok(Some(resp.error_for_status()?.json().await?))
     }
 
-    /// `GET /channels/{name}/tree` — resolve a channel to its desired
-    /// [`wire::Tree`]; `None` if the channel is unset or unknown.
+    /// `GET /channel-targets/tree?channel=` — resolve a channel to its desired
+    /// [`wire::Tree`]; `None` if unknown. Resolves the channel's single target
+    /// (the common case); pass `target_type`/`profile` to `channel_target_tree`
+    /// when a channel serves several.
     pub async fn channel_tree(&self, name: &str) -> Result<Option<Tree>, ClientError> {
+        self.channel_target_tree(name, None, None).await
+    }
+
+    /// `GET /channel-targets/tree?channel=&target_type=&profile=` — resolve a
+    /// (channel, target_type, profile) tuple to its desired [`wire::Tree`];
+    /// `None` if unknown. `target_type`/`profile` omitted resolves a channel
+    /// with a single target.
+    pub async fn channel_target_tree(
+        &self,
+        channel: &str,
+        target_type: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<Option<Tree>, ClientError> {
+        let mut q: Vec<(&str, &str)> = vec![("channel", channel)];
+        if let Some(t) = target_type {
+            q.push(("target_type", t));
+        }
+        if let Some(p) = profile {
+            q.push(("profile", p));
+        }
         let resp = self
             .tower
             .http
-            .get(format!("{}/channels/{}/tree", self.tower.base, name))
+            .get(format!("{}/channel-targets/tree", self.tower.base))
+            .query(&q)
             .send()
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {

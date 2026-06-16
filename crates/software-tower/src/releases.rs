@@ -13,7 +13,7 @@
 //! the content actually changed. The `version` is just a human label (a build
 //! number); `created_at` is the build time (when this content was first cut).
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
@@ -49,10 +49,24 @@ pub struct NewVehicleRelease {
     pub members: Vec<i64>,
 }
 
-/// `PUT /admin/channels/{name}` body.
+/// `PUT /admin/channel-targets` body — point a (channel, target_type, profile)
+/// at a vehicle (target) release.
 #[derive(Deserialize)]
-pub struct SetChannel {
+pub struct SetChannelTarget {
+    pub channel: String,
+    pub target_type: String,
+    pub profile: String,
     pub vehicle_release_id: i64,
+}
+
+/// Query for resolving a channel target. `target_type` / `profile` are optional —
+/// omit them to resolve a channel that has a single target (the common case);
+/// supply both to disambiguate when a channel serves several.
+#[derive(Deserialize)]
+pub struct TargetSelector {
+    pub channel: String,
+    pub target_type: Option<String>,
+    pub profile: Option<String>,
 }
 
 /// A resolved release. `reused` is true when the content already had a release
@@ -76,12 +90,25 @@ impl ReleaseRef {
     }
 }
 
-/// `GET /admin/channels/{name}` response — the channel's current vehicle release
-/// (the build-number source for a reconcile), or `null` if unset.
+/// `GET /admin/channel-targets` response — the resolved target's current vehicle
+/// release (the build-number source for a reconcile) + its tree hash, or a null
+/// `vehicle` if the target is unset/unknown.
 #[derive(Serialize)]
-pub struct ChannelState {
-    pub name: String,
+pub struct ChannelTargetState {
+    pub channel: String,
     pub vehicle: Option<VehicleRef>,
+    pub tree_hash: Option<String>,
+}
+
+/// `PUT /admin/channel-targets` response — the resolved tuple + the tree hash
+/// that binds plan -> execute.
+#[derive(Serialize)]
+pub struct ChannelTargetRef {
+    pub channel: String,
+    pub target_type: String,
+    pub profile: String,
+    pub vehicle_release_id: i64,
+    pub tree_hash: String,
 }
 
 #[derive(Serialize)]
@@ -195,61 +222,100 @@ pub async fn create_vehicle_release(
     Ok(Json(ReleaseRef::from_row(&row, false)))
 }
 
-/// `PUT /admin/channels/{name}` — point a channel at a vehicle release.
-pub async fn set_channel(
+/// `PUT /admin/channel-targets` — point (channel, target_type, profile) at a
+/// vehicle release, and store the `tree_hash` of its resolved tree.
+pub async fn set_channel_target(
     State(s): State<AppState>,
-    Path(name): Path<String>,
-    Json(req): Json<SetChannel>,
-) -> Result<(), AppError> {
+    Json(req): Json<SetChannelTarget>,
+) -> Result<Json<ChannelTargetRef>, AppError> {
     let pool = s.pool()?;
+    let tree = resolve_members_to_tree(pool, req.vehicle_release_id)
+        .await
+        .map_err(db)?;
+    let th = tree_hash(&tree);
     sqlx::query(
-        "INSERT INTO channels (name, vehicle_release_id, updated_at) VALUES ($1, $2, now()) \
-         ON CONFLICT (name) DO UPDATE SET vehicle_release_id = $2, updated_at = now()",
+        "INSERT INTO channel_targets \
+           (channel, target_type, profile, vehicle_release_id, tree_hash, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, now()) \
+         ON CONFLICT (channel, target_type, profile) \
+           DO UPDATE SET vehicle_release_id = $4, tree_hash = $5, updated_at = now()",
     )
-    .bind(&name)
+    .bind(&req.channel)
+    .bind(&req.target_type)
+    .bind(&req.profile)
     .bind(req.vehicle_release_id)
+    .bind(&th)
     .execute(pool)
     .await
     .map_err(db)?;
-    Ok(())
+    Ok(Json(ChannelTargetRef {
+        channel: req.channel,
+        target_type: req.target_type,
+        profile: req.profile,
+        vehicle_release_id: req.vehicle_release_id,
+        tree_hash: th,
+    }))
 }
 
-/// `GET /admin/channels/{name}` — the channel's current vehicle release, or a
-/// null `vehicle` if the channel is unset/unknown. A reconcile reads this to
-/// derive the next build number.
-pub async fn get_channel(
+/// `GET /admin/channel-targets?channel=&target_type=&profile=` — the resolved
+/// target's current vehicle release (the build-number source for a reconcile) +
+/// its tree hash. `target_type`/`profile` are optional (default: the channel's
+/// single target). A null `vehicle` means the target is unset/unknown.
+pub async fn get_channel_target(
     State(s): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<Json<ChannelState>, AppError> {
+    Query(sel): Query<TargetSelector>,
+) -> Result<Json<ChannelTargetState>, AppError> {
     let pool = s.pool()?;
     let row = sqlx::query(
-        "SELECT v.id, v.tag, v.version, v.created_at::text AS created_at \
-         FROM channels c JOIN vehicle_releases v ON v.id = c.vehicle_release_id \
-         WHERE c.name = $1",
+        "SELECT v.id, v.tag, v.version, v.created_at::text AS created_at, ct.tree_hash \
+         FROM channel_targets ct JOIN vehicle_releases v ON v.id = ct.vehicle_release_id \
+         WHERE ct.channel = $1 \
+           AND ($2::text IS NULL OR ct.target_type = $2) \
+           AND ($3::text IS NULL OR ct.profile = $3) \
+         ORDER BY ct.updated_at DESC LIMIT 1",
     )
-    .bind(&name)
+    .bind(&sel.channel)
+    .bind(&sel.target_type)
+    .bind(&sel.profile)
     .fetch_optional(pool)
     .await
     .map_err(db)?;
 
-    let vehicle = row.map(|r| VehicleRef {
-        id: r.get("id"),
-        tag: r.get("tag"),
-        version: r.get("version"),
-        created_at: r.get("created_at"),
-    });
-    Ok(Json(ChannelState { name, vehicle }))
+    let (vehicle, tree_hash) = match row {
+        Some(r) => (
+            Some(VehicleRef {
+                id: r.get("id"),
+                tag: r.get("tag"),
+                version: r.get("version"),
+                created_at: r.get("created_at"),
+            }),
+            Some(r.get::<String, _>("tree_hash")),
+        ),
+        None => (None, None),
+    };
+    Ok(Json(ChannelTargetState {
+        channel: sel.channel,
+        vehicle,
+        tree_hash,
+    }))
 }
 
-/// `GET /channels/{name}/tree` — resolve a channel to its desired tree.
-pub async fn channel_tree(
+/// `GET /channel-targets/tree?channel=&target_type=&profile=` — resolve a target
+/// to its desired tree. `target_type`/`profile` optional (default: the channel's
+/// single target).
+pub async fn channel_target_tree(
     State(s): State<AppState>,
-    Path(name): Path<String>,
+    Query(sel): Query<TargetSelector>,
 ) -> Result<Json<Tree>, AppError> {
-    let tree = resolve_channel(s.pool()?, &name)
-        .await
-        .map_err(db)?
-        .ok_or(AppError::NotFound)?;
+    let tree = resolve_channel_target(
+        s.pool()?,
+        &sel.channel,
+        sel.target_type.as_deref(),
+        sel.profile.as_deref(),
+    )
+    .await
+    .map_err(db)?
+    .ok_or(AppError::NotFound)?;
     Ok(Json(tree))
 }
 
@@ -310,13 +376,57 @@ fn vehicle_identity(members: &[i64]) -> String {
 
 // --- resolution ------------------------------------------------------------
 
-/// Resolve a channel to its desired [`wire::Tree`]: channel → vehicle release →
-/// member component releases → their entities + parts. `None` when the channel
-/// is unset or unknown.
-async fn resolve_channel(pool: &PgPool, name: &str) -> sqlx::Result<Option<Tree>> {
-    let Some(vehicle_id) = channel_vehicle(pool, name).await? else {
+/// Resolve a (channel, target_type?, profile?) to its desired [`wire::Tree`].
+/// `None` when the target is unknown (or, without an explicit type/profile, the
+/// channel has zero or several targets — the caller then asks for a selector).
+async fn resolve_channel_target(
+    pool: &PgPool,
+    channel: &str,
+    target_type: Option<&str>,
+    profile: Option<&str>,
+) -> sqlx::Result<Option<Tree>> {
+    let Some(vehicle_id) = channel_target_vehicle(pool, channel, target_type, profile).await?
+    else {
         return Ok(None);
     };
+    Ok(Some(resolve_members_to_tree(pool, vehicle_id).await?))
+}
+
+/// The vehicle release id a (channel, target_type?, profile?) points at. With an
+/// explicit type+profile it's an exact lookup; without, it resolves a channel
+/// that has exactly one target (zero or many -> `None`).
+async fn channel_target_vehicle(
+    pool: &PgPool,
+    channel: &str,
+    target_type: Option<&str>,
+    profile: Option<&str>,
+) -> sqlx::Result<Option<i64>> {
+    if let (Some(t), Some(p)) = (target_type, profile) {
+        let row = sqlx::query(
+            "SELECT vehicle_release_id FROM channel_targets \
+             WHERE channel = $1 AND target_type = $2 AND profile = $3",
+        )
+        .bind(channel)
+        .bind(t)
+        .bind(p)
+        .fetch_optional(pool)
+        .await?;
+        return Ok(row.map(|r| r.get("vehicle_release_id")));
+    }
+    let rows = sqlx::query("SELECT vehicle_release_id FROM channel_targets WHERE channel = $1")
+        .bind(channel)
+        .fetch_all(pool)
+        .await?;
+    Ok(if rows.len() == 1 {
+        Some(rows[0].get("vehicle_release_id"))
+    } else {
+        None
+    })
+}
+
+/// A vehicle release id -> its desired [`wire::Tree`] (member component releases
+/// -> their entities + parts).
+async fn resolve_members_to_tree(pool: &PgPool, vehicle_id: i64) -> sqlx::Result<Tree> {
     let members = sqlx::query(
         "SELECT component_release_id FROM vehicle_release_members WHERE vehicle_release_id = $1",
     )
@@ -358,15 +468,29 @@ async fn resolve_channel(pool: &PgPool, name: &str) -> sqlx::Result<Option<Tree>
         }
         tree.entities.insert(path, entity);
     }
-    Ok(Some(tree))
+    Ok(tree)
 }
 
-async fn channel_vehicle(pool: &PgPool, name: &str) -> sqlx::Result<Option<i64>> {
-    let row = sqlx::query("SELECT vehicle_release_id FROM channels WHERE name = $1")
-        .bind(name)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.and_then(|r| r.get::<Option<i64>, _>("vehicle_release_id")))
+/// Content-stable canonical hash of a resolved tree: entity paths in order (the
+/// [`Tree`] map is already sorted), each with its parts sorted by id. Binds
+/// plan -> execute (multi-profile spec §2.2) — unlike a vehicle release's
+/// id-based identity hash, it is identical across DB instances for the same
+/// content.
+fn tree_hash(tree: &Tree) -> String {
+    let mut buf = String::new();
+    for (path, entity) in &tree.entities {
+        buf.push_str(path);
+        buf.push('\n');
+        let mut parts: Vec<&Part> = entity.parts.iter().collect();
+        parts.sort_by(|a, b| a.id.cmp(&b.id));
+        for p in parts {
+            buf.push_str(&p.id);
+            buf.push('\0');
+            buf.push_str(&p.content.to_prefixed());
+            buf.push('\n');
+        }
+    }
+    ContentHash::of(buf.as_bytes()).to_prefixed()
 }
 
 /// Map a database error into an `AppError`.
