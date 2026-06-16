@@ -56,6 +56,53 @@ pub enum Error {
         component: String,
         source: serde_json::Error,
     },
+    #[error("reading node update-state from the rig: {0}")]
+    NodeState(String),
+}
+
+/// The node's update-transaction state, read from the device's
+/// `x-sumo-update-state` vendor resource (`docs/design/node-update-state.md`).
+/// The orchestrator polls this to detect an unresolved prior transaction (a node
+/// reboot owed, or a trial awaiting its verdict) before starting a campaign step.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NodeUpdateState {
+    pub phase: String,
+    #[serde(default)]
+    pub components: Vec<String>,
+}
+
+impl NodeUpdateState {
+    /// True when a prior update transaction is unresolved — the node owes an
+    /// activation reboot or a trial awaits its verdict — so a new campaign step
+    /// must not start (it would compound the pending transaction).
+    pub fn is_unresolved(&self) -> bool {
+        matches!(self.phase.as_str(), "RebootPending" | "Trial")
+    }
+}
+
+/// Read the device's node update-transaction state over SOVD
+/// (`GET /vehicle/v1/data/x-sumo-update-state`). A device without the vendor
+/// route (an older image) returns 404 → reported as `Idle`, so a fresh rig just
+/// proceeds.
+pub async fn node_update_state(rig_url: &str) -> Result<NodeUpdateState, Error> {
+    let url = format!(
+        "{}/vehicle/v1/data/x-sumo-update-state",
+        rig_url.trim_end_matches('/')
+    );
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| Error::NodeState(e.to_string()))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(NodeUpdateState {
+            phase: "Idle".to_string(),
+            components: Vec::new(),
+        });
+    }
+    resp.error_for_status()
+        .map_err(|e| Error::NodeState(e.to_string()))?
+        .json::<NodeUpdateState>()
+        .await
+        .map_err(|e| Error::NodeState(e.to_string()))
 }
 
 /// Read a rig's observed state over SOVD as a [`wire::Tree`]: each component is

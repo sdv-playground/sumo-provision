@@ -640,6 +640,20 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                 println!("\n(plan only — re-run with --execute to run the campaign)");
                 return Ok(());
             }
+            // Detection (the orchestrator half): refuse to start a campaign while
+            // the rig has an unresolved prior transaction — a node reboot owed, or
+            // a trial awaiting its verdict — instead of compounding it (the bug).
+            // Names the components so the operator can resolve it first.
+            let node_state = orchestrator::node_update_state(&args.url).await?;
+            if node_state.is_unresolved() {
+                anyhow::bail!(
+                    "rig has an unresolved update transaction (phase {}, components {:?}) — \
+                     reboot the node, or commit/rollback the pending update (./commit.sh or \
+                     `rig rollback …`), before re-running the campaign",
+                    node_state.phase,
+                    node_state.components
+                );
+            }
             // Step through: each singleshot alone, then the banked group. After each
             // step, `finalize_step` gates on system health and (unless --no-commit)
             // commits the banked trial BEFORE the next step — a multi-reboot chain
@@ -749,7 +763,8 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
 
 /// Build the SOVD bearer source for the flash engine: a fixed `--token` if given,
 /// else a per-device JWT minted on demand from `sovd-token-helper`
-/// (`--minter-url` + `--operator-token`).
+/// (`--minter-url` + `--operator-token`). Errors if neither is supplied — every
+/// op that reaches here mutates the device and the device enforces auth.
 fn rig_token(auth: &AuthArgs) -> anyhow::Result<orchestrator::RigToken> {
     if let Some(t) = &auth.token {
         return Ok(orchestrator::RigToken::fixed(t.clone()));
@@ -766,11 +781,16 @@ fn rig_token(auth: &AuthArgs) -> anyhow::Result<orchestrator::RigToken> {
             None,
         ));
     }
-    // No --token and no --minter-url: connect unauthenticated. The device SOVD
-    // does not enforce auth yet (JWT bearer is the direction; SOVDd's auth slice
-    // is future). When it lands, pass --token or --minter-url + --operator-token.
-    // No runtime note here — the device logs unauthenticated access itself.
-    Ok(orchestrator::RigToken::fixed(String::new()))
+    // No --token and no --minter-url. Every op reaching `rig_token` mutates the
+    // device (flash / commit / rollback / reset / keystore), and the device now
+    // enforces per-verb scopes (today `reset:execute`; more as the gates land).
+    // Refuse at the front door with clear guidance instead of sending an empty
+    // bearer the device will correctly reject with a 403 deep inside the reset.
+    anyhow::bail!(
+        "this operation needs a token — pass --token <jwt>, or --minter-url <url> \
+         + --operator-token <jwt> to mint one for device '{}'",
+        auth.device
+    )
 }
 
 fn print_tree(tree: &wire::Tree) {

@@ -11,6 +11,7 @@ sovd-client = { workspace = true }
 sumo-sovd-flash-engine = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
