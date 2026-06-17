@@ -781,16 +781,23 @@ fn rig_token(auth: &AuthArgs) -> anyhow::Result<orchestrator::RigToken> {
             None,
         ));
     }
-    // No --token and no --minter-url. Every op reaching `rig_token` mutates the
-    // device (flash / commit / rollback / reset / keystore), and the device now
-    // enforces per-verb scopes (today `reset:execute`; more as the gates land).
-    // Refuse at the front door with clear guidance instead of sending an empty
-    // bearer the device will correctly reject with a 403 deep inside the reset.
-    anyhow::bail!(
-        "this operation needs a token — pass --token <jwt>, or --minter-url <url> \
-         + --operator-token <jwt> to mint one for device '{}'",
+    // No --token and no --minter-url. The device does NOT yet enforce auth on the
+    // general SOVD path (only High-consequence routes like reset/factory-reset do
+    // — the authorizer isn't wired into `create_router`). So most mutating ops
+    // (keystore install, flash, commit) still succeed unauthenticated. Warn loudly
+    // and proceed with an empty bearer rather than refusing the operator at the
+    // front door: ops on the unenforced path go through; a reset will still 403
+    // (correctly — it needs a real `reset:execute` token), which is the signal to
+    // supply --token / --minter-url. Matches the example scripts' "auth optional
+    // today" note; the token path returns the moment enforcement lands.
+    eprintln!(
+        "[sumo-provision] WARNING: no --token/--minter-url for device '{}' — \
+         connecting UNAUTHENTICATED. Unenforced ops go through; High-consequence \
+         ops (reset) will 403. Provide --token <jwt> or --minter-url + \
+         --operator-token to authenticate.",
         auth.device
-    )
+    );
+    Ok(orchestrator::RigToken::fixed(String::new()))
 }
 
 fn print_tree(tree: &wire::Tree) {
