@@ -12,6 +12,8 @@ use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{DerSignature, SigningKey, VerifyingKey};
 use p256::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey};
 use rand::rngs::OsRng;
+
+use crate::delegated_rights::DelegatedRightsExt;
 use rand::RngCore;
 use x509_cert::builder::{Builder, CertificateBuilder, Profile};
 use x509_cert::der::asn1::Ia5String;
@@ -189,6 +191,48 @@ impl Ca {
         })
     }
 
+    /// Mint a **workshop-delegate** leaf: a fresh P-256 keypair signed by this CA
+    /// into a `clientAuth` leaf that carries the delegated-rights extension
+    /// granting `scopes` (space-delimited, e.g. `"reset:execute"`). The minted
+    /// delegate may then issue tokens for exactly those capabilities — a verifier
+    /// honours such a token only because this CA (a pinned root) vouched for the
+    /// scopes in the delegate's own cert, so the delegate cannot self-escalate.
+    ///
+    /// Unlike [`issue_leaf`], the keypair is generated **here** (no CSR): the CA
+    /// is the one bootstrapping the delegate, so it returns both halves. Returns
+    /// `(cert_pem, key_pkcs8_pem)` — the leaf cert and its private key, PEM.
+    pub fn mint_delegate_leaf(
+        &self,
+        cn: &str,
+        scopes: &str,
+    ) -> anyhow::Result<(String, String)> {
+        let key = SigningKey::random(&mut OsRng);
+        let spki = SubjectPublicKeyInfoOwned::from_key(*key.verifying_key())?;
+        let subject = Name::from_str(&format!("CN={cn}"))?;
+        let mut builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: self.issuer.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            random_serial()?,
+            Validity::from_now(LEAF_VALIDITY)?,
+            subject,
+            spki,
+            &self.signing_key,
+        )?;
+        // clientAuth EKU — the verifier's `WebPkiClientVerifier` requires it on the
+        // delegate's mTLS leaf.
+        builder.add_extension(&ExtendedKeyUsage(vec![ID_KP_CLIENT_AUTH]))?;
+        // The delegation itself: the capabilities this delegate may grant.
+        builder.add_extension(&DelegatedRightsExt(scopes.to_string()))?;
+        let cert: Certificate = builder.build::<DerSignature>()?;
+
+        let cert_pem = cert.to_pem(LineEnding::LF)?;
+        let key_pem = key.to_pkcs8_pem(LineEnding::LF)?.to_string();
+        Ok((cert_pem, key_pem))
+    }
+
     /// Parse + POP-verify a CSR and return the requester's public key (65-byte
     /// uncompressed SEC1 point, hex) WITHOUT issuing a cert. Used for the
     /// `device-decrypt` registration: the device proves possession of its
@@ -285,6 +329,65 @@ mod tests {
             .iter()
             .any(|e| e.extn_id == const_oid::db::rfc5280::ID_CE_EXT_KEY_USAGE);
         assert!(eku, "leaf must carry an extendedKeyUsage extension");
+    }
+
+    #[test]
+    fn mint_delegate_leaf_carries_scopes_eku_and_chains_to_ca() {
+        use crate::delegated_rights::DELEGATED_RIGHTS_OID;
+        use x509_cert::der::asn1::Utf8StringRef;
+
+        let ca = Ca::generate(IDENTITY_ROOT_DN).unwrap();
+        let (cert_pem, key_pem) = ca
+            .mint_delegate_leaf("workshop-minter", "reset:execute update:transfer")
+            .unwrap();
+
+        // The returned key is a parseable PKCS#8 P-256 private key.
+        assert!(key_pem.contains("BEGIN PRIVATE KEY"));
+        SigningKey::from_pkcs8_pem(&key_pem).expect("returned key is PKCS#8 P-256");
+
+        let leaf = Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+        let exts = leaf.tbs_certificate.extensions.as_ref().unwrap();
+
+        // (a) delegated-rights extension decodes to exactly the granted scopes —
+        // mirrors vm-mgr's `granted_scopes`: find by OID, decode the inner
+        // UTF8String, split on whitespace.
+        let dr = exts
+            .iter()
+            .find(|e| e.extn_id == DELEGATED_RIGHTS_OID)
+            .expect("leaf must carry the delegated-rights extension");
+        assert!(!dr.critical, "delegated-rights must be non-critical");
+        let scopes: Vec<String> = Utf8StringRef::from_der(dr.extn_value.as_bytes())
+            .unwrap()
+            .as_str()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(scopes, vec!["reset:execute", "update:transfer"]);
+        assert!(
+            scopes.iter().any(|s| s == "reset:execute"),
+            "delegate must be granted reset:execute"
+        );
+
+        // (b) clientAuth EKU present (the WebPkiClientVerifier requirement).
+        let eku = exts
+            .iter()
+            .find(|e| e.extn_id == const_oid::db::rfc5280::ID_CE_EXT_KEY_USAGE)
+            .map(|e| ExtendedKeyUsage::from_der(e.extn_value.as_bytes()).unwrap())
+            .expect("leaf must carry an extendedKeyUsage extension");
+        assert!(
+            eku.0.contains(&ID_KP_CLIENT_AUTH),
+            "delegate leaf must have clientAuth EKU"
+        );
+
+        // (c) signed by this CA: issuer is the CA name AND the TBS verifies under
+        // the CA's signing key (chains to the CA root).
+        assert_eq!(leaf.tbs_certificate.issuer, ca.issuer);
+        let tbs = leaf.tbs_certificate.to_der().unwrap();
+        let sig = DerSignature::try_from(leaf.signature.as_bytes().unwrap()).unwrap();
+        ca.signing_key
+            .verifying_key()
+            .verify(&tbs, &sig)
+            .expect("delegate leaf must chain to (be signed by) the CA");
     }
 
     #[test]

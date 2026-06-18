@@ -8,6 +8,7 @@
 //! of Tower 2's — the two towers can share one Postgres server, different DBs.
 
 mod ca;
+mod delegated_rights;
 mod devices;
 mod keystore;
 
@@ -117,6 +118,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/admin/devices/{id}/keystore",
             post(keystore::mint_keystore_endpoint),
+        )
+        .route(
+            "/admin/workshop/delegate-cert",
+            post(devices::mint_delegate_cert),
         )
         .route("/admin/ca/cert", get(devices::ca_cert))
         .route("/devices", get(devices::list_devices))

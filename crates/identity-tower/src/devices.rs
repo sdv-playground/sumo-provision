@@ -159,6 +159,55 @@ pub async fn enroll_device(
     }))
 }
 
+/// `POST /admin/workshop/delegate-cert` request — which scopes to delegate and
+/// (optionally) the leaf's CN.
+#[derive(Deserialize)]
+pub struct DelegateCertReq {
+    /// Space-delimited capability scopes the minted delegate may grant, e.g.
+    /// `"reset:execute"`. Ride in the leaf's delegated-rights extension.
+    pub scopes: String,
+    /// Subject CN for the delegate leaf. Defaults to `workshop-minter`.
+    #[serde(default = "default_delegate_cn")]
+    pub cn: String,
+}
+
+fn default_delegate_cn() -> String {
+    "workshop-minter".to_string()
+}
+
+/// `POST /admin/workshop/delegate-cert` response — everything the caller needs to
+/// stand up the delegate: its leaf cert + private key, plus the CA root to pin.
+#[derive(serde::Serialize)]
+pub struct DelegateCertResponse {
+    /// The minted delegate leaf certificate (PEM). Present it leaf-first.
+    pub cert_pem: String,
+    /// The delegate's private key (PKCS#8 PEM). The minter signs tokens with this.
+    pub key_pem: String,
+    /// The CA **identity root** (PEM) — the trust anchor a verifier pins; the
+    /// delegate chains to it.
+    pub ca_root_pem: String,
+}
+
+/// `POST /admin/workshop/delegate-cert` — mint a workshop-delegate leaf granting
+/// the requested `scopes` (e.g. `reset:execute`). Returns the leaf cert, its
+/// private key, and the CA identity root so the caller has the full leaf-first
+/// chain plus the root to pin. Signed by the identity CA — a delegate of its root.
+pub async fn mint_delegate_cert(
+    State(s): State<AppState>,
+    Json(req): Json<DelegateCertReq>,
+) -> Result<Json<DelegateCertResponse>, AppError> {
+    let (cert_pem, key_pem) = s
+        .identity_ca
+        .mint_delegate_leaf(&req.cn, &req.scopes)
+        .map_err(AppError::Internal)?;
+    let ca_root_pem = s.identity_ca.root_cert_pem().map_err(AppError::Internal)?;
+    Ok(Json(DelegateCertResponse {
+        cert_pem,
+        key_pem,
+        ca_root_pem,
+    }))
+}
+
 /// `GET /admin/ca/cert` — the device **identity root** certificate (PEM). The
 /// trust anchor a verifier pins to validate the device certs this tower issues
 /// (a peer node's vHSM, an MQTT broker's client-cert trust store). Distinct from
