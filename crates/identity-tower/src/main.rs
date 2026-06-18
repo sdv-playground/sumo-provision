@@ -63,6 +63,25 @@ struct Args {
         default_value = "data/identity-cert.der"
     )]
     identity_cert: PathBuf,
+
+    /// Delegation-root CA signing key (PKCS#8 DER, P-256). Generated on first
+    /// run. A DISTINCT CA again — it signs delegated capability grants (the
+    /// workshop reset minter's leaf); its root is provisioned into device
+    /// keystores as the delegated-token trust anchor.
+    #[arg(
+        long,
+        env = "SUMO_DELEGATION_KEY",
+        default_value = "data/delegation.key"
+    )]
+    delegation_key: PathBuf,
+
+    /// Delegation-root CA certificate (X.509 DER). Self-signed on first run.
+    #[arg(
+        long,
+        env = "SUMO_DELEGATION_CERT",
+        default_value = "data/delegation-cert.der"
+    )]
+    delegation_cert: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -104,10 +123,16 @@ async fn main() -> anyhow::Result<()> {
         &args.identity_cert,
         ca::IDENTITY_ROOT_DN,
     )?);
+    let delegation_ca = Arc::new(load_or_generate_ca(
+        &args.delegation_key,
+        &args.delegation_cert,
+        ca::DELEGATION_ROOT_DN,
+    )?);
     let state = AppState {
         pool,
         key_authority_ca,
         identity_ca,
+        delegation_ca,
     };
 
     let app = Router::new()

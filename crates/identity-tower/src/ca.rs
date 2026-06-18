@@ -36,6 +36,15 @@ pub const KEY_AUTHORITY_ROOT_DN: &str = "CN=sumo-ca root,O=sumo";
 /// pins to verify a peer's leaf. Kept separate from key-authority and
 /// sw-authority so the identity trust domain never overlaps the others.
 pub const IDENTITY_ROOT_DN: &str = "CN=sumo identity root,O=sumo";
+/// The **delegation** root DN — a DISTINCT CA again: it signs *delegated*
+/// capability grants (the workshop reset minter's leaf, carrying the
+/// delegated-rights extension). Kept separate from identity so the authority to
+/// *grant operational capabilities* never rides on the authority that proves
+/// *who a node is* — a compromise of one trust domain must not confer the other,
+/// the same reason key-authority and sw-authority are distinct. Its root is
+/// provisioned into each device's HSM keystore — the trust anchor the SOVD
+/// authorizer pins to accept a delegated token's `x5c` chain.
+pub const DELEGATION_ROOT_DN: &str = "CN=sumo delegation root,O=sumo";
 const ROOT_VALIDITY: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
 const LEAF_VALIDITY: Duration = Duration::from_secs(825 * 24 * 3600); // CA/B max
 
@@ -118,6 +127,13 @@ impl Ca {
     /// The CA root certificate, PEM (the trust anchor a verifier pins).
     pub fn root_cert_pem(&self) -> anyhow::Result<String> {
         Ok(self.cert.to_pem(LineEnding::LF)?)
+    }
+
+    /// The CA root certificate, DER — embedded in a device keystore as the
+    /// delegation trust anchor (the keystore carries DER; the device re-encodes
+    /// to PEM to pin it for `x5c` chain validation).
+    pub fn root_cert_der(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(self.cert.to_der()?)
     }
 
     /// The CA public key as an uncompressed SEC1 point (`0x04 || x || y`) — used
@@ -441,5 +457,35 @@ mod tests {
             .iter()
             .any(|e| e.extn_id == const_oid::db::rfc5280::ID_CE_SUBJECT_ALT_NAME);
         assert!(has_san, "mTLS leaf must carry a SAN");
+    }
+
+    #[test]
+    fn delegation_root_is_distinct_from_identity_and_signs_delegates() {
+        // The delegation CA (grants capabilities — e.g. ecu reset) must be a
+        // different trust domain from the identity CA (proves who a node is), so
+        // a compromise of one never confers the other.
+        let identity = Ca::generate(IDENTITY_ROOT_DN).unwrap();
+        let delegation = Ca::generate(DELEGATION_ROOT_DN).unwrap();
+        assert_ne!(
+            identity.public_sec1().unwrap(),
+            delegation.public_sec1().unwrap()
+        );
+        assert!(format!("{}", delegation.issuer).contains("delegation root"));
+
+        // A workshop delegate minted by the delegation CA chains to IT, never
+        // to the identity root.
+        let (cert_pem, _key) = delegation
+            .mint_delegate_leaf("workshop-minter", "reset:execute")
+            .unwrap();
+        let leaf = Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+        assert_eq!(leaf.tbs_certificate.issuer, delegation.issuer);
+        assert_ne!(leaf.tbs_certificate.issuer, identity.issuer);
+        let tbs = leaf.tbs_certificate.to_der().unwrap();
+        let sig = DerSignature::try_from(leaf.signature.as_bytes().unwrap()).unwrap();
+        delegation
+            .signing_key
+            .verifying_key()
+            .verify(&tbs, &sig)
+            .expect("delegate must chain to the delegation root");
     }
 }

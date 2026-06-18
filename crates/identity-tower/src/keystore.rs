@@ -13,8 +13,9 @@ use axum::Json;
 use coset::iana;
 use coset::CborSerializable;
 use hsm::payload::{
-    self, HsmKeystore, KeySlot, LeafCert, FACTORY_SIGNING_PUBLIC, FACTORY_SIGNING_SCALAR,
-    KEY_TYPE_EC_P256, OP_GET_PUBKEY, OP_SIGN, OP_VERIFY,
+    self, HsmKeystore, KeySlot, LeafCert, TrustAnchorCert, DELEGATION_ROOT_ANCHOR_ID,
+    FACTORY_SIGNING_PUBLIC, FACTORY_SIGNING_SCALAR, KEY_TYPE_EC_P256, OP_GET_PUBKEY, OP_SIGN,
+    OP_VERIFY,
 };
 use hsm::KeyRole;
 use serde::Deserialize;
@@ -69,6 +70,14 @@ pub async fn mint_keystore_endpoint(
         .key_authority_ca
         .public_sec1()
         .map_err(AppError::Internal)?;
+    // The delegation root (DER) — the CA the device pins to accept a delegated
+    // (x5c) operator token. Provisioned in the keystore so it reaches the HSM by
+    // normal T1 provisioning, not an out-of-band file. Its own trust domain,
+    // distinct from key-authority / identity / sw-authority.
+    let delegation_root_der = s
+        .delegation_ca
+        .root_cert_der()
+        .map_err(AppError::Internal)?;
 
     // The device's tls-identity leaf, if it's been enrolled — delivered in the
     // keystore envelope (schema v3) so the cross-node mTLS listener finds its
@@ -89,6 +98,7 @@ pub async fn mint_keystore_endpoint(
         &ka_sec1,
         req.security_version,
         tls_leaf.as_deref(),
+        &delegation_root_der,
     )
     .map_err(AppError::Internal)?;
     Ok((
@@ -106,11 +116,16 @@ pub async fn mint_keystore_endpoint(
 /// private key, delivered on the one keystore channel (schema v3). It's `None`
 /// on first provision; the orchestrator supplies it on re-provision once the
 /// device's `tls-identity` CSR has been enrolled.
+///
+/// `delegation_root_der` (DER) is the delegation CA root, embedded as a pinned
+/// `trust_anchors` entry — the root a delegated operator token's `x5c` chain must
+/// validate to, provisioned into the HSM rather than an out-of-band file.
 fn assemble_keystore(
     sw_authority_sec1: &[u8; 65],
     key_authority_pub_sec1: &[u8; 65],
     security_version: u64,
     tls_identity_leaf: Option<&[u8]>,
+    delegation_root_der: &[u8],
 ) -> HsmKeystore {
     // Slots are driven by the canonical mandatory role set (the device wire
     // contract). Trust anchors carry a public key; device-generated slots carry
@@ -156,12 +171,21 @@ fn assemble_keystore(
         });
     }
 
+    // The delegation root — the CA the device pins to accept a delegated (x5c)
+    // operator token. A foreign CA root (its own trust domain), so it rides the
+    // dedicated `trust_anchors` channel, NOT `certificates` (device-key leaves).
+    let trust_anchors = vec![TrustAnchorCert {
+        anchor_id: DELEGATION_ROOT_ANCHOR_ID.to_string(),
+        certificate: delegation_root_der.to_vec(),
+    }];
+
     HsmKeystore {
         schema_version: payload::SCHEMA_VERSION,
         security_version,
         identities: Vec::new(),
         slots,
         certificates,
+        trust_anchors,
     }
 }
 
@@ -173,12 +197,15 @@ fn assemble_keystore(
 /// - `key_authority_pub_sec1` — this CA's pubkey, SEC1 (key-authority anchor).
 /// - `security_version`       — anti-rollback floor / SUIT sequence number.
 /// - `tls_identity_leaf`      — the device's signed `tls-identity` leaf (DER), or `None`.
+/// - `delegation_root_der`    — the delegation CA root (DER), pinned by the device
+///                              as the delegated-token trust anchor.
 pub fn mint_keystore(
     device_decrypt_cose: &[u8],
     sw_authority_cose: &[u8],
     key_authority_pub_sec1: &[u8; 65],
     security_version: u64,
     tls_identity_leaf: Option<&[u8]>,
+    delegation_root_der: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     let sw_authority_sec1 = cose_to_sec1(sw_authority_cose)?;
     let keystore = assemble_keystore(
@@ -186,6 +213,7 @@ pub fn mint_keystore(
         key_authority_pub_sec1,
         security_version,
         tls_identity_leaf,
+        delegation_root_der,
     );
     let cbor = payload::encode(&keystore).map_err(|e| anyhow!("encode HSM keystore: {e}"))?;
     // The SUIT image digest/size describe the PLAINTEXT keystore CBOR (what the
@@ -278,7 +306,8 @@ mod tests {
         let sw_cose = sw.public_key_bytes();
         let ka_sec1 = cose_to_sec1(&dev_cose).unwrap();
 
-        let suit = mint_keystore(&dev_cose, &sw_cose, &ka_sec1, 1, None).unwrap();
+        let suit = mint_keystore(&dev_cose, &sw_cose, &ka_sec1, 1, None, &[0x30, 0x82, 0x01, 0x00])
+            .unwrap();
         assert!(!suit.is_empty(), "minted keystore SUIT must be non-empty");
 
         // SEC1 <-> COSE roundtrip (the enrol pubkey conversion path).
@@ -293,7 +322,8 @@ mod tests {
         let ka = [0x04u8; 65];
         let leaf = vec![0x30, 0x82, 0x01, 0x00, 0xAB];
 
-        let ks = assemble_keystore(&sw, &ka, 1, Some(&leaf));
+        let root = vec![0x30, 0x82, 0x02, 0x00, 0xCA, 0xFE]; // stand-in delegation root DER
+        let ks = assemble_keystore(&sw, &ka, 1, Some(&leaf), &root);
         let tls = ks
             .certificates
             .iter()
@@ -306,7 +336,17 @@ mod tests {
             .iter()
             .any(|s| s.key_id == KeyRole::TlsIdentity.key_id()));
 
-        // No leaf → empty certificates (first-provision shape).
-        assert!(assemble_keystore(&sw, &ka, 1, None).certificates.is_empty());
+        // The delegation root is embedded as a pinned trust anchor.
+        let anchor = ks
+            .trust_anchors
+            .iter()
+            .find(|a| a.anchor_id == DELEGATION_ROOT_ANCHOR_ID)
+            .expect("delegation root embedded");
+        assert_eq!(anchor.certificate, root);
+
+        // No leaf → empty certificates, but the delegation root is always pinned.
+        let ks2 = assemble_keystore(&sw, &ka, 1, None, &root);
+        assert!(ks2.certificates.is_empty());
+        assert_eq!(ks2.trust_anchors.len(), 1);
     }
 }

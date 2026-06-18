@@ -23,6 +23,11 @@ pub struct AppState {
     /// Signs device TLS leaf certs — the identity root, a distinct CA whose root
     /// every node pins to verify a peer's leaf.
     pub identity_ca: Arc<Ca>,
+    /// Signs delegated capability grants (the workshop reset minter's leaf) — the
+    /// delegation root, a distinct CA again. Its root is provisioned into device
+    /// keystores so the SOVD authorizer accepts a delegated token's `x5c` chain,
+    /// keeping "who may grant a reset" off the node-identity trust domain.
+    pub delegation_ca: Arc<Ca>,
 }
 
 /// The roster columns projected into a [`wire::Device`]. Leaf certs are
@@ -183,24 +188,26 @@ pub struct DelegateCertResponse {
     pub cert_pem: String,
     /// The delegate's private key (PKCS#8 PEM). The minter signs tokens with this.
     pub key_pem: String,
-    /// The CA **identity root** (PEM) — the trust anchor a verifier pins; the
-    /// delegate chains to it.
+    /// The **delegation root** (PEM) — the trust anchor a verifier pins; the
+    /// delegate chains to it. Provisioned into devices via the HSM keystore.
     pub ca_root_pem: String,
 }
 
 /// `POST /admin/workshop/delegate-cert` — mint a workshop-delegate leaf granting
 /// the requested `scopes` (e.g. `reset:execute`). Returns the leaf cert, its
-/// private key, and the CA identity root so the caller has the full leaf-first
-/// chain plus the root to pin. Signed by the identity CA — a delegate of its root.
+/// private key, and the delegation root so the caller has the full leaf-first
+/// chain plus the root to pin. Signed by the **delegation** CA — a distinct trust
+/// domain from identity, so the authority to grant a reset never rides on the
+/// node-identity root. The device pins this root from its HSM keystore.
 pub async fn mint_delegate_cert(
     State(s): State<AppState>,
     Json(req): Json<DelegateCertReq>,
 ) -> Result<Json<DelegateCertResponse>, AppError> {
     let (cert_pem, key_pem) = s
-        .identity_ca
+        .delegation_ca
         .mint_delegate_leaf(&req.cn, &req.scopes)
         .map_err(AppError::Internal)?;
-    let ca_root_pem = s.identity_ca.root_cert_pem().map_err(AppError::Internal)?;
+    let ca_root_pem = s.delegation_ca.root_cert_pem().map_err(AppError::Internal)?;
     Ok(Json(DelegateCertResponse {
         cert_pem,
         key_pem,
