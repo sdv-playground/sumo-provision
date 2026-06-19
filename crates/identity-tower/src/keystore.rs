@@ -142,7 +142,7 @@ fn assemble_keystore(
                 // always resettable even if Tower 1's storage is lost. Production
                 // swaps in the real Tower-1/OEM HC root here (then key-escrowed).
                 // See docs/design/authorization.md §6.
-                KeyRole::HighConsequenceIssuer => FACTORY_SIGNING_PUBLIC.to_vec(),
+                KeyRole::ResetIssuer => FACTORY_SIGNING_PUBLIC.to_vec(),
                 // key-authority + platform/application/operational-issuer default
                 // to this CA's key for the dev flow; only firmware (sw-authority)
                 // is load-bearing here. Add distinct anchors when those tiers go live.
