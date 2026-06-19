@@ -477,10 +477,12 @@ pub async fn flash_bundle(
 pub enum RigToken {
     /// A pre-supplied bearer JWT, used verbatim for every component.
     Static(String),
-    /// Mint a per-device JWT (aud = device_id) on first use, then cache it.
+    /// Mint a per-device JWT on first use, then cache it. The token's audience is
+    /// the rig's ecu_id — its HSM device-key thumbprint, read from `x-sumo-id` at
+    /// mint time — which is what the device verifies, NOT its roster name.
     Mint {
         minter: MinterClient,
-        device_id: String,
+        rig_url: String,
         ttl_secs: Option<u64>,
         cached: Mutex<Option<String>>,
     },
@@ -492,21 +494,50 @@ impl RigToken {
         RigToken::Static(jwt.into())
     }
 
-    /// Mint per-device JWTs from `minter_url` (operator-authenticated to `/mint`),
-    /// bound to `device_id` as the audience.
+    /// Mint per-device JWTs from `minter_url` (operator-authenticated to `/mint`).
+    /// `rig_url` is the device's SOVD base — the audience is resolved from its
+    /// `x-sumo-id` (the ecu_id) at mint time, never supplied as a name.
     pub fn minting(
         minter_url: impl Into<String>,
         operator_token: impl Into<String>,
-        device_id: impl Into<String>,
+        rig_url: impl Into<String>,
         ttl_secs: Option<u64>,
     ) -> Self {
         RigToken::Mint {
             minter: MinterClient::new(minter_url, operator_token),
-            device_id: device_id.into(),
+            rig_url: rig_url.into(),
             ttl_secs,
             cached: Mutex::new(None),
         }
     }
+}
+
+/// Read the rig's ecu_id — its HSM device-key thumbprint — from the SOVD
+/// `x-sumo-id` endpoint. This is the token audience the device verifies (NOT its
+/// roster name); the same id `factory-reset.sh` reads to bind its reset token.
+async fn fetch_rig_ecu_id(rig_url: &str) -> Result<String, EngineError> {
+    let url = format!(
+        "{}/vehicle/v1/components/hsm/x-sumo-id",
+        rig_url.trim_end_matches('/')
+    );
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| EngineError::Internal(format!("read ecu id from {url}: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(EngineError::Internal(format!(
+            "read ecu id: {url} returned HTTP {}",
+            resp.status()
+        )));
+    }
+    let id = resp
+        .text()
+        .await
+        .map_err(|e| EngineError::Internal(format!("read ecu id body: {e}")))?;
+    let id = id.trim().trim_matches('"').to_string();
+    if id.is_empty() {
+        return Err(EngineError::Internal(format!("{url} returned an empty ecu id")));
+    }
+    Ok(id)
 }
 
 #[async_trait]
@@ -516,7 +547,7 @@ impl TokenSource for RigToken {
             RigToken::Static(jwt) => Ok(jwt.clone()),
             RigToken::Mint {
                 minter,
-                device_id,
+                rig_url,
                 ttl_secs,
                 cached,
             } => {
@@ -524,8 +555,12 @@ impl TokenSource for RigToken {
                 if let Some(tok) = guard.as_ref() {
                     return Ok(tok.clone());
                 }
+                // The token's `aud` must be the rig's ecu_id (its HSM device-key
+                // thumbprint, which the device verifies) — NOT its roster name.
+                // Resolve it from the device, the same id factory-reset.sh reads.
+                let ecu_id = fetch_rig_ecu_id(rig_url).await?;
                 let minted = minter
-                    .mint(device_id, &["*".to_string()], *ttl_secs)
+                    .mint(&ecu_id, &["*".to_string()], *ttl_secs)
                     .await
                     .map_err(|e| EngineError::Internal(format!("mint token: {e}")))?;
                 *guard = Some(minted.token.clone());

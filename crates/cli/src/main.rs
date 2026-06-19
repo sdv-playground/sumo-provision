@@ -576,7 +576,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
         } => {
             let target = sel.target();
             if execute {
-                let token = rig_token(&auth)?;
+                let token = rig_token(&auth, &args.url)?;
                 let result = orchestrator::flash_execute(
                     &args.url,
                     &hub_url,
@@ -671,7 +671,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     &auth.device,
                     Some(c.entity.as_str()),
                     false, // singleshot (rt) reboots via its own declared reset_kind
-                    rig_token(&auth)?,
+                    rig_token(&auth, &args.url)?,
                 )
                 .await?;
                 print_flash_result(&r, no_commit);
@@ -687,7 +687,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     &auth.device,
                     None,
                     true, // banked step: activate the whole step with ONE node reboot
-                    rig_token(&auth)?,
+                    rig_token(&auth, &args.url)?,
                 )
                 .await?;
                 print_flash_result(&r, no_commit);
@@ -707,7 +707,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             update,
             auth,
         } => {
-            let token = rig_token(&auth)?;
+            let token = rig_token(&auth, &args.url)?;
             let status = orchestrator::flash_commit(&args.url, &component, &update, token).await?;
             println!("{component} committed → {status}");
         }
@@ -716,18 +716,18 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             update,
             auth,
         } => {
-            let token = rig_token(&auth)?;
+            let token = rig_token(&auth, &args.url)?;
             let status =
                 orchestrator::flash_rollback(&args.url, &component, &update, token).await?;
             println!("{component} rolled back → {status}");
         }
         RigCmd::CommitTrials { auth } => {
-            let token = rig_token(&auth)?;
+            let token = rig_token(&auth, &args.url)?;
             orchestrator::flash_commit_trials(&args.url, token).await?;
             println!("node trials committed (the update session is the commit unit)");
         }
         RigCmd::RollbackTrials { auth } => {
-            let token = rig_token(&auth)?;
+            let token = rig_token(&auth, &args.url)?;
             orchestrator::flash_rollback_trials(&args.url, token).await?;
             println!("node trials rolled back");
         }
@@ -736,7 +736,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             update,
             auth,
         } => {
-            let token = rig_token(&auth)?;
+            let token = rig_token(&auth, &args.url)?;
             let status = orchestrator::flash_reset(&args.url, &component, &update, token).await?;
             println!("{component} reset → {status}");
         }
@@ -745,7 +745,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             hub_url,
             auth,
         } => {
-            let token = rig_token(&auth)?;
+            let token = rig_token(&auth, &args.url)?;
             let suit_bytes = std::fs::read(&suit)?;
             let trust_anchor = SoftwareClient::new(&hub_url).signer_pubkey().await?;
             let result =
@@ -765,7 +765,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
 /// else a per-device JWT minted on demand from `sovd-token-helper`
 /// (`--minter-url` + `--operator-token`). Errors if neither is supplied — every
 /// op that reaches here mutates the device and the device enforces auth.
-fn rig_token(auth: &AuthArgs) -> anyhow::Result<orchestrator::RigToken> {
+fn rig_token(auth: &AuthArgs, rig_url: &str) -> anyhow::Result<orchestrator::RigToken> {
     if let Some(t) = &auth.token {
         return Ok(orchestrator::RigToken::fixed(t.clone()));
     }
@@ -777,7 +777,7 @@ fn rig_token(auth: &AuthArgs) -> anyhow::Result<orchestrator::RigToken> {
         return Ok(orchestrator::RigToken::minting(
             minter_url,
             operator_token,
-            auth.device.clone(),
+            rig_url,
             None,
         ));
     }
@@ -984,7 +984,7 @@ async fn finalize_step(
     if !step_came_up(r) {
         eprintln!("  step '{label}' unhealthy — an ECU did not come up; rolling back + aborting.");
         if !trial.is_empty() {
-            match orchestrator::flash_rollback_all(rig_url, &trial, rig_token(auth)?).await {
+            match orchestrator::flash_rollback_all(rig_url, &trial, rig_token(auth, rig_url)?).await {
                 Ok(rolled) => {
                     for (entity, state) in rolled {
                         eprintln!("    rolled back {entity} → {state}");
@@ -998,7 +998,7 @@ async fn finalize_step(
     if no_commit || trial.is_empty() {
         return Ok(()); // singleshot is write-through; or operator wants a manual verdict
     }
-    for (entity, state) in orchestrator::flash_commit_all(rig_url, &trial, rig_token(auth)?).await?
+    for (entity, state) in orchestrator::flash_commit_all(rig_url, &trial, rig_token(auth, rig_url)?).await?
     {
         println!("  committed {entity} (healthy) → {state}");
     }
