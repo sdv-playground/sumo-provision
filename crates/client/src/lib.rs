@@ -397,6 +397,8 @@ struct MintReq<'a> {
     device_id: &'a str,
     components: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
+    boot_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     ttl_secs: Option<u64>,
 }
 
@@ -419,11 +421,13 @@ impl MinterClient {
     }
 
     /// `POST /mint` — mint a token bound to `device_id` (the `aud`, the replay
-    /// guard) granting the given component scopes (`["*"]` for all).
+    /// guard) granting the given component scopes (`["*"]` for all). `boot_id`, when
+    /// supplied, binds it to the device's current boot (§7.1 freshness).
     pub async fn mint(
         &self,
         device_id: &str,
         components: &[String],
+        boot_id: Option<&str>,
         ttl_secs: Option<u64>,
     ) -> Result<MintedToken, ClientError> {
         Ok(self
@@ -433,6 +437,7 @@ impl MinterClient {
             .json(&MintReq {
                 device_id,
                 components,
+                boot_id,
                 ttl_secs,
             })
             .send()
