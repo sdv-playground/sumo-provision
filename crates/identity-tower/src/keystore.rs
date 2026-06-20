@@ -14,10 +14,10 @@ use coset::iana;
 use coset::CborSerializable;
 use hsm::payload::{
     self, HsmKeystore, KeySlot, LeafCert, TrustAnchorCert, DELEGATION_ROOT_ANCHOR_ID,
-    FACTORY_SIGNING_PUBLIC, FACTORY_SIGNING_SCALAR, KEY_TYPE_EC_P256, OP_GET_PUBKEY, OP_SIGN,
-    OP_VERIFY,
+    FACTORY_SIGNING_PUBLIC, FACTORY_SIGNING_SCALAR, KEY_TYPE_AES_256, KEY_TYPE_EC_P256, OP_DECRYPT,
+    OP_ENCRYPT, OP_GET_PUBKEY, OP_SIGN, OP_VERIFY,
 };
-use hsm::KeyRole;
+use hsm::{KeyRole, KeyType};
 use serde::Deserialize;
 use sqlx::Row;
 use sumo_offboard::cose_key::CoseKey;
@@ -149,14 +149,19 @@ fn assemble_keystore(
                 _ => key_authority_pub_sec1.to_vec(),
             })
         };
+        // The lone AES slot (storage-key) is symmetric: KEY_TYPE_AES_256,
+        // ENCRYPT/DECRYPT, never a public-key op. Every other slot is EC-P256.
+        let is_aes = role.key_type() == KeyType::Aes256;
         let allowed_ops = if anchor_public_key.is_some() {
             Some(vec![OP_VERIFY, OP_GET_PUBKEY])
+        } else if is_aes {
+            Some(vec![OP_ENCRYPT, OP_DECRYPT])
         } else {
             Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY])
         };
         slots.push(KeySlot {
             key_id: role.key_id().to_string(),
-            key_kind: KEY_TYPE_EC_P256,
+            key_kind: if is_aes { KEY_TYPE_AES_256 } else { KEY_TYPE_EC_P256 },
             anchor_public_key,
             allowed_guests: None,
             allowed_ops,
@@ -348,5 +353,58 @@ mod tests {
         let ks2 = assemble_keystore(&sw, &ka, 1, None, &root);
         assert!(ks2.certificates.is_empty());
         assert_eq!(ks2.trust_anchors.len(), 1);
+    }
+
+    #[test]
+    fn keystore_emits_no_private_or_symmetric_material() {
+        // The Tower keystore is PUBLIC-ONLY. Every device-generated slot — the
+        // in-HSM keypairs AND the AES storage key — must ship with NO key
+        // material; the HSM generates those locally. Only verify-anchors carry
+        // bytes, and those are PUBLIC keys (65-byte uncompressed SEC1).
+        let sw = [0x04u8; 65];
+        let ka = [0x04u8; 65];
+        let root = vec![0x30, 0x82, 0x02, 0x00, 0xCA, 0xFE];
+        let ks = assemble_keystore(&sw, &ka, 1, None, &root);
+
+        for &role in KeyRole::mandatory_roles() {
+            let slot = ks
+                .slots
+                .iter()
+                .find(|s| s.key_id == role.key_id())
+                .expect("every mandatory role has a slot");
+            if role.is_device_generated() {
+                assert!(
+                    slot.anchor_public_key.is_none(),
+                    "device-generated slot {} must ship NO key material",
+                    role.key_id()
+                );
+            } else {
+                let pk = slot
+                    .anchor_public_key
+                    .as_ref()
+                    .expect("anchor slot carries its public key");
+                assert_eq!(pk.len(), 65, "anchor {} public is SEC1", role.key_id());
+                assert_eq!(pk[0], 0x04);
+            }
+        }
+
+        // The lone AES slot: symmetric, device-generated, encrypt/decrypt — and
+        // critically carries no key bytes.
+        let storage = ks
+            .slots
+            .iter()
+            .find(|s| s.key_id == KeyRole::Storage.key_id())
+            .expect("storage-key slot present");
+        assert_eq!(storage.key_kind, KEY_TYPE_AES_256);
+        assert!(
+            storage.anchor_public_key.is_none(),
+            "storage-key must ship no key bytes"
+        );
+        assert_eq!(storage.allowed_ops, Some(vec![OP_ENCRYPT, OP_DECRYPT]));
+
+        // The device's own decoder accepts it — proving the AES "no material"
+        // guard (`KeySlot::validate`) is satisfied, not tripped.
+        let bytes = payload::encode(&ks).expect("encode");
+        payload::decode(&bytes).expect("device decode accepts the public-only keystore");
     }
 }
