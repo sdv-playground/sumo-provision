@@ -14,8 +14,8 @@ use client::{ClientError, IdentityClient, MinterClient, SoftwareClient};
 use serde::{Deserialize, Serialize};
 use sovd_client::{SovdClient, SovdClientError};
 use sumo_sovd_flash_engine::{
-    EcuState, EcuStatus, EngineError, EngineTimeouts, FlashEngine, FlashJob, FlashPlan, Payload,
-    PayloadSource, TokenSource, UpdateType,
+    CameUp, CampaignStep, EcuState, EcuStatus, EngineError, EngineTimeouts, FlashEngine, FlashJob,
+    FlashPlan, Payload, PayloadSource, TokenSource, UpdateType,
 };
 use tokio::sync::Mutex;
 use wire::{ContentHash, Entity, Part, Tree, UpdateMode};
@@ -471,20 +471,25 @@ pub async fn flash_bundle(
 
 /// Bearer-token source for the flash engine's SOVD calls — replaces the old
 /// `api_key`-as-Bearer hack. Either a token the operator supplied directly, or a
-/// per-device JWT minted from `sovd-token-helper`. Minting is cached for the run
-/// (one mint per flash, device-scoped `*`) — matching the single-token flow the
-/// fork used, and covering every component plus the engine's entity-root restart.
+/// per-device JWT minted from `sovd-token-helper` (device-scoped `*`, covering
+/// every component plus the engine's entity-root restart). The minted token is
+/// **bound to the device's boot** (`boot_id`, which the boot-bound reset route
+/// verifies), so it is cached **per boot**: a multi-step campaign that reboots
+/// more than once re-mints once the live `boot_id` moves — only a cheap
+/// `x-sumo-boot-id` GET is per-call; the mint itself happens once per boot.
 pub enum RigToken {
     /// A pre-supplied bearer JWT, used verbatim for every component.
     Static(String),
-    /// Mint a per-device JWT on first use, then cache it. The token's audience is
-    /// the rig's ecu_id — its HSM device-key thumbprint, read from `x-sumo-id` at
-    /// mint time — which is what the device verifies, NOT its roster name.
+    /// Mint a per-device JWT, re-minting when the device's boot changes. The
+    /// token's audience is the rig's ecu_id — its HSM device-key thumbprint, read
+    /// from `x-sumo-id` — which is what the device verifies, NOT its roster name.
     Mint {
         minter: MinterClient,
         rig_url: String,
         ttl_secs: Option<u64>,
-        cached: Mutex<Option<String>>,
+        /// `(boot_id, token)` — the token minted for that boot. Re-minted when the
+        /// live boot_id differs (a reboot rotated it).
+        cached: Mutex<Option<(String, String)>>,
     },
 }
 
@@ -532,7 +537,9 @@ async fn fetch_rig_id(rig_url: &str, path: &str, what: &str) -> Result<String, E
         .map_err(|e| EngineError::Internal(format!("read {what} body: {e}")))?;
     let id = id.trim().trim_matches('"').to_string();
     if id.is_empty() {
-        return Err(EngineError::Internal(format!("{url} returned an empty {what}")));
+        return Err(EngineError::Internal(format!(
+            "{url} returned an empty {what}"
+        )));
     }
     Ok(id)
 }
@@ -559,21 +566,28 @@ impl TokenSource for RigToken {
                 ttl_secs,
                 cached,
             } => {
+                // The minted token's `boot_id` is bound at the device by the
+                // boot-bound reset route, so it is only valid for the current boot.
+                // Read the live boot_id first; reuse the cached token only while the
+                // boot hasn't moved, and re-mint when it has (a campaign step that
+                // rebooted). This makes a multi-reboot campaign work with one
+                // `RigToken` — only this GET is per-call, the mint is once per boot.
+                let boot_id = fetch_rig_boot_id(rig_url).await?;
                 let mut guard = cached.lock().await;
-                if let Some(tok) = guard.as_ref() {
-                    return Ok(tok.clone());
+                if let Some((cached_boot, tok)) = guard.as_ref() {
+                    if cached_boot == &boot_id {
+                        return Ok(tok.clone());
+                    }
                 }
                 // The token's `aud` is the rig's ecu_id (its HSM device-key
-                // thumbprint) and its `boot_id` is the rig's live boot nonce — both
-                // resolved from the device (NOT the roster name, NOT a stale boot),
-                // the same ids factory-reset.sh reads. Destructive routes bind both.
+                // thumbprint), resolved from the device (NOT the roster name), and
+                // its `boot_id` is the live boot just read above.
                 let ecu_id = fetch_rig_ecu_id(rig_url).await?;
-                let boot_id = fetch_rig_boot_id(rig_url).await?;
                 let minted = minter
                     .mint(&ecu_id, &["*".to_string()], Some(&boot_id), *ttl_secs)
                     .await
                     .map_err(|e| EngineError::Internal(format!("mint token: {e}")))?;
-                *guard = Some(minted.token.clone());
+                *guard = Some((boot_id, minted.token.clone()));
                 Ok(minted.token)
             }
         }
@@ -694,6 +708,88 @@ pub async fn flash_execute(
         device: device_id.to_string(),
         components: ecus.iter().map(component_result).collect(),
     })
+}
+
+/// Run the rig campaign over the shared engine: resolve the channel target, group
+/// the shipping components into ordered steps (each singleshot alone, the banked
+/// group together), and drive [`FlashEngine::run_campaign`] — per step
+/// `guard → stage → reset → health (CameUp) → commit | rollback + abort`, on one
+/// committed baseline. An unhealthy step rolls back its trial and aborts the chain.
+/// `no_commit` leaves healthy banked steps in trial for a manual verdict. Returns
+/// each component's final state; an empty result means the rig was already at the
+/// target. **Destructive: mutates the rig.**
+#[allow(clippy::too_many_arguments)] // rig + two tower URLs, selector, flag, token — all distinct
+pub async fn campaign_execute(
+    rig_url: &str,
+    hub_url: &str,
+    ca_url: &str,
+    target: &ChannelTarget,
+    device_id: &str,
+    no_commit: bool,
+    token: RigToken,
+) -> Result<Vec<ComponentFlashResult>, Error> {
+    // Resolve + partition the shipping components by update mode: singleshot
+    // (irreversible, write-through) vs banked (reversible trial) — the same source
+    // the engine's no-mix guard reads off the device.
+    let plan = apply_plan(rig_url, hub_url, target, None).await?;
+    let shipping: Vec<&ComponentApply> = plan
+        .components
+        .iter()
+        .filter(|c| !c.ship.is_empty())
+        .collect();
+    if shipping.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (singleshot, banked): (Vec<&ComponentApply>, Vec<&ComponentApply>) = shipping
+        .into_iter()
+        .partition(|c| c.supports_rollback == Some(false));
+
+    // Build the ordered steps. Each component's plan is built individually
+    // (`only = Some`), so a step's jobs don't depend on prior steps' device state;
+    // the banked components are then grouped into ONE step (`force_ecu_reset`: a
+    // single coalesced node reboot activates them together). Singleshot steps come
+    // first (each its own transaction), the banked group last.
+    let mut steps: Vec<CampaignStep> = Vec::new();
+    let mut trust_anchor: Option<Vec<u8>> = None;
+    for c in &singleshot {
+        let (p, ta) =
+            build_flash_plan(rig_url, hub_url, ca_url, target, device_id, Some(&c.entity)).await?;
+        trust_anchor.get_or_insert(ta);
+        steps.push(CampaignStep {
+            jobs: p.jobs,
+            force_ecu_reset: false,
+        });
+    }
+    if !banked.is_empty() {
+        let mut jobs = Vec::new();
+        for c in &banked {
+            let (p, ta) =
+                build_flash_plan(rig_url, hub_url, ca_url, target, device_id, Some(&c.entity))
+                    .await?;
+            trust_anchor.get_or_insert(ta);
+            jobs.extend(p.jobs);
+        }
+        steps.push(CampaignStep {
+            jobs,
+            force_ecu_reset: true,
+        });
+    }
+    if steps.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // One engine + the rig's (boot-aware) minting token; `run_campaign` varies
+    // `force_ecu_reset` per step internally, and the token re-mints across the
+    // reboots. `CameUp` is the shared default health gate — the rig's former
+    // `step_came_up`, now in the engine.
+    let engine = FlashEngine::new(
+        rig_url,
+        Arc::new(token),
+        trust_anchor.unwrap_or_default(),
+        EngineTimeouts::default(),
+    );
+    let report = engine.run_campaign(steps, &CameUp, no_commit).await?;
+    Ok(report.ecus.iter().map(component_result).collect())
 }
 
 /// Install a pre-built, factory-signed HSM keystore SUIT on the rig's `hsm`

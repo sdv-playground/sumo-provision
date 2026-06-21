@@ -553,11 +553,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                 print_diff(&wire::diff(&observed, &desired));
             }
         }
-        RigCmd::Apply {
-            sel,
-            hub_url,
-            json,
-        } => {
+        RigCmd::Apply { sel, hub_url, json } => {
             let plan = orchestrator::apply_plan(&args.url, &hub_url, &sel.target(), None).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -626,7 +622,10 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                 .filter(|c| !c.ship.is_empty())
                 .collect();
             if shipping.is_empty() {
-                println!("up to date — nothing to flash for channel '{}'", sel.channel);
+                println!(
+                    "up to date — nothing to flash for channel '{}'",
+                    sel.channel
+                );
                 return Ok(());
             }
             // Singleshot (irreversible) components each flash in their own
@@ -654,44 +653,25 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     node_state.components
                 );
             }
-            // Step through: each singleshot alone, then the banked group. After each
-            // step, `finalize_step` gates on system health and (unless --no-commit)
-            // commits the banked trial BEFORE the next step — a multi-reboot chain
-            // must commit each good step rather than stack uncommitted trials (which
-            // the device's verdict watchdog would auto-revert). An unhealthy step
-            // rolls back and aborts the chain. By the banked step the singleshots are
-            // committed + up-to-date, so a no-filter flash ships only the banked ones.
-            for c in &singleshot {
-                println!("\n== campaign step: {} (singleshot) ==", c.entity);
-                let r = orchestrator::flash_execute(
-                    &args.url,
-                    &hub_url,
-                    &ca_url,
-                    &target,
-                    &auth.device,
-                    Some(c.entity.as_str()),
-                    false, // singleshot (rt) reboots via its own declared reset_kind
-                    rig_token(&auth, &args.url)?,
-                )
-                .await?;
-                print_flash_result(&r, no_commit);
-                finalize_step(&args.url, &c.entity, &r, no_commit, &auth).await?;
-            }
-            if !banked.is_empty() {
-                println!("\n== campaign step: banked VMs ==");
-                let r = orchestrator::flash_execute(
-                    &args.url,
-                    &hub_url,
-                    &ca_url,
-                    &target,
-                    &auth.device,
-                    None,
-                    true, // banked step: activate the whole step with ONE node reboot
-                    rig_token(&auth, &args.url)?,
-                )
-                .await?;
-                print_flash_result(&r, no_commit);
-                finalize_step(&args.url, "banked VMs", &r, no_commit, &auth).await?;
+            // Run the campaign over the shared engine (`run_campaign`): each
+            // singleshot alone, then the banked group, with per-step health-gating
+            // (`CameUp`) and — unless --no-commit — a per-step commit so the chain
+            // builds on a committed baseline; an unhealthy step rolls back its trial
+            // and aborts. The grouping + health + commit loop is now the engine's,
+            // shared with the onboard / campaign drivers (the rig's per-step token
+            // re-mints across the reboots).
+            let results = orchestrator::campaign_execute(
+                &args.url,
+                &hub_url,
+                &ca_url,
+                &target,
+                &auth.device,
+                no_commit,
+                rig_token(&auth, &args.url)?,
+            )
+            .await?;
+            for r in &results {
+                println!("  {} → {}", r.entity, r.state);
             }
             println!(
                 "\ncampaign complete — {}",
@@ -935,74 +915,6 @@ fn print_bundle(b: &orchestrator::FlashBundle) {
         "would flash (per component): SOVD open_update → upload manifest + payloads → prepare → execute → commit"
     );
     println!("(dry run — no rig flash; the live flash authenticates to SOVD with a sovd-token-helper JWT)");
-}
-
-/// Minimal system-health gate for the campaign's per-step auto-commit.
-///
-/// NOTE — TO ELABORATE: "good system state" is not yet fully specified. The real
-/// gate should probe each running ECU's own health (heartbeat / app-level
-/// liveness) and confirm the WHOLE system came back after a node reboot, not just
-/// the components this step touched. For now we use the minimal definition agreed
-/// with the operator: every component this step reset came back up — the engine
-/// drove each to `Activated` (banked trial) or `Committed` (singleshot
-/// write-through), none left `Failed`/`RolledBack`. `flash_execute` already polls
-/// that, so an all-came-up result IS "each running ECU came up again". Grow the
-/// health contract here when it's defined.
-fn step_came_up(r: &orchestrator::FlashResult) -> bool {
-    !r.components.is_empty()
-        && r.components
-            .iter()
-            .all(|c| matches!(c.state.as_str(), "Activated" | "Committed"))
-}
-
-/// Health-gate a finished campaign step, then (unless `no_commit`) commit its
-/// banked trial so the next step builds on a committed baseline. Banked
-/// components sit in `Activated` (trial) and need an explicit commit; singleshot
-/// ones are already `Committed` (write-through), nothing to do. An unhealthy step
-/// rolls back whatever reached trial and aborts the campaign — never proceed on a
-/// bad baseline.
-async fn finalize_step(
-    rig_url: &str,
-    label: &str,
-    r: &orchestrator::FlashResult,
-    no_commit: bool,
-    auth: &AuthArgs,
-) -> anyhow::Result<()> {
-    // The step's banked components sit in `Activated` (trial); singleshot ones are
-    // already `Committed`. The trial is a step-level transaction, so commit (or roll
-    // back) the whole set in ONE engine verdict — not once per component.
-    let trial: Vec<(String, String)> = r
-        .components
-        .iter()
-        .filter(|c| c.state == "Activated")
-        .filter_map(|c| {
-            c.update_id
-                .as_deref()
-                .map(|id| (c.entity.clone(), id.to_string()))
-        })
-        .collect();
-    if !step_came_up(r) {
-        eprintln!("  step '{label}' unhealthy — an ECU did not come up; rolling back + aborting.");
-        if !trial.is_empty() {
-            match orchestrator::flash_rollback_all(rig_url, &trial, rig_token(auth, rig_url)?).await {
-                Ok(rolled) => {
-                    for (entity, state) in rolled {
-                        eprintln!("    rolled back {entity} → {state}");
-                    }
-                }
-                Err(e) => eprintln!("    rollback failed: {e}"),
-            }
-        }
-        anyhow::bail!("campaign aborted: step '{label}' left the system unhealthy");
-    }
-    if no_commit || trial.is_empty() {
-        return Ok(()); // singleshot is write-through; or operator wants a manual verdict
-    }
-    for (entity, state) in orchestrator::flash_commit_all(rig_url, &trial, rig_token(auth, rig_url)?).await?
-    {
-        println!("  committed {entity} (healthy) → {state}");
-    }
-    Ok(())
 }
 
 fn print_flash_result(r: &orchestrator::FlashResult, trial_hint: bool) {
