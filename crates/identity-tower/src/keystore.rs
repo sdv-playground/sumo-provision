@@ -161,7 +161,11 @@ fn assemble_keystore(
         };
         slots.push(KeySlot {
             key_id: role.key_id().to_string(),
-            key_kind: if is_aes { KEY_TYPE_AES_256 } else { KEY_TYPE_EC_P256 },
+            key_kind: if is_aes {
+                KEY_TYPE_AES_256
+            } else {
+                KEY_TYPE_EC_P256
+            },
             anchor_public_key,
             allowed_guests: None,
             allowed_ops,
@@ -311,8 +315,15 @@ mod tests {
         let sw_cose = sw.public_key_bytes();
         let ka_sec1 = cose_to_sec1(&dev_cose).unwrap();
 
-        let suit = mint_keystore(&dev_cose, &sw_cose, &ka_sec1, 1, None, &[0x30, 0x82, 0x01, 0x00])
-            .unwrap();
+        let suit = mint_keystore(
+            &dev_cose,
+            &sw_cose,
+            &ka_sec1,
+            1,
+            None,
+            &[0x30, 0x82, 0x01, 0x00],
+        )
+        .unwrap();
         assert!(!suit.is_empty(), "minted keystore SUIT must be non-empty");
 
         // SEC1 <-> COSE roundtrip (the enrol pubkey conversion path).

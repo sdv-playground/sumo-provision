@@ -207,7 +207,10 @@ pub async fn mint_delegate_cert(
         .delegation_ca
         .mint_delegate_leaf(&req.cn, &req.scopes)
         .map_err(AppError::Internal)?;
-    let ca_root_pem = s.delegation_ca.root_cert_pem().map_err(AppError::Internal)?;
+    let ca_root_pem = s
+        .delegation_ca
+        .root_cert_pem()
+        .map_err(AppError::Internal)?;
     Ok(Json(DelegateCertResponse {
         cert_pem,
         key_pem,

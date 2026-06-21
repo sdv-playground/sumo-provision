@@ -217,11 +217,7 @@ impl Ca {
     /// Unlike [`issue_leaf`], the keypair is generated **here** (no CSR): the CA
     /// is the one bootstrapping the delegate, so it returns both halves. Returns
     /// `(cert_pem, key_pkcs8_pem)` — the leaf cert and its private key, PEM.
-    pub fn mint_delegate_leaf(
-        &self,
-        cn: &str,
-        scopes: &str,
-    ) -> anyhow::Result<(String, String)> {
+    pub fn mint_delegate_leaf(&self, cn: &str, scopes: &str) -> anyhow::Result<(String, String)> {
         let key = SigningKey::random(&mut OsRng);
         let spki = SubjectPublicKeyInfoOwned::from_key(*key.verifying_key())?;
         let subject = Name::from_str(&format!("CN={cn}"))?;
