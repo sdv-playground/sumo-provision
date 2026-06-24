@@ -52,25 +52,25 @@ pub struct NewVehicleRelease {
     pub config_snapshot: Option<Value>,
 }
 
-/// `PUT /admin/channel-targets` body — point a (channel, target_type, profile)
+/// `PUT /admin/channel-targets` body — point a (channel, device, architecture)
 /// at a vehicle (target) release.
 #[derive(Deserialize)]
 pub struct SetChannelTarget {
     pub channel: String,
-    pub target_type: String,
-    pub profile: String,
+    pub device: String,
+    pub architecture: String,
     #[serde(alias = "target_release_id")]
     pub vehicle_release_id: i64,
 }
 
-/// Query for resolving a channel target. `target_type` / `profile` are optional —
+/// Query for resolving a channel target. `device` / `architecture` are optional —
 /// omit them to resolve a channel that has a single target (the common case);
 /// supply both to disambiguate when a channel serves several.
 #[derive(Deserialize)]
 pub struct TargetSelector {
     pub channel: String,
-    pub target_type: Option<String>,
-    pub profile: Option<String>,
+    pub device: Option<String>,
+    pub architecture: Option<String>,
 }
 
 /// A resolved release. `reused` is true when the content already had a release
@@ -101,9 +101,9 @@ impl ReleaseRef {
 pub struct ChannelTargetState {
     pub channel: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_type: Option<String>,
+    pub device: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile: Option<String>,
+    pub architecture: Option<String>,
     /// Deprecated compatibility field. Prefer `target_release`.
     pub vehicle: Option<VehicleRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -118,8 +118,8 @@ pub struct ChannelTargetState {
 #[derive(Serialize)]
 pub struct ChannelTargetRef {
     pub channel: String,
-    pub target_type: String,
-    pub profile: String,
+    pub device: String,
+    pub architecture: String,
     pub vehicle_release_id: i64,
     pub tree_hash: String,
 }
@@ -248,7 +248,7 @@ pub async fn create_vehicle_release(
     Ok(Json(ReleaseRef::from_row(&row, false)))
 }
 
-/// `PUT /admin/channel-targets` — point (channel, target_type, profile) at a
+/// `PUT /admin/channel-targets` — point (channel, device, architecture) at a
 /// vehicle release, and store the `tree_hash` of its resolved tree.
 pub async fn set_channel_target(
     State(s): State<AppState>,
@@ -261,14 +261,14 @@ pub async fn set_channel_target(
     let th = tree_hash(&tree);
     sqlx::query(
         "INSERT INTO channel_targets \
-           (channel, target_type, profile, vehicle_release_id, tree_hash, updated_at) \
+           (channel, device, architecture, vehicle_release_id, tree_hash, updated_at) \
          VALUES ($1, $2, $3, $4, $5, now()) \
-         ON CONFLICT (channel, target_type, profile) \
+         ON CONFLICT (channel, device, architecture) \
            DO UPDATE SET vehicle_release_id = $4, tree_hash = $5, updated_at = now()",
     )
     .bind(&req.channel)
-    .bind(&req.target_type)
-    .bind(&req.profile)
+    .bind(&req.device)
+    .bind(&req.architecture)
     .bind(req.vehicle_release_id)
     .bind(&th)
     .execute(pool)
@@ -276,8 +276,8 @@ pub async fn set_channel_target(
     .map_err(db)?;
     Ok(Json(ChannelTargetRef {
         channel: req.channel,
-        target_type: req.target_type,
-        profile: req.profile,
+        device: req.device,
+        architecture: req.architecture,
         vehicle_release_id: req.vehicle_release_id,
         tree_hash: th,
     }))
@@ -289,11 +289,11 @@ pub async fn list_channels(
 ) -> Result<Json<Vec<ChannelTargetState>>, AppError> {
     let pool = s.pool()?;
     let rows = sqlx::query(
-        "SELECT ct.channel, ct.target_type, ct.profile, ct.tree_hash, \
+        "SELECT ct.channel, ct.device, ct.architecture, ct.tree_hash, \
                 v.config_snapshot, v.id, v.tag, v.version, \
                 v.created_at::text AS created_at \
          FROM channel_targets ct JOIN vehicle_releases v ON v.id = ct.vehicle_release_id \
-         ORDER BY ct.channel, ct.target_type, ct.profile",
+         ORDER BY ct.channel, ct.device, ct.architecture",
     )
     .fetch_all(pool)
     .await
@@ -310,8 +310,8 @@ pub async fn list_channels(
             };
             ChannelTargetState {
                 channel: r.get("channel"),
-                target_type: Some(r.get("target_type")),
-                profile: Some(r.get("profile")),
+                device: Some(r.get("device")),
+                architecture: Some(r.get("architecture")),
                 vehicle: Some(target_release.clone()),
                 target_release: Some(target_release),
                 tree_hash: Some(r.get("tree_hash")),
@@ -333,25 +333,25 @@ pub async fn get_channel_target(
 ) -> Result<Json<ChannelTargetState>, AppError> {
     let pool = s.pool()?;
     let row = sqlx::query(
-        "SELECT ct.target_type, ct.profile, v.config_snapshot, v.id, v.tag, v.version, \
+        "SELECT ct.device, ct.architecture, v.config_snapshot, v.id, v.tag, v.version, \
                 v.created_at::text AS created_at, ct.tree_hash \
          FROM channel_targets ct JOIN vehicle_releases v ON v.id = ct.vehicle_release_id \
          WHERE ct.channel = $1 \
-           AND ($2::text IS NULL OR ct.target_type = $2) \
-           AND ($3::text IS NULL OR ct.profile = $3) \
+           AND ($2::text IS NULL OR ct.device = $2) \
+           AND ($3::text IS NULL OR ct.architecture = $3) \
          ORDER BY ct.updated_at DESC LIMIT 1",
     )
     .bind(&sel.channel)
-    .bind(&sel.target_type)
-    .bind(&sel.profile)
+    .bind(&sel.device)
+    .bind(&sel.architecture)
     .fetch_optional(pool)
     .await
     .map_err(db)?;
 
-    let (target_type, profile, target_release, tree_hash, config_snapshot) = match row {
+    let (device, architecture, target_release, tree_hash, config_snapshot) = match row {
         Some(r) => (
-            Some(r.get("target_type")),
-            Some(r.get("profile")),
+            Some(r.get("device")),
+            Some(r.get("architecture")),
             Some(VehicleRef {
                 id: r.get("id"),
                 tag: r.get("tag"),
@@ -365,8 +365,8 @@ pub async fn get_channel_target(
     };
     Ok(Json(ChannelTargetState {
         channel: sel.channel,
-        target_type,
-        profile,
+        device,
+        architecture,
         vehicle: target_release.clone(),
         target_release,
         tree_hash,
@@ -384,8 +384,8 @@ pub async fn channel_target_tree(
     let tree = resolve_channel_target(
         s.pool()?,
         &sel.channel,
-        sel.target_type.as_deref(),
-        sel.profile.as_deref(),
+        sel.device.as_deref(),
+        sel.architecture.as_deref(),
     )
     .await
     .map_err(db)?
@@ -450,39 +450,39 @@ fn vehicle_identity(members: &[i64]) -> String {
 
 // --- resolution ------------------------------------------------------------
 
-/// Resolve a (channel, target_type?, profile?) to its desired [`wire::Tree`].
-/// `None` when the target is unknown (or, without an explicit type/profile, the
+/// Resolve a (channel, device?, architecture?) to its desired [`wire::Tree`].
+/// `None` when the target is unknown (or, without an explicit device/arch, the
 /// channel has zero or several targets — the caller then asks for a selector).
 async fn resolve_channel_target(
     pool: &PgPool,
     channel: &str,
-    target_type: Option<&str>,
-    profile: Option<&str>,
+    device: Option<&str>,
+    architecture: Option<&str>,
 ) -> sqlx::Result<Option<Tree>> {
-    let Some(vehicle_id) = channel_target_vehicle(pool, channel, target_type, profile).await?
+    let Some(vehicle_id) = channel_target_vehicle(pool, channel, device, architecture).await?
     else {
         return Ok(None);
     };
     Ok(Some(resolve_members_to_tree(pool, vehicle_id).await?))
 }
 
-/// The vehicle release id a (channel, target_type?, profile?) points at. With an
-/// explicit type+profile it's an exact lookup; without, it resolves a channel
-/// that has exactly one target (zero or many -> `None`).
+/// The vehicle release id a (channel, device?, architecture?) points at. With an
+/// explicit device+architecture it's an exact lookup; without, it resolves a
+/// channel that has exactly one target (zero or many -> `None`).
 async fn channel_target_vehicle(
     pool: &PgPool,
     channel: &str,
-    target_type: Option<&str>,
-    profile: Option<&str>,
+    device: Option<&str>,
+    architecture: Option<&str>,
 ) -> sqlx::Result<Option<i64>> {
-    if let (Some(t), Some(p)) = (target_type, profile) {
+    if let (Some(d), Some(a)) = (device, architecture) {
         let row = sqlx::query(
             "SELECT vehicle_release_id FROM channel_targets \
-             WHERE channel = $1 AND target_type = $2 AND profile = $3",
+             WHERE channel = $1 AND device = $2 AND architecture = $3",
         )
         .bind(channel)
-        .bind(t)
-        .bind(p)
+        .bind(d)
+        .bind(a)
         .fetch_optional(pool)
         .await?;
         return Ok(row.map(|r| r.get("vehicle_release_id")));
@@ -632,15 +632,15 @@ mod tests {
     fn set_channel_target_accepts_target_release_alias() {
         let req: SetChannelTarget = serde_json::from_value(serde_json::json!({
             "channel": "bleeding",
-            "target_type": "managed-cvc-rig",
-            "profile": "default",
+            "device": "rig",
+            "architecture": "arm64",
             "target_release_id": 42
         }))
         .unwrap();
 
         assert_eq!(req.channel, "bleeding");
-        assert_eq!(req.target_type, "managed-cvc-rig");
-        assert_eq!(req.profile, "default");
+        assert_eq!(req.device, "rig");
+        assert_eq!(req.architecture, "arm64");
         assert_eq!(req.vehicle_release_id, 42);
     }
 
@@ -706,8 +706,8 @@ mod tests {
             "/admin/channel-targets",
             serde_json::json!({
                 "channel": "bleeding",
-                "target_type": "managed-cvc-rig",
-                "profile": "default",
+                "device": "rig",
+                "architecture": "arm64",
                 "target_release_id": release_id
             }),
         )
@@ -729,7 +729,7 @@ mod tests {
 
         let channel = get_json(
             &app,
-            "/admin/channel-targets?channel=bleeding&target_type=managed-cvc-rig&profile=default",
+            "/admin/channel-targets?channel=bleeding&device=rig&architecture=arm64",
         )
         .await;
         assert_eq!(channel["target_release"]["id"], release_id);
@@ -741,8 +741,8 @@ mod tests {
 
         let channels = get_json(&app, "/admin/channels").await;
         assert_eq!(channels[0]["channel"], "bleeding");
-        assert_eq!(channels[0]["target_type"], "managed-cvc-rig");
-        assert_eq!(channels[0]["profile"], "default");
+        assert_eq!(channels[0]["device"], "rig");
+        assert_eq!(channels[0]["architecture"], "arm64");
         assert_eq!(channels[0]["target_release"]["id"], release_id);
         assert_eq!(
             channels[0]["config_snapshot"]["deployment"]["profile"],

@@ -282,35 +282,35 @@ impl ApplyPlan {
 }
 
 /// Which channel target to resolve: a `channel`, optionally narrowed to one
-/// `(target_type, profile)` when that channel serves several targets — the
-/// multi-profile selector (software-tower migration `0005`). Both `None`
-/// resolves the channel's single target, the common case.
+/// `(device, architecture)` when that channel serves several targets — the
+/// resolution selector (software-tower migration `0007`). Both `None` resolves
+/// the channel's single target, the common case.
 #[derive(Debug, Clone)]
 pub struct ChannelTarget {
     pub channel: String,
-    pub target_type: Option<String>,
-    pub profile: Option<String>,
+    pub device: Option<String>,
+    pub architecture: Option<String>,
 }
 
 impl ChannelTarget {
-    /// A channel with no `(target_type, profile)` narrowing — its single target.
+    /// A channel with no `(device, architecture)` narrowing — its single target.
     pub fn channel(channel: impl Into<String>) -> Self {
         Self {
             channel: channel.into(),
-            target_type: None,
-            profile: None,
+            device: None,
+            architecture: None,
         }
     }
 
     /// Human label for diagnostics: the channel, plus any narrowing in parens.
     fn label(&self) -> String {
-        match (&self.target_type, &self.profile) {
+        match (&self.device, &self.architecture) {
             (None, None) => self.channel.clone(),
-            (tt, pf) => format!(
-                "{} (target_type={}, profile={})",
+            (dev, arch) => format!(
+                "{} (device={}, architecture={})",
                 self.channel,
-                tt.as_deref().unwrap_or("*"),
-                pf.as_deref().unwrap_or("*"),
+                dev.as_deref().unwrap_or("*"),
+                arch.as_deref().unwrap_or("*"),
             ),
         }
     }
@@ -333,8 +333,8 @@ pub async fn apply_plan(
     let desired = hub
         .channel_target_tree(
             &target.channel,
-            target.target_type.as_deref(),
-            target.profile.as_deref(),
+            target.device.as_deref(),
+            target.architecture.as_deref(),
         )
         .await?
         .ok_or_else(|| Error::ChannelNotFound {

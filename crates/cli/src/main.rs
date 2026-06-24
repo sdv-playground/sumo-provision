@@ -60,12 +60,12 @@ enum HubCmd {
     Channel {
         /// Channel name (e.g. `bleeding`).
         name: String,
-        /// Narrow to this target type when the channel serves several.
+        /// Narrow to this device when the channel serves several (e.g. `rig`).
         #[arg(long)]
-        target_type: Option<String>,
-        /// Narrow to this profile when the channel serves several.
+        device: Option<String>,
+        /// Narrow to this architecture when the channel serves several (e.g. `arm64`).
         #[arg(long)]
-        profile: Option<String>,
+        architecture: Option<String>,
         /// Emit the tree as JSON.
         #[arg(long)]
         json: bool,
@@ -168,12 +168,12 @@ enum RigCmd {
         /// Desired tree from a Tower 2 channel (e.g. `bleeding`).
         #[arg(long, required_unless_present = "release")]
         channel: Option<String>,
-        /// Narrow `--channel` to this target type when it serves several.
+        /// Narrow `--channel` to this device when it serves several.
         #[arg(long, conflicts_with = "release")]
-        target_type: Option<String>,
-        /// Narrow `--channel` to this profile when it serves several.
+        device: Option<String>,
+        /// Narrow `--channel` to this architecture when it serves several.
         #[arg(long, conflicts_with = "release")]
-        profile: Option<String>,
+        architecture: Option<String>,
         /// Tower 2 base URL (used with `--channel`).
         #[arg(long, env = "SUMO_HUB_URL", default_value = "http://localhost:8081")]
         hub_url: String,
@@ -303,29 +303,28 @@ enum RigCmd {
 }
 
 /// A channel-target selector for the rig commands: the channel, plus the
-/// optional `(target_type, profile)` narrowing for a channel that serves several
-/// targets (the multi-profile selector — Tower 2 migration `0005`). Omit both to
+/// optional `(device, architecture)` narrowing for a channel that serves several
+/// targets (the resolution selector — Tower 2 migration `0007`). Omit both to
 /// resolve the channel's single target.
 #[derive(Args, Debug)]
 struct ChannelSel {
     /// Desired state from a Tower 2 channel (e.g. `bleeding`).
     #[arg(long)]
     channel: String,
-    /// Narrow to this target type when the channel serves several (e.g.
-    /// `managed-cvc`).
+    /// Narrow to this device when the channel serves several (e.g. `rig`).
     #[arg(long)]
-    target_type: Option<String>,
-    /// Narrow to this profile when the channel serves several (e.g. `autosd`).
+    device: Option<String>,
+    /// Narrow to this architecture when the channel serves several (e.g. `arm64`).
     #[arg(long)]
-    profile: Option<String>,
+    architecture: Option<String>,
 }
 
 impl ChannelSel {
     fn target(&self) -> orchestrator::ChannelTarget {
         orchestrator::ChannelTarget {
             channel: self.channel.clone(),
-            target_type: self.target_type.clone(),
-            profile: self.profile.clone(),
+            device: self.device.clone(),
+            architecture: self.architecture.clone(),
         }
     }
 }
@@ -397,12 +396,12 @@ async fn run_hub(args: HubArgs) -> anyhow::Result<()> {
         }
         HubCmd::Channel {
             name,
-            target_type,
-            profile,
+            device,
+            architecture,
             json,
         } => {
             let tree = hub
-                .channel_target_tree(&name, target_type.as_deref(), profile.as_deref())
+                .channel_target_tree(&name, device.as_deref(), architecture.as_deref())
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("channel '{name}' not found on {}", args.url))?;
             if json {
@@ -533,8 +532,8 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
         RigCmd::Diff {
             release,
             channel,
-            target_type,
-            profile,
+            device,
+            architecture,
             hub_url,
             plan,
         } => {
@@ -542,7 +541,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             let desired = match (release, channel) {
                 (Some(path), _) => serde_json::from_reader(std::fs::File::open(&path)?)?,
                 (None, Some(name)) => SoftwareClient::new(&hub_url)
-                    .channel_target_tree(&name, target_type.as_deref(), profile.as_deref())
+                    .channel_target_tree(&name, device.as_deref(), architecture.as_deref())
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("channel '{name}' not found on {hub_url}"))?,
                 (None, None) => unreachable!("clap requires --release or --channel"),
