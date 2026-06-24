@@ -333,9 +333,11 @@ impl ChannelSel {
 /// recipient) and either a bearer JWT or minter creds to mint one.
 #[derive(Args, Debug)]
 struct AuthArgs {
-    /// Device id in the Tower 1 roster (envelope recipient + token aud).
+    /// Device id (instance) in the Tower 1 roster — the envelope recipient +
+    /// token `aud`. Distinct from the channel selector's `--device` (the device
+    /// class, e.g. rig/emulated).
     #[arg(long)]
-    device: String,
+    device_id: String,
     /// SOVD bearer JWT (skip minting).
     #[arg(long, env = "SOVD_TOKEN")]
     token: Option<String>,
@@ -577,7 +579,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     &hub_url,
                     &ca_url,
                     &target,
-                    &auth.device,
+                    &auth.device_id,
                     only.as_deref(),
                     false, // `rig flash`: respect each component's declared reset_kind
                     token,
@@ -594,7 +596,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                     &hub_url,
                     &ca_url,
                     &target,
-                    &auth.device,
+                    &auth.device_id,
                     only.as_deref(),
                 )
                 .await?;
@@ -633,7 +635,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
             let (singleshot, banked): (Vec<&orchestrator::ComponentApply>, Vec<_>) = shipping
                 .into_iter()
                 .partition(|c| c.supports_rollback == Some(false));
-            print_campaign(&sel.channel, &auth.device, &singleshot, &banked);
+            print_campaign(&sel.channel, &auth.device_id, &singleshot, &banked);
             if !execute {
                 println!("\n(plan only — re-run with --execute to run the campaign)");
                 return Ok(());
@@ -664,7 +666,7 @@ async fn run_rig(args: RigArgs) -> anyhow::Result<()> {
                 &hub_url,
                 &ca_url,
                 &target,
-                &auth.device,
+                &auth.device_id,
                 no_commit,
                 rig_token(&auth, &args.url)?,
             )
@@ -774,7 +776,7 @@ fn rig_token(auth: &AuthArgs, rig_url: &str) -> anyhow::Result<orchestrator::Rig
          connecting UNAUTHENTICATED. Unenforced ops go through; High-consequence \
          ops (reset) will 403. Provide --token <jwt> or --minter-url + \
          --operator-token to authenticate.",
-        auth.device
+        auth.device_id
     );
     Ok(orchestrator::RigToken::fixed(String::new()))
 }
