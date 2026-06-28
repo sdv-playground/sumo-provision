@@ -80,16 +80,32 @@ impl NodeUpdateState {
     }
 }
 
+/// A reqwest client for the device's SOVD endpoint. `insecure` is the `curl -k`
+/// equivalent: skip TLS cert verification — the device's leaf is signed by the
+/// sumo identity root with a SAN that won't match a `127.0.0.1` dial (dev/interim
+/// until the device's `.local` SAN + mDNS land). Default (`false`) is full
+/// verification, identical to the previous bare `reqwest::get`. Scoped to the
+/// device — the towers (Tower 1/2, the minter) are plain HTTP and keep full
+/// verification by construction.
+fn device_http_client(insecure: bool) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(insecure)
+        .build()
+}
+
 /// Read the device's node update-transaction state over SOVD
 /// (`GET /vehicle/v1/data/x-sumo-update-state`). A device without the vendor
 /// route (an older image) returns 404 → reported as `Idle`, so a fresh rig just
 /// proceeds.
-pub async fn node_update_state(rig_url: &str) -> Result<NodeUpdateState, Error> {
+pub async fn node_update_state(rig_url: &str, insecure: bool) -> Result<NodeUpdateState, Error> {
     let url = format!(
         "{}/vehicle/v1/data/x-sumo-update-state",
         rig_url.trim_end_matches('/')
     );
-    let resp = reqwest::get(&url)
+    let resp = device_http_client(insecure)
+        .map_err(|e| Error::NodeState(e.to_string()))?
+        .get(&url)
+        .send()
         .await
         .map_err(|e| Error::NodeState(e.to_string()))?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -109,8 +125,8 @@ pub async fn node_update_state(rig_url: &str) -> Result<NodeUpdateState, Error> 
 /// an entity, and the files in its signed installed manifest are its parts
 /// (`kind = "file"`, `id = path`, `content = sha256`). Components with no signed
 /// manifest come back as entities with no parts.
-pub async fn read_rig_state(sovd_url: &str) -> Result<Tree, Error> {
-    let client = SovdClient::new(sovd_url)?;
+pub async fn read_rig_state(sovd_url: &str, insecure: bool) -> Result<Tree, Error> {
+    let client = SovdClient::new_insecure(sovd_url, insecure)?;
     let mut tree = Tree::default();
     for c in client.list_components().await? {
         let mut entity = Entity {
@@ -327,8 +343,9 @@ pub async fn apply_plan(
     hub_url: &str,
     target: &ChannelTarget,
     only: Option<&str>,
+    insecure: bool,
 ) -> Result<ApplyPlan, Error> {
-    let observed = read_rig_state(rig_url).await?;
+    let observed = read_rig_state(rig_url, insecure).await?;
     let hub = SoftwareClient::new(hub_url);
     let desired = hub
         .channel_target_tree(
@@ -428,8 +445,9 @@ pub async fn flash_bundle(
     target: &ChannelTarget,
     device_id: &str,
     only: Option<&str>,
+    insecure: bool,
 ) -> Result<FlashBundle, Error> {
-    let plan = apply_plan(rig_url, hub_url, target, only).await?;
+    let plan = apply_plan(rig_url, hub_url, target, only, insecure).await?;
     let pubkey = device_pubkey(ca_url, device_id).await?;
 
     let hub = SoftwareClient::new(hub_url);
@@ -487,6 +505,10 @@ pub enum RigToken {
         minter: MinterClient,
         rig_url: String,
         ttl_secs: Option<u64>,
+        /// Skip TLS cert verification when reading the device's `boot_id`/`aud`
+        /// to mint against (the `curl -k` equivalent; mirrors the CLI `--insecure`).
+        /// `false` = full verification.
+        insecure: bool,
         /// `(boot_id, token)` — the token minted for that boot. Re-minted when the
         /// live boot_id differs (a reboot rotated it).
         cached: Mutex<Option<(String, String)>>,
@@ -501,17 +523,21 @@ impl RigToken {
 
     /// Mint per-device JWTs from `minter_url` (operator-authenticated to `/mint`).
     /// `rig_url` is the device's SOVD base — the audience is resolved from its
-    /// `x-sumo-id` (the ecu_id) at mint time, never supplied as a name.
+    /// `x-sumo-id` (the ecu_id) at mint time, never supplied as a name. `insecure`
+    /// (the CLI `--insecure`) skips cert verification on those device reads only;
+    /// the minter itself is reached over plain HTTP regardless.
     pub fn minting(
         minter_url: impl Into<String>,
         operator_token: impl Into<String>,
         rig_url: impl Into<String>,
         ttl_secs: Option<u64>,
+        insecure: bool,
     ) -> Self {
         RigToken::Mint {
             minter: MinterClient::new(minter_url, operator_token),
             rig_url: rig_url.into(),
             ttl_secs,
+            insecure,
             cached: Mutex::new(None),
         }
     }
@@ -520,9 +546,17 @@ impl RigToken {
 /// GET a small `x-sumo-*` id from the rig, trimmed + unquoted. The `aud` (ecu_id)
 /// and `boot_id` a destructive token must carry are read here — the same ids
 /// `factory-reset.sh` reads, never the roster name and never a stale boot.
-async fn fetch_rig_id(rig_url: &str, path: &str, what: &str) -> Result<String, EngineError> {
+async fn fetch_rig_id(
+    rig_url: &str,
+    path: &str,
+    what: &str,
+    insecure: bool,
+) -> Result<String, EngineError> {
     let url = format!("{}{path}", rig_url.trim_end_matches('/'));
-    let resp = reqwest::get(&url)
+    let resp = device_http_client(insecure)
+        .map_err(|e| EngineError::Internal(format!("build http client: {e}")))?
+        .get(&url)
+        .send()
         .await
         .map_err(|e| EngineError::Internal(format!("read {what} from {url}: {e}")))?;
     if !resp.status().is_success() {
@@ -545,14 +579,26 @@ async fn fetch_rig_id(rig_url: &str, path: &str, what: &str) -> Result<String, E
 }
 
 /// The rig's ecu_id (its HSM device-key thumbprint) — the token `aud`.
-async fn fetch_rig_ecu_id(rig_url: &str) -> Result<String, EngineError> {
-    fetch_rig_id(rig_url, "/vehicle/v1/components/hsm/x-sumo-id", "ecu id").await
+async fn fetch_rig_ecu_id(rig_url: &str, insecure: bool) -> Result<String, EngineError> {
+    fetch_rig_id(
+        rig_url,
+        "/vehicle/v1/components/hsm/x-sumo-id",
+        "ecu id",
+        insecure,
+    )
+    .await
 }
 
 /// The rig's live boot nonce — the §7.1 freshness `boot_id` a destructive token
 /// binds to (read fresh, right before minting).
-async fn fetch_rig_boot_id(rig_url: &str) -> Result<String, EngineError> {
-    fetch_rig_id(rig_url, "/vehicle/v1/status/x-sumo-boot-id", "boot id").await
+async fn fetch_rig_boot_id(rig_url: &str, insecure: bool) -> Result<String, EngineError> {
+    fetch_rig_id(
+        rig_url,
+        "/vehicle/v1/status/x-sumo-boot-id",
+        "boot id",
+        insecure,
+    )
+    .await
 }
 
 #[async_trait]
@@ -564,6 +610,7 @@ impl TokenSource for RigToken {
                 minter,
                 rig_url,
                 ttl_secs,
+                insecure,
                 cached,
             } => {
                 // The minted token's `boot_id` is bound at the device by the
@@ -572,7 +619,7 @@ impl TokenSource for RigToken {
                 // boot hasn't moved, and re-mint when it has (a campaign step that
                 // rebooted). This makes a multi-reboot campaign work with one
                 // `RigToken` — only this GET is per-call, the mint is once per boot.
-                let boot_id = fetch_rig_boot_id(rig_url).await?;
+                let boot_id = fetch_rig_boot_id(rig_url, *insecure).await?;
                 let mut guard = cached.lock().await;
                 if let Some((cached_boot, tok)) = guard.as_ref() {
                     if cached_boot == &boot_id {
@@ -582,7 +629,7 @@ impl TokenSource for RigToken {
                 // The token's `aud` is the rig's ecu_id (its HSM device-key
                 // thumbprint), resolved from the device (NOT the roster name), and
                 // its `boot_id` is the live boot just read above.
-                let ecu_id = fetch_rig_ecu_id(rig_url).await?;
+                let ecu_id = fetch_rig_ecu_id(rig_url, *insecure).await?;
                 let minted = minter
                     .mint(&ecu_id, &["*".to_string()], Some(&boot_id), *ttl_secs)
                     .await
@@ -624,8 +671,9 @@ pub async fn build_flash_plan(
     target: &ChannelTarget,
     device_id: &str,
     only: Option<&str>,
+    insecure: bool,
 ) -> Result<(FlashPlan, Vec<u8>), Error> {
-    let plan = apply_plan(rig_url, hub_url, target, only).await?;
+    let plan = apply_plan(rig_url, hub_url, target, only, insecure).await?;
     let pubkey = device_pubkey(ca_url, device_id).await?;
     let hub = SoftwareClient::new(hub_url);
     let trust_anchor = hub.signer_pubkey().await?;
@@ -682,9 +730,10 @@ pub async fn flash_execute(
     only: Option<&str>,
     reboot_to_activate: bool,
     token: RigToken,
+    insecure: bool,
 ) -> Result<FlashResult, Error> {
     let (plan, trust_anchor) =
-        build_flash_plan(rig_url, hub_url, ca_url, target, device_id, only).await?;
+        build_flash_plan(rig_url, hub_url, ca_url, target, device_id, only, insecure).await?;
     // `reboot_to_activate` (the workshop campaign) activates the whole step via one
     // node reboot — both banks boot their new images together, no racy per-VM
     // relaunch. The onboard/field path leaves it false (no orchestrator reboot;
@@ -694,6 +743,7 @@ pub async fn flash_execute(
         Arc::new(token),
         trust_anchor,
         EngineTimeouts::default(),
+        insecure,
     )
     .with_force_ecu_reset(reboot_to_activate);
     // No-mix guard, scoped to this (possibly `--only`-filtered) plan: reject a
@@ -727,11 +777,12 @@ pub async fn campaign_execute(
     device_id: &str,
     no_commit: bool,
     token: RigToken,
+    insecure: bool,
 ) -> Result<Vec<ComponentFlashResult>, Error> {
     // Resolve + partition the shipping components by update mode: singleshot
     // (irreversible, write-through) vs banked (reversible trial) — the same source
     // the engine's no-mix guard reads off the device.
-    let plan = apply_plan(rig_url, hub_url, target, None).await?;
+    let plan = apply_plan(rig_url, hub_url, target, None, insecure).await?;
     let shipping: Vec<&ComponentApply> = plan
         .components
         .iter()
@@ -752,8 +803,16 @@ pub async fn campaign_execute(
     let mut steps: Vec<CampaignStep> = Vec::new();
     let mut trust_anchor: Option<Vec<u8>> = None;
     for c in &singleshot {
-        let (p, ta) =
-            build_flash_plan(rig_url, hub_url, ca_url, target, device_id, Some(&c.entity)).await?;
+        let (p, ta) = build_flash_plan(
+            rig_url,
+            hub_url,
+            ca_url,
+            target,
+            device_id,
+            Some(&c.entity),
+            insecure,
+        )
+        .await?;
         trust_anchor.get_or_insert(ta);
         steps.push(CampaignStep {
             jobs: p.jobs,
@@ -763,9 +822,16 @@ pub async fn campaign_execute(
     if !banked.is_empty() {
         let mut jobs = Vec::new();
         for c in &banked {
-            let (p, ta) =
-                build_flash_plan(rig_url, hub_url, ca_url, target, device_id, Some(&c.entity))
-                    .await?;
+            let (p, ta) = build_flash_plan(
+                rig_url,
+                hub_url,
+                ca_url,
+                target,
+                device_id,
+                Some(&c.entity),
+                insecure,
+            )
+            .await?;
             trust_anchor.get_or_insert(ta);
             jobs.extend(p.jobs);
         }
@@ -787,6 +853,7 @@ pub async fn campaign_execute(
         Arc::new(token),
         trust_anchor.unwrap_or_default(),
         EngineTimeouts::default(),
+        insecure,
     );
     let report = engine.run_campaign(steps, &CameUp, no_commit).await?;
     Ok(report.ecus.iter().map(component_result).collect())
@@ -808,6 +875,7 @@ pub async fn flash_keystore(
     hsm_suit: Vec<u8>,
     trust_anchor: Vec<u8>,
     token: RigToken,
+    insecure: bool,
 ) -> Result<FlashResult, Error> {
     let plan = FlashPlan {
         jobs: vec![FlashJob {
@@ -822,6 +890,7 @@ pub async fn flash_keystore(
         Arc::new(token),
         trust_anchor,
         EngineTimeouts::default(),
+        insecure,
     );
     let ecus = engine.stage_all(&plan).await?;
     Ok(FlashResult {
@@ -842,8 +911,9 @@ pub async fn flash_reset(
     component: &str,
     update_id: &str,
     token: RigToken,
+    insecure: bool,
 ) -> Result<String, Error> {
-    let engine = verdict_engine(rig_url, token, false);
+    let engine = verdict_engine(rig_url, token, false, insecure);
     let mut ecus = [ecu_status(component, update_id, EcuState::Staged)];
     engine.reset_all(&mut ecus).await?;
     Ok(format!("{:?}", ecus[0].state))
@@ -855,8 +925,9 @@ pub async fn flash_commit(
     component: &str,
     update_id: &str,
     token: RigToken,
+    insecure: bool,
 ) -> Result<String, Error> {
-    let engine = verdict_engine(rig_url, token, false);
+    let engine = verdict_engine(rig_url, token, false, insecure);
     let mut ecus = [ecu_status(component, update_id, EcuState::Activated)];
     engine.commit_all(&mut ecus).await?;
     Ok(format!("{:?}", ecus[0].state))
@@ -868,8 +939,9 @@ pub async fn flash_rollback(
     component: &str,
     update_id: &str,
     token: RigToken,
+    insecure: bool,
 ) -> Result<String, Error> {
-    let engine = verdict_engine(rig_url, token, false);
+    let engine = verdict_engine(rig_url, token, false, insecure);
     let mut ecus = [ecu_status(component, update_id, EcuState::Activated)];
     engine.rollback_all(&mut ecus).await?;
     Ok(format!("{:?}", ecus[0].state))
@@ -883,8 +955,9 @@ pub async fn flash_commit_all(
     rig_url: &str,
     updates: &[(String, String)],
     token: RigToken,
+    insecure: bool,
 ) -> Result<Vec<(String, String)>, Error> {
-    let engine = verdict_engine(rig_url, token, true);
+    let engine = verdict_engine(rig_url, token, true, insecure);
     let mut ecus: Vec<EcuStatus> = updates
         .iter()
         .map(|(c, id)| ecu_status(c, id, EcuState::Activated))
@@ -901,8 +974,9 @@ pub async fn flash_rollback_all(
     rig_url: &str,
     updates: &[(String, String)],
     token: RigToken,
+    insecure: bool,
 ) -> Result<Vec<(String, String)>, Error> {
-    let engine = verdict_engine(rig_url, token, true);
+    let engine = verdict_engine(rig_url, token, true, insecure);
     let mut ecus: Vec<EcuStatus> = updates
         .iter()
         .map(|(c, id)| ecu_status(c, id, EcuState::Activated))
@@ -918,16 +992,24 @@ pub async fn flash_rollback_all(
 /// components — the device resolves the in-trial set from NV. This is the
 /// manual `commit-trials` verb (and what `commit.sh` runs after a node-reboot
 /// update): the update *session* is the commit unit, never a single component.
-pub async fn flash_commit_trials(rig_url: &str, token: RigToken) -> Result<(), Error> {
-    verdict_engine(rig_url, token, true)
+pub async fn flash_commit_trials(
+    rig_url: &str,
+    token: RigToken,
+    insecure: bool,
+) -> Result<(), Error> {
+    verdict_engine(rig_url, token, true, insecure)
         .commit_node_trials()
         .await?;
     Ok(())
 }
 
 /// Roll the whole node's in-trial set back in ONE verdict — see [`flash_commit_trials`].
-pub async fn flash_rollback_trials(rig_url: &str, token: RigToken) -> Result<(), Error> {
-    verdict_engine(rig_url, token, true)
+pub async fn flash_rollback_trials(
+    rig_url: &str,
+    token: RigToken,
+    insecure: bool,
+) -> Result<(), Error> {
+    verdict_engine(rig_url, token, true, insecure)
         .rollback_node_trials()
         .await?;
     Ok(())
@@ -953,12 +1035,18 @@ async fn device_pubkey(ca_url: &str, device_id: &str) -> Result<String, Error> {
 /// `force_ecu_reset` selects the node-level verdict (one verdict for the whole
 /// step, finalized from NV after a node reboot — the update *session* is the
 /// commit unit) over the per-component path (a live local-reset session).
-fn verdict_engine(rig_url: &str, token: RigToken, force_ecu_reset: bool) -> FlashEngine {
+fn verdict_engine(
+    rig_url: &str,
+    token: RigToken,
+    force_ecu_reset: bool,
+    insecure: bool,
+) -> FlashEngine {
     FlashEngine::new(
         rig_url,
         Arc::new(token),
         Vec::new(),
         EngineTimeouts::default(),
+        insecure,
     )
     .with_force_ecu_reset(force_ecu_reset)
 }
