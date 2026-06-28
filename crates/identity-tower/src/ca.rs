@@ -180,10 +180,12 @@ impl Ca {
         builder.add_extension(&ExtendedKeyUsage(eku))?;
         if matches!(usage, LeafUsage::Mtls) {
             // The node's mTLS leaf is presented BOTH when dialing a peer
-            // (clientAuth) and when listening (serverAuth), so the dialer
-            // verifies a SAN against its ServerName. We use the device id as the
-            // dNSName — same as the CN and the cross-node principal — and the
-            // dialer connects with ServerName = device_id.
+            // (clientAuth) and when listening (serverAuth). The SAN carries two
+            // dNSNames: the bare device id (the cross-node principal / direct
+            // dial) and `<device-id>.local` — the mDNS/DNS-SD hostname the SOVD
+            // server is discovered as (RFC 6762/6763), so a discovery client that
+            // dials `<id>.local` verifies the leaf with standard hostname checking
+            // (no skip-verify). See docs/design/sovd-tls-discovery.md.
             //
             // TODO(vehicle): revisit this SAN in a real vehicle context. It could
             // be `vin.ecu_name` (vehicle-scoped, human-meaningful), but then
@@ -191,8 +193,10 @@ impl Ca {
             // re-issue/rename. The device id (HSM thumbprint) is
             // vehicle-independent and survives the swap — decide the trade-off
             // later.
-            let san = GeneralName::DnsName(Ia5String::try_from(device_id.to_string())?);
-            builder.add_extension(&SubjectAltName(vec![san]))?;
+            let san_id = GeneralName::DnsName(Ia5String::try_from(device_id.to_string())?);
+            let san_local =
+                GeneralName::DnsName(Ia5String::try_from(format!("{device_id}.local"))?);
+            builder.add_extension(&SubjectAltName(vec![san_id, san_local]))?;
         }
         let cert: Certificate = builder.build::<DerSignature>()?;
 
