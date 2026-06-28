@@ -50,9 +50,20 @@ if [ "${#COMPOSE[@]}" -gt 0 ]; then
     DOCKER_UID="$(id -u)"; export DOCKER_UID
     DOCKER_GID="$(id -g)"; export DOCKER_GID
     mkdir -p data/postgres data/minio
+    # Only OWN the teardown for infra THIS instance starts. If another stack
+    # instance already has the containers up, a second one must NOT `down` them on
+    # exit — that terminates the live tower DBs out from under the first. (A killed
+    # second instance's cleanup running `down` is exactly the "terminating
+    # connection due to administrator command" → CA pool-timeout failure.)
+    already_running=0
+    if [ -n "$("${COMPOSE[@]}" ps -q 2>/dev/null)" ]; then already_running=1; fi
     echo "==> Starting backing services (postgres, minio) via '${COMPOSE[*]}'..."
     if "${COMPOSE[@]}" up -d; then
-        INFRA_UP=1
+        if [ "$already_running" -eq 1 ]; then
+            echo "    backing services were already up — NOT tearing them down on exit."
+        else
+            INFRA_UP=1
+        fi
         # Persistence step: each tower uses its OWN database (separate fault
         # domains — a Tower 2 compromise must not read Tower 1's identity data).
         # Idempotent: create only if missing, so existing data dirs are fine too.
