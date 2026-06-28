@@ -1097,7 +1097,7 @@ dependencies = [
 [[package]]
 name = "hsm"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#be70dcbccd8548e888a965f48ca51fa82e34ca0e"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#abb1245c17b222fecbb6ca8604a90da280a96f17"
 dependencies = [
  "ciborium",
  "coset",
@@ -1112,7 +1112,7 @@ dependencies = [
 [[package]]
 name = "hsm-contract"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#be70dcbccd8548e888a965f48ca51fa82e34ca0e"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#abb1245c17b222fecbb6ca8604a90da280a96f17"
 dependencies = [
  "vhsm-proto",
 ]
@@ -1120,7 +1120,7 @@ dependencies = [
 [[package]]
 name = "hsm-link-b"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#be70dcbccd8548e888a965f48ca51fa82e34ca0e"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#abb1245c17b222fecbb6ca8604a90da280a96f17"
 
 [[package]]
 name = "http"
@@ -2508,7 +2508,7 @@ dependencies = [
 [[package]]
 name = "sovd-client"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#f2b11bc7aa9d023b2e371992c99ba328bcb90bad"
+source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#ae2ecc71c3dfe70c9c94feb3328f7b8e6be7029c"
 dependencies = [
  "anyhow",
  "axum",
@@ -2531,7 +2531,7 @@ dependencies = [
 [[package]]
 name = "sovd-core"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#f2b11bc7aa9d023b2e371992c99ba328bcb90bad"
+source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#ae2ecc71c3dfe70c9c94feb3328f7b8e6be7029c"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3323,7 +3323,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vhsm-proto"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#be70dcbccd8548e888a965f48ca51fa82e34ca0e"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#abb1245c17b222fecbb6ca8604a90da280a96f17"
 
 [[package]]
 name = "want"
