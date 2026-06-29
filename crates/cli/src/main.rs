@@ -19,6 +19,12 @@ struct Cli {
     /// the device's .local SAN + mDNS land).
     #[arg(long, env = "SUMO_INSECURE", global = true)]
     insecure: bool,
+    /// Pin this CA root (PEM file) to verify the device's TLS cert against the
+    /// tower identity root — the verifying alternative to `--insecure` (e.g. the
+    /// `device-identity-root.pem` from `ca ca-cert`). Unset = unchanged: skip-verify
+    /// when `--insecure`, else system roots.
+    #[arg(long, env = "SUMO_CACERT", global = true, value_name = "PATH")]
+    cacert: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -367,10 +373,20 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // Read the pinned CA root (PEM) once, up front, so a bad `--cacert` path fails
+    // clearly before any work. `None` threads down as the unchanged (skip-verify /
+    // system-roots) behaviour. The CLI owns the bytes; callees borrow `.as_deref()`.
+    let ca_cert_pem: Option<Vec<u8>> = match &cli.cacert {
+        Some(path) => Some(
+            std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("reading --cacert {}: {e}", path.display()))?,
+        ),
+        None => None,
+    };
     match cli.command {
         Command::Hub(args) => run_hub(args).await,
         Command::Ca(args) => run_ca(args).await,
-        Command::Rig(args) => run_rig(args, cli.insecure).await,
+        Command::Rig(args) => run_rig(args, cli.insecure, ca_cert_pem.as_deref()).await,
     }
 }
 
@@ -526,10 +542,10 @@ fn print_device(d: &wire::Device) {
     println!("pubkey  {}", d.pubkey.as_deref().unwrap_or("(none)"));
 }
 
-async fn run_rig(args: RigArgs, insecure: bool) -> anyhow::Result<()> {
+async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> anyhow::Result<()> {
     match args.cmd {
         RigCmd::State { json } => {
-            let observed = orchestrator::read_rig_state(&args.url, insecure).await?;
+            let observed = orchestrator::read_rig_state(&args.url, insecure, ca_cert_pem).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&observed)?);
             } else {
@@ -544,7 +560,7 @@ async fn run_rig(args: RigArgs, insecure: bool) -> anyhow::Result<()> {
             hub_url,
             plan,
         } => {
-            let observed = orchestrator::read_rig_state(&args.url, insecure).await?;
+            let observed = orchestrator::read_rig_state(&args.url, insecure, ca_cert_pem).await?;
             let desired = match (release, channel) {
                 (Some(path), _) => serde_json::from_reader(std::fs::File::open(&path)?)?,
                 (None, Some(name)) => SoftwareClient::new(&hub_url)
@@ -560,8 +576,15 @@ async fn run_rig(args: RigArgs, insecure: bool) -> anyhow::Result<()> {
             }
         }
         RigCmd::Apply { sel, hub_url, json } => {
-            let plan = orchestrator::apply_plan(&args.url, &hub_url, &sel.target(), None, insecure)
-                .await?;
+            let plan = orchestrator::apply_plan(
+                &args.url,
+                &hub_url,
+                &sel.target(),
+                None,
+                insecure,
+                ca_cert_pem,
+            )
+            .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
@@ -579,7 +602,7 @@ async fn run_rig(args: RigArgs, insecure: bool) -> anyhow::Result<()> {
         } => {
             let target = sel.target();
             if execute {
-                let token = rig_token(&auth, &args.url, insecure)?;
+                let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
                 let result = orchestrator::flash_execute(
                     &args.url,
                     &hub_url,
@@ -590,6 +613,7 @@ async fn run_rig(args: RigArgs, insecure: bool) -> anyhow::Result<()> {
                     false, // `rig flash`: respect each component's declared reset_kind
                     token,
                     insecure,
+                    ca_cert_pem,
                 )
                 .await?;
                 if json {
@@ -606,6 +630,7 @@ async fn run_rig(args: RigArgs, insecure: bool) -> anyhow::Result<()> {
                     &auth.device_id,
                     only.as_deref(),
                     insecure,
+                    ca_cert_pem,
                 )
                 .await?;
                 if json {
@@ -625,7 +650,8 @@ async fn run_rig(args: RigArgs, insecure: bool) -> anyhow::Result<()> {
         } => {
             let target = sel.target();
             let plan =
-                orchestrator::apply_plan(&args.url, &hub_url, &target, None, insecure).await?;
+                orchestrator::apply_plan(&args.url, &hub_url, &target, None, insecure, ca_cert_pem)
+                    .await?;
             let shipping: Vec<&orchestrator::ComponentApply> = plan
                 .components
                 .iter()
@@ -653,7 +679,8 @@ async fn run_rig(args: RigArgs, insecure: bool) -> anyhow::Result<()> {
             // the rig has an unresolved prior transaction — a node reboot owed, or
             // a trial awaiting its verdict — instead of compounding it (the bug).
             // Names the components so the operator can resolve it first.
-            let node_state = orchestrator::node_update_state(&args.url, insecure).await?;
+            let node_state =
+                orchestrator::node_update_state(&args.url, insecure, ca_cert_pem).await?;
             if node_state.is_unresolved() {
                 anyhow::bail!(
                     "rig has an unresolved update transaction (phase {}, components {:?}) — \
@@ -677,8 +704,9 @@ async fn run_rig(args: RigArgs, insecure: bool) -> anyhow::Result<()> {
                 &target,
                 &auth.device_id,
                 no_commit,
-                rig_token(&auth, &args.url, insecure)?,
+                rig_token(&auth, &args.url, insecure, ca_cert_pem)?,
                 insecure,
+                ca_cert_pem,
             )
             .await?;
             for r in &results {
@@ -698,9 +726,16 @@ async fn run_rig(args: RigArgs, insecure: bool) -> anyhow::Result<()> {
             update,
             auth,
         } => {
-            let token = rig_token(&auth, &args.url, insecure)?;
-            let status =
-                orchestrator::flash_commit(&args.url, &component, &update, token, insecure).await?;
+            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
+            let status = orchestrator::flash_commit(
+                &args.url,
+                &component,
+                &update,
+                token,
+                insecure,
+                ca_cert_pem,
+            )
+            .await?;
             println!("{component} committed → {status}");
         }
         RigCmd::Rollback {
@@ -708,20 +743,26 @@ async fn run_rig(args: RigArgs, insecure: bool) -> anyhow::Result<()> {
             update,
             auth,
         } => {
-            let token = rig_token(&auth, &args.url, insecure)?;
-            let status =
-                orchestrator::flash_rollback(&args.url, &component, &update, token, insecure)
-                    .await?;
+            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
+            let status = orchestrator::flash_rollback(
+                &args.url,
+                &component,
+                &update,
+                token,
+                insecure,
+                ca_cert_pem,
+            )
+            .await?;
             println!("{component} rolled back → {status}");
         }
         RigCmd::CommitTrials { auth } => {
-            let token = rig_token(&auth, &args.url, insecure)?;
-            orchestrator::flash_commit_trials(&args.url, token, insecure).await?;
+            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
+            orchestrator::flash_commit_trials(&args.url, token, insecure, ca_cert_pem).await?;
             println!("node trials committed (the update session is the commit unit)");
         }
         RigCmd::RollbackTrials { auth } => {
-            let token = rig_token(&auth, &args.url, insecure)?;
-            orchestrator::flash_rollback_trials(&args.url, token, insecure).await?;
+            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
+            orchestrator::flash_rollback_trials(&args.url, token, insecure, ca_cert_pem).await?;
             println!("node trials rolled back");
         }
         RigCmd::Reset {
@@ -729,9 +770,16 @@ async fn run_rig(args: RigArgs, insecure: bool) -> anyhow::Result<()> {
             update,
             auth,
         } => {
-            let token = rig_token(&auth, &args.url, insecure)?;
-            let status =
-                orchestrator::flash_reset(&args.url, &component, &update, token, insecure).await?;
+            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
+            let status = orchestrator::flash_reset(
+                &args.url,
+                &component,
+                &update,
+                token,
+                insecure,
+                ca_cert_pem,
+            )
+            .await?;
             println!("{component} reset → {status}");
         }
         RigCmd::InstallKeystore {
@@ -739,12 +787,18 @@ async fn run_rig(args: RigArgs, insecure: bool) -> anyhow::Result<()> {
             hub_url,
             auth,
         } => {
-            let token = rig_token(&auth, &args.url, insecure)?;
+            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
             let suit_bytes = std::fs::read(&suit)?;
             let trust_anchor = SoftwareClient::new(&hub_url).signer_pubkey().await?;
-            let result =
-                orchestrator::flash_keystore(&args.url, suit_bytes, trust_anchor, token, insecure)
-                    .await?;
+            let result = orchestrator::flash_keystore(
+                &args.url,
+                suit_bytes,
+                trust_anchor,
+                token,
+                insecure,
+                ca_cert_pem,
+            )
+            .await?;
             for c in &result.components {
                 println!("hsm keystore → {}", c.state);
             }
@@ -764,6 +818,7 @@ fn rig_token(
     auth: &AuthArgs,
     rig_url: &str,
     insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
 ) -> anyhow::Result<orchestrator::RigToken> {
     if let Some(t) = &auth.token {
         return Ok(orchestrator::RigToken::fixed(t.clone()));
@@ -779,6 +834,7 @@ fn rig_token(
             rig_url,
             None,
             insecure,
+            ca_cert_pem.map(|c| c.to_vec()),
         ));
     }
     // No --token and no --minter-url. The device does NOT yet enforce auth on the
