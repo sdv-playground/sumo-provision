@@ -207,7 +207,7 @@ fn assemble_keystore(
 /// - `security_version`       — anti-rollback floor / SUIT sequence number.
 /// - `tls_identity_leaf`      — the device's signed `tls-identity` leaf (DER), or `None`.
 /// - `delegation_root_der`    — the delegation CA root (DER), pinned by the device
-///                              as the delegated-token trust anchor.
+///   as the delegated-token trust anchor.
 pub fn mint_keystore(
     device_decrypt_cose: &[u8],
     sw_authority_cose: &[u8],

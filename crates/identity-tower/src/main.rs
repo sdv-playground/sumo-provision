@@ -149,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
             post(devices::mint_delegate_cert),
         )
         .route("/admin/ca/cert", get(devices::ca_cert))
+        .route("/admin/ca/trust-bundle", get(devices::trust_bundle))
         .route("/devices", get(devices::list_devices))
         .route("/devices/{id}", get(devices::get_device))
         .with_state(state);

@@ -184,6 +184,19 @@ pub struct EnrollResponse {
     pub fingerprint: Option<String>,
 }
 
+/// `GET /admin/ca/trust-bundle` response — the tower's root **trust anchors** as
+/// named, pinnable PEMs (anchor-name → root cert PEM). Offboard tooling fetches
+/// this once and pins each PEM (e.g. `identity-root.pem`, `delegation-root.pem`).
+/// Today it carries `"identity"` (the device-TLS root a node pins to verify a
+/// peer's `tls-identity` leaf) and `"delegation"` (the delegated-token / minter
+/// root). A map rather than fixed fields, so adding a third anchor is a one-line
+/// tower change with no wire break.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TrustBundle {
+    /// Anchor name → root certificate PEM.
+    pub anchors: BTreeMap<String, String>,
+}
+
 // --- vehicle model ---------------------------------------------------------
 
 /// One updatable unit on an [`Entity`]: a logical id + a content hash, of some

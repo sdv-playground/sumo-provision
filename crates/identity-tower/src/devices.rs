@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use sqlx::{PgPool, Row};
-use wire::{Device, EnrollResponse, RegisterDevice};
+use wire::{Device, EnrollResponse, RegisterDevice, TrustBundle};
 
 use crate::ca::{Ca, LeafUsage};
 
@@ -230,6 +230,28 @@ pub async fn ca_cert(State(s): State<AppState>) -> Result<impl IntoResponse, App
     ))
 }
 
+/// `GET /admin/ca/trust-bundle` — the tower's root **trust anchors** as named,
+/// pinnable PEMs, so offboard tooling fetches-and-pins them once. Carries the two
+/// anchors offboard parts need: `"identity"` (device-TLS — the root a node pins
+/// to verify a peer's `tls-identity` leaf) and `"delegation"` (the
+/// delegated-token / minter root the SOVD authorizer pins for a token's `x5c`
+/// chain). A map, not fixed fields, so a third anchor is a one-line change here
+/// with no wire break.
+pub async fn trust_bundle(State(s): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    let mut anchors = std::collections::BTreeMap::new();
+    anchors.insert(
+        "identity".to_string(),
+        s.identity_ca.root_cert_pem().map_err(AppError::Internal)?,
+    );
+    anchors.insert(
+        "delegation".to_string(),
+        s.delegation_ca
+            .root_cert_pem()
+            .map_err(AppError::Internal)?,
+    );
+    Ok(Json(TrustBundle { anchors }))
+}
+
 /// `GET /devices` — the roster.
 pub async fn list_devices(State(s): State<AppState>) -> Result<Json<Vec<Device>>, AppError> {
     let rows = sqlx::query(&format!("SELECT {DEVICE_COLS} FROM devices ORDER BY id"))
@@ -294,4 +316,59 @@ impl IntoResponse for AppError {
 /// Map a database error into an `AppError`.
 fn db(e: sqlx::Error) -> AppError {
     AppError::Internal(e.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ca::{Ca, DELEGATION_ROOT_DN, IDENTITY_ROOT_DN, KEY_AUTHORITY_ROOT_DN};
+    use sqlx::postgres::PgPoolOptions;
+    use x509_cert::der::DecodePem;
+    use x509_cert::Certificate;
+
+    /// An `AppState` with three distinct, freshly generated CA roots and a *lazy*
+    /// pool — the trust-bundle handler never queries the DB, so the connection is
+    /// never established and no live Postgres is needed.
+    fn test_state() -> AppState {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://sumo:dev-only@localhost:5432/sumo_ca_test")
+            .expect("lazy pool parses");
+        AppState {
+            pool,
+            key_authority_ca: Arc::new(Ca::generate(KEY_AUTHORITY_ROOT_DN).unwrap()),
+            identity_ca: Arc::new(Ca::generate(IDENTITY_ROOT_DN).unwrap()),
+            delegation_ca: Arc::new(Ca::generate(DELEGATION_ROOT_DN).unwrap()),
+        }
+    }
+
+    #[tokio::test]
+    async fn trust_bundle_returns_identity_and_delegation_pems() {
+        let state = test_state();
+        let identity_root = state.identity_ca.root_cert_pem().unwrap();
+        let delegation_root = state.delegation_ca.root_cert_pem().unwrap();
+
+        // Drive the real handler and decode its JSON wire body.
+        let resp = trust_bundle(State(state)).await.expect("handler ok");
+        let body = axum::body::to_bytes(resp.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let bundle: TrustBundle = serde_json::from_slice(&body).unwrap();
+
+        // Exactly the two anchors offboard parts need.
+        assert_eq!(bundle.anchors.len(), 2);
+        let identity = bundle.anchors.get("identity").expect("identity anchor");
+        let delegation = bundle.anchors.get("delegation").expect("delegation anchor");
+
+        // Each is a parseable PEM certificate...
+        for pem in [identity, delegation] {
+            assert!(pem.contains("-----BEGIN CERTIFICATE-----"));
+            assert!(pem.contains("-----END CERTIFICATE-----"));
+            Certificate::from_pem(pem.as_bytes()).expect("anchor is a parseable X.509 PEM");
+        }
+        // ...the two anchors are distinct trust domains...
+        assert_ne!(identity, delegation);
+        // ...and they are exactly the tower's two roots.
+        assert_eq!(identity, &identity_root);
+        assert_eq!(delegation, &delegation_root);
+    }
 }

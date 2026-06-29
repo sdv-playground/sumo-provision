@@ -6,7 +6,7 @@
 //! [`IdentityClient`] (Tower 1) add the per-tower operations, same pattern.
 
 use serde::{Deserialize, Serialize};
-use wire::{ArtifactRef, ContentHash, Device, EnrollResponse, RegisterDevice, Tree};
+use wire::{ArtifactRef, ContentHash, Device, EnrollResponse, RegisterDevice, Tree, TrustBundle};
 
 /// `POST /admin/devices/{id}/keystore` body.
 #[derive(Serialize)]
@@ -379,6 +379,22 @@ impl IdentityClient {
             .await?
             .error_for_status()?
             .text()
+            .await?)
+    }
+
+    /// `GET /admin/ca/trust-bundle` — the tower's root **trust anchors** as named,
+    /// pinnable PEMs (`identity` = the device-TLS root, `delegation` = the
+    /// delegated-token / minter root). Offboard tooling fetches this once and pins
+    /// each PEM; a map (not fixed fields) so new anchors don't break the wire.
+    pub async fn trust_bundle(&self) -> Result<TrustBundle, ClientError> {
+        Ok(self
+            .tower
+            .http
+            .get(format!("{}/admin/ca/trust-bundle", self.tower.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
             .await?)
     }
 }

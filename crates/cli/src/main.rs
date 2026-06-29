@@ -151,6 +151,14 @@ enum CaCmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Export the tower root trust anchors as named PEMs (identity-root.pem,
+    /// delegation-root.pem) so offboard tooling can fetch-and-pin them once.
+    TrustBundle {
+        /// Directory to write the `<anchor>-root.pem` files into (created if
+        /// absent).
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -527,6 +535,24 @@ async fn run_ca(args: CaArgs) -> anyhow::Result<()> {
                     eprintln!("wrote identity-root CA cert to {}", p.display());
                 }
                 None => print!("{pem}"),
+            }
+        }
+        CaCmd::TrustBundle { out } => {
+            let bundle = ca.trust_bundle().await?;
+            std::fs::create_dir_all(&out)?;
+            let mut written = Vec::new();
+            for (name, pem) in &bundle.anchors {
+                let path = out.join(format!("{name}-root.pem"));
+                std::fs::write(&path, pem.as_bytes())?;
+                written.push(path);
+            }
+            eprintln!(
+                "wrote {} trust anchor(s) to {}:",
+                written.len(),
+                out.display()
+            );
+            for p in &written {
+                eprintln!("  {}", p.display());
             }
         }
     }
