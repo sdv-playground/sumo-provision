@@ -40,6 +40,12 @@ pub struct EnvelopePart {
     pub cek: [u8; 16],
     /// The GCM IV from the index.
     pub iv: [u8; 12],
+    /// Ciphertext content-address (the blob-store `outer` hash). When set, the
+    /// L2 payload URI is `sha256:<outer>` so the ciphertext is fetched from the
+    /// blob store — by the device (pull) or resolved by the orchestrator to S3
+    /// and pushed (push). `None` keeps the legacy integrated `#<id>` URI whose
+    /// bytes are uploaded alongside the manifest.
+    pub outer: Option<ContentHash>,
 }
 
 impl Signer {
@@ -95,11 +101,18 @@ impl Signer {
             .sequence_number(seq);
         for p in parts {
             let enc_info = encryptor::rewrap_cek_ecdh(&p.cek, &p.iv, &recipient)?;
+            // Content-address URI => ciphertext lives in the blob store (fetched
+            // by the device on pull, or resolved to S3 + pushed on push);
+            // otherwise the legacy integrated `#<id>` (bytes uploaded alongside).
+            let uri = match &p.outer {
+                Some(outer) => outer.to_prefixed(),
+                None => format!("#{}", p.id),
+            };
             builder = builder.add_component(ComponentSpec {
                 id: vec![component.to_string(), p.id.clone()],
                 digest: p.inner.to_vec(),
                 size: p.size,
-                uri: format!("#{}", p.id),
+                uri,
                 encryption_info: Some(enc_info),
             });
         }
@@ -195,6 +208,7 @@ pub async fn create_envelope(
             size: entry.size,
             cek: entry.cek,
             iv: entry.nonce,
+            outer: None,
         });
     }
     let envelope = s
@@ -248,6 +262,7 @@ mod tests {
             size: pt.len() as u64,
             cek,
             iv,
+            outer: None,
         };
 
         // Tower 2 builds the per-device envelope (only the device's PUBLIC key).
@@ -295,6 +310,7 @@ mod tests {
                 size: 42,
                 cek: [7u8; 16],
                 iv: [9u8; 12],
+                outer: Some(ContentHash::of(id.as_bytes())),
             };
             signer
                 .build_envelope(&device.public_key_bytes(), b"dev-1", component, &[part], 1)

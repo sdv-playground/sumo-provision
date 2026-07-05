@@ -481,6 +481,7 @@ pub async fn channel_target_l1(
                 size: entry.size,
                 cek: entry.cek,
                 iv: entry.nonce,
+                outer: Some(entry.outer),
             });
         }
         let l2 = s
