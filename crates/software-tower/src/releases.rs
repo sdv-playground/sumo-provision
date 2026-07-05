@@ -14,14 +14,18 @@
 //! number); `created_at` is the build time (when this content was first cut).
 
 use axum::extract::{Path, Query, State};
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
+use sumo_offboard::cose_key::CoseKey;
 use wire::{ArtifactRef, ContentHash, Entity, Part, Tree};
 
 use crate::content::{AppError, AppState};
+use crate::signer::EnvelopePart;
 
 // --- request / response bodies ---------------------------------------------
 
@@ -391,6 +395,115 @@ pub async fn channel_target_tree(
     .map_err(db)?
     .ok_or(AppError::NotFound)?;
     Ok(Json(tree))
+}
+
+/// `POST /channel-targets/l1` body — "vehicle state in → signed L1 out".
+#[derive(Deserialize)]
+pub struct L1Request {
+    pub channel: String,
+    pub device: String,
+    pub architecture: String,
+    /// Device public key as hex of its COSE_Key CBOR (relayed from Tower 1's
+    /// roster — the orchestrator hands identity, never a secret).
+    pub device_pubkey: String,
+    /// Device id — the recipient `kid` for the per-device CEK re-wrap.
+    pub device_id: String,
+    /// The vehicle's self-reported current state — accepted so the source of
+    /// truth flows up. The tower is authoritative about the *target* and the
+    /// vehicle reconciles the L1 against its own banks (copy-vs-fetch), so this
+    /// is reserved for future path/dependency resolution (unused today).
+    #[serde(default)]
+    pub current_state: Option<Value>,
+    /// SUIT sequence number (anti-replay) for the L1 and its L2s.
+    #[serde(default = "default_l1_seq")]
+    pub seq: u64,
+}
+
+fn default_l1_seq() -> u64 {
+    1
+}
+
+/// `POST /channel-targets/l1` — the "state in → signed L1 out" call.
+///
+/// Resolves the channel to its full desired [`wire::Tree`] and returns a
+/// per-device, sw-authority-signed **L1 campaign**: one embedded L2 image per
+/// component, each with the content key re-wrapped to `device_pubkey`. Firmware
+/// ciphertext stays content-addressed in the blob store — the L1 carries only
+/// manifests, never firmware bytes — so the orchestrator relays this opaque,
+/// signed artifact and streams ciphertext from the blob store with no device
+/// private key.
+///
+/// The L1 is the full authoritative target (every component, even ones already
+/// installed); the vehicle reconciles it against its own banks. `current_state`
+/// is accepted so it flows up as the source of truth but is not yet used.
+pub async fn channel_target_l1(
+    State(s): State<AppState>,
+    Json(req): Json<L1Request>,
+) -> Result<Response, AppError> {
+    let device_pubkey = hex::decode(req.device_pubkey.trim())
+        .map_err(|_| AppError::BadRequest("device_pubkey must be hex".into()))?;
+    CoseKey::from_cose_key_bytes(&device_pubkey)
+        .map_err(|_| AppError::BadRequest("device_pubkey is not a valid COSE_Key".into()))?;
+
+    // The vehicle's self-report flows up as the source of truth; the tower is
+    // authoritative about the target and the vehicle reconciles, so we record it
+    // but don't act on it yet (path/dependency logic is the next step).
+    if req.current_state.is_some() {
+        tracing::debug!(
+            channel = %req.channel,
+            device = %req.device,
+            "L1 request carried a vehicle-state report (recorded; reconciliation is on the vehicle)"
+        );
+    }
+
+    let tree = resolve_channel_target(
+        s.pool()?,
+        &req.channel,
+        Some(&req.device),
+        Some(&req.architecture),
+    )
+    .await
+    .map_err(db)?
+    .ok_or(AppError::NotFound)?;
+
+    // One per-device L2 per component that has parts; wrap them into the L1.
+    let mut l2s: Vec<(String, Vec<u8>)> = Vec::new();
+    for (path, entity) in &tree.entities {
+        if entity.parts.is_empty() {
+            continue;
+        }
+        let mut parts = Vec::with_capacity(entity.parts.len());
+        for p in &entity.parts {
+            let entry = s.index.get(&p.content).await?.ok_or(AppError::NotFound)?;
+            parts.push(EnvelopePart {
+                id: p.id.clone(),
+                inner: *p.content.as_bytes(),
+                size: entry.size,
+                cek: entry.cek,
+                iv: entry.nonce,
+            });
+        }
+        let l2 = s
+            .signer
+            .build_envelope(
+                &device_pubkey,
+                req.device_id.as_bytes(),
+                path,
+                &parts,
+                req.seq,
+            )
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("L2 build failed for {path}: {e}")))?;
+        l2s.push((path.clone(), l2));
+    }
+    if l2s.is_empty() {
+        return Err(AppError::NotFound);
+    }
+
+    let l1 = s
+        .signer
+        .build_campaign(&l2s, req.seq)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("L1 build failed: {e}")))?;
+    Ok(([(header::CONTENT_TYPE, "application/cbor")], l1).into_response())
 }
 
 /// `GET /admin/artifacts/{inner}` — does Tower 2 already have this content?

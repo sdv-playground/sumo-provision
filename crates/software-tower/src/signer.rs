@@ -17,7 +17,7 @@ use serde::Deserialize;
 use sumo_offboard::cose_key::CoseKey;
 use sumo_offboard::image_builder::{ComponentSpec, MultiComponentBuilder};
 use sumo_offboard::recipient::Recipient;
-use sumo_offboard::{encryptor, keygen, OffboardError};
+use sumo_offboard::{encryptor, keygen, CampaignBuilder, OffboardError};
 use wire::ContentHash;
 
 use crate::content::{AppError, AppState};
@@ -102,6 +102,34 @@ impl Signer {
                 uri: format!("#{}", p.id),
                 encryption_info: Some(enc_info),
             });
+        }
+        builder.build(&self.key)
+    }
+
+    /// Build a signed **L1 campaign** envelope from per-device L2 image
+    /// envelopes — one per component, each embedded under its component key.
+    /// The L1 carries only the (tiny, per-device) L2 manifests; every firmware
+    /// payload stays content-addressed in the blob store, so only key material
+    /// is ever an integrated *payload*. Signed with the same sw-authority key,
+    /// so the device verifies content on one anchor and the orchestrator relays
+    /// this opaque artifact without any device private key.
+    pub fn build_campaign(
+        &self,
+        components: &[(String, Vec<u8>)],
+        seq: u64,
+    ) -> Result<Vec<u8>, OffboardError> {
+        // Manifest signing time (iat): the tower's wall clock at build time — the
+        // L1 campaign is a signed manifest too, so it carries the same lower bound
+        // on real time the device ratchets from (see docs/design/safe-time-floor.md).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut builder = CampaignBuilder::new()
+            .signing_time(now)
+            .sequence_number(seq);
+        for (name, l2) in components {
+            builder = builder.add_integrated_image(name.clone(), l2);
         }
         builder.build(&self.key)
     }
@@ -248,5 +276,41 @@ mod tests {
         total += decryptor.update(&ciphertext, &mut out[total..]).unwrap();
         total += decryptor.finalize(&mut out[total..]).unwrap();
         assert_eq!(&out[..total], pt);
+    }
+
+    /// `build_campaign` wraps the per-device L2s into a signed L1 that validates
+    /// against the pinned sw-authority anchor — the "state in → signed L1 out"
+    /// core. No device key is needed to build or verify the L1 itself; only the
+    /// vehicle's HSM can later unwrap the L2 payloads.
+    #[test]
+    fn build_campaign_produces_a_signed_l1() {
+        let crypto = RustCryptoBackend::new();
+        let signer = Signer::generate().unwrap();
+        let device = keygen::generate_device_key(keygen::ES256).unwrap();
+
+        let mk_l2 = |component: &str, id: &str| {
+            let part = EnvelopePart {
+                id: id.into(),
+                inner: encryptor::sha256(id.as_bytes()),
+                size: 42,
+                cek: [7u8; 16],
+                iv: [9u8; 12],
+            };
+            signer
+                .build_envelope(&device.public_key_bytes(), b"dev-1", component, &[part], 1)
+                .unwrap()
+        };
+        let l2a = mk_l2("vm1", "kernel");
+        let l2b = mk_l2("vm2", "rootfs");
+
+        let l1 = signer
+            .build_campaign(&[("vm1".into(), l2a), ("vm2".into(), l2b)], 3)
+            .expect("L1 builds");
+        assert!(!l1.is_empty());
+
+        let validator = Validator::new(&signer.public_key_cbor(), None);
+        validator
+            .validate_envelope(&l1, &crypto, 0)
+            .expect("L1 validates against the sw-authority anchor");
     }
 }
