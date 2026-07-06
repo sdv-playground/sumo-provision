@@ -1095,7 +1095,7 @@ dependencies = [
 [[package]]
 name = "hsm"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#aa1ce1825eb3b5ff252de45e197f407a6d7efde5"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#3289cbb8d1f812de898dce9a76c7bde0a6327371"
 dependencies = [
  "ciborium",
  "coset",
@@ -1110,7 +1110,7 @@ dependencies = [
 [[package]]
 name = "hsm-contract"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#aa1ce1825eb3b5ff252de45e197f407a6d7efde5"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#3289cbb8d1f812de898dce9a76c7bde0a6327371"
 dependencies = [
  "vhsm-proto",
 ]
@@ -1118,7 +1118,7 @@ dependencies = [
 [[package]]
 name = "hsm-link-b"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#aa1ce1825eb3b5ff252de45e197f407a6d7efde5"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#3289cbb8d1f812de898dce9a76c7bde0a6327371"
 
 [[package]]
 name = "http"
@@ -1367,9 +1367,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
- "sumo-codec 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
+ "sumo-codec",
  "sumo-offboard",
- "sumo-onboard 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
+ "sumo-onboard",
  "tempfile",
  "tokio",
  "tracing",
@@ -2469,9 +2469,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
- "sumo-crypto 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
+ "sumo-crypto",
  "sumo-offboard",
- "sumo-onboard 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
+ "sumo-onboard",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -2759,40 +2759,10 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sumo-codec"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
-dependencies = [
- "ciborium",
- "coset",
-]
-
-[[package]]
-name = "sumo-codec"
-version = "0.1.0"
 source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1#8a9a680df4b216542d4872079f242bac0619597e"
 dependencies = [
  "ciborium",
  "coset",
-]
-
-[[package]]
-name = "sumo-crypto"
-version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
-dependencies = [
- "aes",
- "aes-gcm",
- "aes-kw",
- "ciborium",
- "coset",
- "ctr",
- "ed25519-dalek",
- "getrandom 0.2.17",
- "ghash",
- "hkdf",
- "p256",
- "sha2",
- "sumo-codec 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0)",
- "zeroize",
 ]
 
 [[package]]
@@ -2812,7 +2782,7 @@ dependencies = [
  "hkdf",
  "p256",
  "sha2",
- "sumo-codec 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
+ "sumo-codec",
  "zeroize",
 ]
 
@@ -2829,22 +2799,10 @@ dependencies = [
  "pem",
  "rand 0.8.6",
  "sha2",
- "sumo-codec 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
- "sumo-crypto 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
+ "sumo-codec",
+ "sumo-crypto",
  "thiserror 2.0.18",
  "zstd",
-]
-
-[[package]]
-name = "sumo-onboard"
-version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
-dependencies = [
- "ciborium",
- "coset",
- "ruzstd",
- "sumo-codec 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0)",
- "sumo-crypto 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0)",
 ]
 
 [[package]]
@@ -2855,14 +2813,14 @@ dependencies = [
  "ciborium",
  "coset",
  "ruzstd",
- "sumo-codec 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
- "sumo-crypto 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
+ "sumo-codec",
+ "sumo-crypto",
 ]
 
 [[package]]
 name = "sumo-sovd-flash-engine"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#2f29bd472de2cabd065572883980899d916b01a1"
+source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#f5c1dbf948536e3a20104044309f3acd6c9b95cb"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -2870,8 +2828,8 @@ dependencies = [
  "serde_json",
  "sovd-client",
  "sovd-core",
- "sumo-crypto 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0)",
- "sumo-onboard 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0)",
+ "sumo-crypto",
+ "sumo-onboard",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
@@ -3336,7 +3294,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vhsm-proto"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#aa1ce1825eb3b5ff252de45e197f407a6d7efde5"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#3289cbb8d1f812de898dce9a76c7bde0a6327371"
 
 [[package]]
 name = "want"
