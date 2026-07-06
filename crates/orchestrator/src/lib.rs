@@ -6,9 +6,12 @@
 //! channel) for the read-only preview ([`apply_plan`]). The push itself relays
 //! Tower 2's signed **L1 campaign** for the device ([`build_flash_plan`] /
 //! [`campaign_execute`]): Tower 2 does the diff + per-device assembly and signs
-//! the result, so the orchestrator fans the L1 out into per-component L2 images,
-//! fetches each part's ciphertext from the blob store, and drives the SOVD
-//! `/updates` flash over the shared engine — never rebuilding the plan itself.
+//! the result, so the orchestrator fans the L1 out into per-component L2 images
+//! and drives the SOVD `/updates` flash over the shared engine — never rebuilding
+//! the plan itself. It fetches each part's ciphertext from the blob store to push
+//! alongside the manifest, except for a whole component the vehicle already carries
+//! (diffed against its self-report): that one pushes the manifest alone and the
+//! device copy-forwards the content from its own active bank, digest-verified.
 
 use std::sync::Arc;
 
@@ -717,11 +720,17 @@ pub struct FlashResult {
 // --- L1 fan-out (the signed plan source) -----------------------------------
 
 /// One part of a component's L2 image, decoded from the L1: the part id (the SUIT
-/// component id's second segment) and the ciphertext content-address parsed from
-/// the L2's `sha256:<hex>` payload uri — the blob to push.
+/// component id's second segment), the ciphertext content-address parsed from the
+/// L2's `sha256:<hex>` payload uri (the blob to push), and the expected **plaintext
+/// image digest** (the SUIT `suit-parameter-image-digest`). That digest is the same
+/// currency the vehicle self-reports per installed file (the decrypted, decompressed
+/// image's SHA-256), so it drives the copy-forward diff ([`component_unchanged`]).
+/// `None` when the L2 carries no image digest for the part (then the component is
+/// always pushed full — the safe default).
 struct L1Part {
     part: String,
     outer: ContentHash,
+    inner: Option<ContentHash>,
 }
 
 /// One component's slice of a decoded L1 campaign: the L2 manifest bytes (the
@@ -776,7 +785,14 @@ fn fanout_l1(l1: &[u8]) -> Result<Vec<L1Component>, Error> {
                 component: component.clone(),
                 reason: format!("part '{part}' uri '{uri}' is not a content address"),
             })?;
-            parts.push(L1Part { part, outer });
+            // The expected plaintext image digest (SUIT image-digest, always
+            // SHA-256 here). A non-32-byte or absent digest → `None`, and the
+            // component is pushed full (never copy-forwarded on a guess).
+            let inner = manifest
+                .image_digest(i)
+                .and_then(|(d,)| <[u8; 32]>::try_from(d.bytes.as_slice()).ok())
+                .map(ContentHash::from_bytes);
+            parts.push(L1Part { part, outer, inner });
         }
         components.push(L1Component {
             component,
@@ -787,16 +803,78 @@ fn fanout_l1(l1: &[u8]) -> Result<Vec<L1Component>, Error> {
     Ok(components)
 }
 
-/// Turn decoded L1 components into engine [`FlashJob`]s, fetching each part's
-/// ciphertext from Tower 2's blob store. `only` keeps a single component (the
-/// singleshot-in-its-own-transaction path). Payload order mirrors the manifest's
-/// component order — the device pairs pushed payloads positionally — and each
-/// payload keeps the `#<part>` uri the current push wire uses: cosmetic to the
-/// device (it routes by order and reads the uri/digest from the manifest), but it
-/// keeps parts distinct within a job even when two ship byte-identical content.
+/// Where a job's part ciphertext comes from — Tower 2's blob store in production,
+/// a fake in tests. A seam so the copy-forward diff (below) can be unit-tested
+/// without a live blob store: the manifest-only path fetches nothing at all.
+#[async_trait]
+trait BlobSource {
+    /// Fetch a part's ciphertext by its content-address (`outer`), erroring when
+    /// the source has no such blob (a build/publish step out of sync).
+    async fn fetch_ciphertext(&self, outer: &ContentHash) -> Result<Vec<u8>, Error>;
+}
+
+#[async_trait]
+impl BlobSource for SoftwareClient {
+    async fn fetch_ciphertext(&self, outer: &ContentHash) -> Result<Vec<u8>, Error> {
+        self.get_blob(outer)
+            .await?
+            .ok_or_else(|| Error::PayloadMissing {
+                outer: outer.to_prefixed(),
+            })
+    }
+}
+
+/// Whether the vehicle's active bank already holds **every** part this component's
+/// L2 declares — so the push can be manifest-only and the device copy-forwards the
+/// content from its own active bank (digest-verified) instead of us re-shipping it.
+///
+/// Correlation is by the **plaintext image digest**, the content identity itself —
+/// verified to be the same currency on both sides: the L2's
+/// `suit-parameter-image-digest` and the vehicle's per-file `sha256` are each the
+/// SHA-256 of the decrypted, decompressed image. We deliberately do **not** match
+/// by part name: the vehicle reports each file under its on-disk *bank filename*, a
+/// device-side layout remap of the part-id (e.g. `firmware → rootfs.img`), so a
+/// name join would silently never fire for multi-file banks. A digest join is both
+/// robust to that remap and exact (equal digest ⇔ equal content).
+///
+/// UNCHANGED (⇒ manifest-only) iff the vehicle reports this component and every
+/// declared part's expected digest is present among the vehicle's current digests
+/// for it. Any of: component unknown to the vehicle, a declared part whose content
+/// the vehicle lacks, or a part with no expected digest ⇒ CHANGED (push full — the
+/// safe default). The device re-derives each copy-forward's target file and
+/// re-checks it against the manifest digest on-target, so a copy it cannot satisfy
+/// fails safe there rather than installing the wrong bytes.
+fn component_unchanged(c: &L1Component, observed: &Tree) -> bool {
+    let Some(entity) = observed.entities.get(&c.component) else {
+        return false;
+    };
+    !c.parts.is_empty()
+        && c.parts.iter().all(|p| match p.inner {
+            Some(inner) => entity.parts.iter().any(|op| op.content == inner),
+            None => false,
+        })
+}
+
+/// Turn decoded L1 components into engine [`FlashJob`]s, diffing each against the
+/// vehicle's `observed` state to decide **copy-forward vs full push**:
+///
+/// - **Unchanged** ([`component_unchanged`]) → a manifest-only job (empty
+///   `payloads`, no blob fetched): the device copy-forwards every part from its own
+///   active bank, digest-verified against the L2.
+/// - **Changed / unknown** → today's behavior: fetch every part's ciphertext from
+///   the blob store and push it alongside the manifest.
+///
+/// The decision is component-level, all-or-nothing: the L2's part order is
+/// tower-signed and the device pairs pushed payloads positionally, so we cannot
+/// push an arbitrary subset of a component's parts (intra-component part-diff is a
+/// follow-up). `only` keeps a single component (the singleshot-in-its-own-
+/// transaction path). For a full push, payload order mirrors the manifest's
+/// component order and each payload keeps the `#<part>` uri the push wire uses.
+/// Every decision is logged so a copy-forward is never a silent skip.
 async fn l1_jobs(
-    hub: &SoftwareClient,
+    blobs: &impl BlobSource,
     components: Vec<L1Component>,
+    observed: &Tree,
     only: Option<&str>,
 ) -> Result<Vec<FlashJob>, Error> {
     let mut jobs = Vec::new();
@@ -804,19 +882,28 @@ async fn l1_jobs(
         if only.is_some_and(|o| o != c.component) {
             continue;
         }
-        let mut payloads = Vec::with_capacity(c.parts.len());
-        for p in &c.parts {
-            let ciphertext =
-                hub.get_blob(&p.outer)
-                    .await?
-                    .ok_or_else(|| Error::PayloadMissing {
-                        outer: p.outer.to_prefixed(),
-                    })?;
-            payloads.push(Payload {
-                uri: format!("#{}", p.part),
-                source: PayloadSource::Bytes(ciphertext),
-            });
-        }
+        let payloads = if component_unchanged(&c, observed) {
+            tracing::info!(
+                component = %c.component,
+                parts = c.parts.len(),
+                "copy-forward: vehicle already carries this component — pushing manifest only (no payloads)"
+            );
+            Vec::new()
+        } else {
+            tracing::info!(
+                component = %c.component,
+                parts = c.parts.len(),
+                "push-full: component changed or unknown on the vehicle — shipping all payloads"
+            );
+            let mut payloads = Vec::with_capacity(c.parts.len());
+            for p in &c.parts {
+                payloads.push(Payload {
+                    uri: format!("#{}", p.part),
+                    source: PayloadSource::Bytes(blobs.fetch_ciphertext(&p.outer).await?),
+                });
+            }
+            payloads
+        };
         jobs.push(FlashJob {
             component_id: c.component,
             gateway_id: None,
@@ -877,7 +964,9 @@ async fn l1_flash_plan(
             1,
         )
         .await?;
-    let jobs = l1_jobs(&hub, fanout_l1(&l1)?, only).await?;
+    // Diff each fanned-out component against the vehicle's self-report: unchanged
+    // components push manifest-only (device copy-forwards), the rest push full.
+    let jobs = l1_jobs(&hub, fanout_l1(&l1)?, &observed, only).await?;
     let trust_anchor = hub.signer_pubkey().await?;
     Ok((jobs, trust_anchor, observed))
 }
@@ -1380,5 +1469,246 @@ mod tests {
             architecture: Some("arm64".into()),
         };
         assert_eq!(l1_selector(&full).unwrap(), ("rig", "arm64"));
+    }
+
+    // --- copy-forward diff ------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A blob source that hands back fixed ciphertext and counts fetches — so a
+    /// manifest-only job can be asserted to fetch *nothing*.
+    struct FakeBlobs {
+        fetches: AtomicUsize,
+    }
+
+    impl FakeBlobs {
+        fn new() -> Self {
+            Self {
+                fetches: AtomicUsize::new(0),
+            }
+        }
+        fn fetches(&self) -> usize {
+            self.fetches.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl BlobSource for FakeBlobs {
+        async fn fetch_ciphertext(&self, _outer: &ContentHash) -> Result<Vec<u8>, Error> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(b"ciphertext".to_vec())
+        }
+    }
+
+    /// Build a signed L1 wrapping one component whose parts carry an explicit
+    /// `(part-id, outer, inner)` triple — `inner` becomes the SUIT image-digest the
+    /// diff compares, `outer` the blob content-address a full push would fetch.
+    fn l1_one_component(
+        key: &CoseKey,
+        component: &str,
+        parts: &[(&str, ContentHash, ContentHash)],
+    ) -> Vec<u8> {
+        let mut b = MultiComponentBuilder::new()
+            .signing_time(1_751_800_000)
+            .sequence_number(1);
+        for (part, outer, inner) in parts {
+            b = b.add_component(ComponentSpec {
+                id: vec![component.to_string(), part.to_string()],
+                digest: inner.as_bytes().to_vec(),
+                size: 16,
+                uri: outer.to_prefixed(),
+                encryption_info: None,
+            });
+        }
+        let l2 = b.build(key).unwrap();
+        CampaignBuilder::new()
+            .signing_time(1_751_800_000)
+            .sequence_number(1)
+            .add_integrated_image(component.to_string(), &l2)
+            .build(key)
+            .unwrap()
+    }
+
+    /// A one-component observed tree: the vehicle reports `parts` as `(file-name,
+    /// plaintext-sha256)` — the shape `read_rig_state` builds from the device's
+    /// `x-sumo-installed-manifest`.
+    fn observed_of(component: &str, parts: &[(&str, ContentHash)]) -> Tree {
+        let mut tree = Tree::default();
+        tree.entities.insert(
+            component.to_string(),
+            Entity {
+                kind: "vm".to_string(),
+                parts: parts
+                    .iter()
+                    .map(|(name, content)| Part {
+                        kind: "file".to_string(),
+                        id: name.to_string(),
+                        content: *content,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        tree
+    }
+
+    /// `fanout_l1` surfaces each part's expected plaintext image-digest (the SUIT
+    /// image-digest) alongside the ciphertext content-address.
+    #[test]
+    fn fanout_l1_surfaces_image_digest() {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let (ok, dk) = (ContentHash::of(b"k-ct"), ContentHash::of(b"k-pt"));
+        let l1 = l1_one_component(&key, "vm1", &[("kernel", ok, dk)]);
+        let fanned = fanout_l1(&l1).unwrap();
+        assert_eq!(fanned[0].parts[0].inner, Some(dk));
+        assert_eq!(fanned[0].parts[0].outer, ok);
+    }
+
+    /// The diff correlates by digest, so it fires even though the vehicle reports a
+    /// part under its remapped on-disk bank filename (`firmware` → `rootfs.img`) —
+    /// same content digests ⇒ the component is unchanged.
+    #[test]
+    fn component_unchanged_matches_by_digest_despite_bank_filename_remap() {
+        let (dk, df) = (ContentHash::of(b"kernel-pt"), ContentHash::of(b"rootfs-pt"));
+        let c = L1Component {
+            component: "vm1".into(),
+            envelope: vec![],
+            parts: vec![
+                L1Part {
+                    part: "kernel".into(),
+                    outer: ContentHash::of(b"kc"),
+                    inner: Some(dk),
+                },
+                L1Part {
+                    part: "firmware".into(),
+                    outer: ContentHash::of(b"fc"),
+                    inner: Some(df),
+                },
+            ],
+        };
+        // Vehicle reports `firmware` under its bank filename `rootfs.img`.
+        let observed = observed_of("vm1", &[("kernel", dk), ("rootfs.img", df)]);
+        assert!(component_unchanged(&c, &observed));
+    }
+
+    /// One differing part ⇒ the whole component is changed (all-or-nothing);
+    /// an unknown component or a part the vehicle lacks ⇒ changed; a part with no
+    /// expected digest ⇒ changed.
+    #[test]
+    fn component_unchanged_false_paths() {
+        let (dk, df) = (ContentHash::of(b"kernel-pt"), ContentHash::of(b"rootfs-pt"));
+        let mk =
+            |kernel_inner: Option<ContentHash>, firmware_inner: Option<ContentHash>| L1Component {
+                component: "vm1".into(),
+                envelope: vec![],
+                parts: vec![
+                    L1Part {
+                        part: "kernel".into(),
+                        outer: ContentHash::of(b"kc"),
+                        inner: kernel_inner,
+                    },
+                    L1Part {
+                        part: "firmware".into(),
+                        outer: ContentHash::of(b"fc"),
+                        inner: firmware_inner,
+                    },
+                ],
+            };
+        let c = mk(Some(dk), Some(df));
+
+        // A part's content differs on the vehicle.
+        let changed = observed_of(
+            "vm1",
+            &[("kernel", dk), ("rootfs.img", ContentHash::of(b"other"))],
+        );
+        assert!(!component_unchanged(&c, &changed));
+
+        // The vehicle doesn't report this component at all.
+        assert!(!component_unchanged(&c, &Tree::default()));
+        assert!(!component_unchanged(
+            &c,
+            &observed_of("vm2", &[("kernel", dk)])
+        ));
+
+        // The vehicle is missing one declared part (only has the kernel).
+        let missing = observed_of("vm1", &[("kernel", dk)]);
+        assert!(!component_unchanged(&c, &missing));
+
+        // A declared part carries no expected digest — cannot claim unchanged.
+        let no_digest = mk(Some(dk), None);
+        assert!(!component_unchanged(
+            &no_digest,
+            &observed_of("vm1", &[("kernel", dk), ("rootfs.img", df)])
+        ));
+    }
+
+    /// Unchanged component → a manifest-only job: empty payloads, and the blob
+    /// store is never touched.
+    #[tokio::test]
+    async fn l1_jobs_unchanged_component_pushes_manifest_only() {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let (ok, dk) = (ContentHash::of(b"k-ct"), ContentHash::of(b"k-pt"));
+        let (of, df) = (ContentHash::of(b"f-ct"), ContentHash::of(b"f-pt"));
+        let l1 = l1_one_component(&key, "vm1", &[("kernel", ok, dk), ("firmware", of, df)]);
+
+        // Vehicle already carries both (under the remapped rootfs.img name).
+        let observed = observed_of("vm1", &[("kernel", dk), ("rootfs.img", df)]);
+        let blobs = FakeBlobs::new();
+        let jobs = l1_jobs(&blobs, fanout_l1(&l1).unwrap(), &observed, None)
+            .await
+            .unwrap();
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].component_id, "vm1");
+        assert!(jobs[0].payloads.is_empty(), "manifest-only: no payloads");
+        assert!(
+            !jobs[0].envelope.is_empty(),
+            "the signed L2 is still pushed"
+        );
+        assert_eq!(blobs.fetches(), 0, "copy-forward fetches no ciphertext");
+    }
+
+    /// Changed component → a full job: every declared part's ciphertext is fetched
+    /// and pushed (component-level all-or-nothing).
+    #[tokio::test]
+    async fn l1_jobs_changed_component_pushes_all_payloads() {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let (ok, dk) = (ContentHash::of(b"k-ct"), ContentHash::of(b"k-pt"));
+        let (of, df) = (ContentHash::of(b"f-ct"), ContentHash::of(b"f-pt"));
+        let l1 = l1_one_component(&key, "vm1", &[("kernel", ok, dk), ("firmware", of, df)]);
+
+        // The rootfs differs — so the whole component ships, both parts.
+        let observed = observed_of(
+            "vm1",
+            &[("kernel", dk), ("rootfs.img", ContentHash::of(b"stale"))],
+        );
+        let blobs = FakeBlobs::new();
+        let jobs = l1_jobs(&blobs, fanout_l1(&l1).unwrap(), &observed, None)
+            .await
+            .unwrap();
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].payloads.len(),
+            2,
+            "all parts ship, not just the changed one"
+        );
+        assert_eq!(blobs.fetches(), 2);
+    }
+
+    /// A component the vehicle doesn't report (no self-report / brand-new) → full.
+    #[tokio::test]
+    async fn l1_jobs_unknown_vehicle_pushes_full() {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let (ok, dk) = (ContentHash::of(b"k-ct"), ContentHash::of(b"k-pt"));
+        let l1 = l1_one_component(&key, "vm1", &[("kernel", ok, dk)]);
+
+        let blobs = FakeBlobs::new();
+        let jobs = l1_jobs(&blobs, fanout_l1(&l1).unwrap(), &Tree::default(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(jobs[0].payloads.len(), 1);
+        assert_eq!(blobs.fetches(), 1);
     }
 }

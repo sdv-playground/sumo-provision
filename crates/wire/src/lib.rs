@@ -40,6 +40,14 @@ impl ContentHash {
         &self.0
     }
 
+    /// Wrap an already-computed 32-byte SHA-256 digest as a content address — the
+    /// inverse of [`as_bytes`](Self::as_bytes). Use when the digest was produced
+    /// elsewhere and only needs comparing, e.g. a SUIT manifest's
+    /// `suit-parameter-image-digest`.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// An incremental hasher, for content-addressing a stream without holding it
     /// all in memory. Feed chunks with [`Hasher::update`], then [`Hasher::finalize`].
     pub fn hasher() -> Hasher {

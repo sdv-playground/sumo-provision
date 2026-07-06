@@ -11,7 +11,8 @@ sovd-client = { workspace = true }
 sumo-sovd-flash-engine = { workspace = true }
 # decode the Tower-2 signed L1 campaign + its embedded L2 images (fan out the push).
 # sumo-codec = the CBOR `decode_envelope`; sumo-onboard::Manifest = typed per-component
-# accessors (component_id / uri / count) that track the SUIT component index for us.
+# accessors (component_id / uri / count / image_digest) that track the SUIT
+# component index for us.
 sumo-codec = { workspace = true }
 sumo-onboard = { workspace = true }
 serde = { workspace = true }
@@ -20,6 +21,8 @@ reqwest = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+# structured log of each component's push decision (copy-forward vs full).
+tracing = { workspace = true }
 
 [dev-dependencies]
 # build a signed L1 (campaign of L2 images) in-test to exercise the fan-out decode.

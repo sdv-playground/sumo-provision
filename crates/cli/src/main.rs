@@ -372,8 +372,9 @@ async fn main() -> anyhow::Result<()> {
     // Surface the flash engine's progress (per-payload upload size/time/throughput,
     // staging, reset, commit) on stderr. Quiet by default for everything else;
     // override with RUST_LOG (e.g. `RUST_LOG=info` or `=debug` for more detail).
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,sumo_sovd_flash_engine=info"));
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("warn,sumo_sovd_flash_engine=info,orchestrator=info")
+    });
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .without_time()

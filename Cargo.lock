@@ -1731,6 +1731,7 @@ dependencies = [
  "sumo-sovd-flash-engine",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "wire",
 ]
 
