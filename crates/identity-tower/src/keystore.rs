@@ -242,7 +242,14 @@ pub fn mint_keystore(
         .map_err(|e| anyhow!("ECDH-encrypt keystore: {e}"))?;
 
     let factory_key = factory_signing_key()?;
+    // Manifest signing time (iat): tower wall clock at build time — the signed
+    // lower bound the device ratchets its safe-time floor from (safe-time-floor.md).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     ImageManifestBuilder::new()
+        .signing_time(now)
         .component_id(vec!["hsm".to_string(), "keys".to_string()])
         .sequence_number(security_version)
         .security_version(security_version)
@@ -325,6 +332,17 @@ mod tests {
         )
         .unwrap();
         assert!(!suit.is_empty(), "minted keystore SUIT must be non-empty");
+
+        // The minted manifest MUST carry a signing time (iat) — the signed lower
+        // bound the device ratchets its safe-time floor from. Read it back via the
+        // onboard accessor (docs/design/safe-time-floor.md).
+        let envelope = sumo_codec::decode::decode_envelope(&suit).unwrap();
+        let manifest = sumo_onboard::Manifest { envelope };
+        let iat = manifest
+            .signing_time()
+            .expect("minted keystore manifest must carry a signing time (iat)");
+        // Sanity: a plausible recent wall-clock (after 2023-01-01), not 0/epoch.
+        assert!(iat > 1_672_531_200, "iat should be a real wall-clock time");
 
         // SEC1 <-> COSE roundtrip (the enrol pubkey conversion path).
         let sec1 = cose_to_sec1(&dev_cose).unwrap();

@@ -83,7 +83,16 @@ impl Signer {
             public_key: CoseKey::from_cose_key_bytes(device_pubkey)?,
             kid: device_kid.to_vec(),
         };
-        let mut builder = MultiComponentBuilder::new().sequence_number(seq);
+        // Manifest signing time (iat): the tower's wall clock at build time —
+        // a signed lower bound on real time the device ratchets its safe-time
+        // floor from (see docs/design/safe-time-floor.md).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut builder = MultiComponentBuilder::new()
+            .signing_time(now)
+            .sequence_number(seq);
         for p in parts {
             let enc_info = encryptor::rewrap_cek_ecdh(&p.cek, &p.iv, &recipient)?;
             builder = builder.add_component(ComponentSpec {

@@ -1367,7 +1367,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "sumo-codec 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
  "sumo-offboard",
+ "sumo-onboard 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
  "tempfile",
  "tokio",
  "tracing",
@@ -2467,9 +2469,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
- "sumo-crypto",
+ "sumo-crypto 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
  "sumo-offboard",
- "sumo-onboard",
+ "sumo-onboard 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -2764,6 +2766,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sumo-codec"
+version = "0.1.0"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1#8a9a680df4b216542d4872079f242bac0619597e"
+dependencies = [
+ "ciborium",
+ "coset",
+]
+
+[[package]]
 name = "sumo-crypto"
 version = "0.1.0"
 source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
@@ -2780,14 +2791,35 @@ dependencies = [
  "hkdf",
  "p256",
  "sha2",
- "sumo-codec",
+ "sumo-codec 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0)",
+ "zeroize",
+]
+
+[[package]]
+name = "sumo-crypto"
+version = "0.1.0"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1#8a9a680df4b216542d4872079f242bac0619597e"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "aes-kw",
+ "ciborium",
+ "coset",
+ "ctr",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "ghash",
+ "hkdf",
+ "p256",
+ "sha2",
+ "sumo-codec 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
  "zeroize",
 ]
 
 [[package]]
 name = "sumo-offboard"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0#19ffce9b5dca5743e90d7a8892fda9a2f4343754"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1#8a9a680df4b216542d4872079f242bac0619597e"
 dependencies = [
  "ciborium",
  "coset",
@@ -2797,8 +2829,8 @@ dependencies = [
  "pem",
  "rand 0.8.6",
  "sha2",
- "sumo-codec",
- "sumo-crypto",
+ "sumo-codec 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
+ "sumo-crypto 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
  "thiserror 2.0.18",
  "zstd",
 ]
@@ -2811,8 +2843,20 @@ dependencies = [
  "ciborium",
  "coset",
  "ruzstd",
- "sumo-codec",
- "sumo-crypto",
+ "sumo-codec 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0)",
+ "sumo-crypto 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0)",
+]
+
+[[package]]
+name = "sumo-onboard"
+version = "0.1.0"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1#8a9a680df4b216542d4872079f242bac0619597e"
+dependencies = [
+ "ciborium",
+ "coset",
+ "ruzstd",
+ "sumo-codec 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
+ "sumo-crypto 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1)",
 ]
 
 [[package]]
@@ -2826,8 +2870,8 @@ dependencies = [
  "serde_json",
  "sovd-client",
  "sovd-core",
- "sumo-crypto",
- "sumo-onboard",
+ "sumo-crypto 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0)",
+ "sumo-onboard 0.1.0 (git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.0)",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
