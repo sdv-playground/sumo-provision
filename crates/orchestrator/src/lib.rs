@@ -3,9 +3,12 @@
 //! The orchestrator is the only component that talks to both the towers and a
 //! rig. It observes a rig over SOVD as a [`wire::Tree`] ([`read_rig_state`]),
 //! which [`wire::diff`] / [`wire::flash_plan`] compare against a desired tree (a
-//! channel). [`apply_plan`] resolves a channel's ship-set against Tower 2 — the
-//! read/resolve half of apply. Minting from Tower 1 and driving the SOVD
-//! `/updates` flash land against the roadmap in `architecture.md`.
+//! channel) for the read-only preview ([`apply_plan`]). The push itself relays
+//! Tower 2's signed **L1 campaign** for the device ([`build_flash_plan`] /
+//! [`campaign_execute`]): Tower 2 does the diff + per-device assembly and signs
+//! the result, so the orchestrator fans the L1 out into per-component L2 images,
+//! fetches each part's ciphertext from the blob store, and drives the SOVD
+//! `/updates` flash over the shared engine — never rebuilding the plan itself.
 
 use std::sync::Arc;
 
@@ -13,6 +16,8 @@ use async_trait::async_trait;
 use client::{ClientError, IdentityClient, MinterClient, SoftwareClient};
 use serde::{Deserialize, Serialize};
 use sovd_client::{SovdClient, SovdClientError};
+use sumo_codec::decode::decode_envelope;
+use sumo_onboard::Manifest;
 use sumo_sovd_flash_engine::{
     CameUp, CampaignStep, EcuState, EcuStatus, EngineError, EngineTimeouts, FlashEngine, FlashJob,
     FlashPlan, Payload, PayloadSource, TokenSource, UpdateType,
@@ -58,6 +63,17 @@ pub enum Error {
     },
     #[error("reading node update-state from the rig: {0}")]
     NodeState(String),
+    #[error("decoding the signed L1 campaign from Tower 2: {0}")]
+    DecodeL1(String),
+    #[error("the L1 image for component '{component}' is malformed: {reason}")]
+    BadL2 { component: String, reason: String },
+    #[error(
+        "the L1 push needs an explicit device and architecture — channel '{channel}' resolves a \
+         (channel, device, architecture) target"
+    )]
+    L1NeedsSelector { channel: String },
+    #[error("encoding the vehicle state for the L1 request: {0}")]
+    StateEncode(String),
 }
 
 /// The node's update-transaction state, read from the device's
@@ -353,8 +369,9 @@ impl ChannelTarget {
 /// (resolved from Tower 2 at `hub_url`). Reads the rig over SOVD, resolves the
 /// target's desired tree, computes the per-component [`wire::flash_plan`], and
 /// resolves each shipped part against Tower 2's index — confirming Tower 2 can
-/// actually serve it and totalling the transfer. This is the read/resolve half
-/// of apply; flashing drives the SOVD `/updates` wire per component from it.
+/// actually serve it and totalling the transfer. This is the **read-only preview**
+/// (and the `rig campaign` "anything to do?" gate); the push itself no longer
+/// diffs client-side — it relays Tower 2's signed L1 (see [`build_flash_plan`]).
 pub async fn apply_plan(
     rig_url: &str,
     hub_url: &str,
@@ -697,12 +714,181 @@ pub struct FlashResult {
     pub components: Vec<ComponentFlashResult>,
 }
 
+// --- L1 fan-out (the signed plan source) -----------------------------------
+
+/// One part of a component's L2 image, decoded from the L1: the part id (the SUIT
+/// component id's second segment) and the ciphertext content-address parsed from
+/// the L2's `sha256:<hex>` payload uri — the blob to push.
+struct L1Part {
+    part: String,
+    outer: ContentHash,
+}
+
+/// One component's slice of a decoded L1 campaign: the L2 manifest bytes (the
+/// engine job's `envelope`) and its parts **in SUIT component order**. The device
+/// pairs pushed payloads to manifest components positionally, so that order is
+/// load-bearing — preserved here from the manifest's component index.
+struct L1Component {
+    component: String,
+    envelope: Vec<u8>,
+    parts: Vec<L1Part>,
+}
+
+/// Fan a signed Tower-2 **L1 campaign** out into its per-component L2 slices.
+///
+/// The L1 wraps one integrated L2 image per component, keyed `#<component>`
+/// (`sumo_offboard::CampaignBuilder::add_integrated_image`); each L2 is itself a
+/// signed SUIT envelope whose components carry a content-address `sha256:<hex>`
+/// payload uri (firmware ciphertext stays in Tower 2's blob store). Decoding is
+/// opaque — no device key and no signature check here: the flash engine validates
+/// each L2 against the sw-authority anchor at stage time and the device
+/// re-validates on-target. Pure (no network), so it unit-tests directly.
+fn fanout_l1(l1: &[u8]) -> Result<Vec<L1Component>, Error> {
+    let campaign = decode_envelope(l1).map_err(|e| Error::DecodeL1(e.to_string()))?;
+    // BTreeMap → deterministic (sorted) component order. Each L2 is an independent
+    // job, so cross-component order is immaterial — only within-L2 part order is.
+    let mut components = Vec::with_capacity(campaign.integrated_payloads.len());
+    for (key, l2) in &campaign.integrated_payloads {
+        let component = key.strip_prefix('#').unwrap_or(key).to_string();
+        let manifest = Manifest {
+            envelope: decode_envelope(l2).map_err(|e| Error::BadL2 {
+                component: component.clone(),
+                reason: format!("L2 envelope did not decode: {e}"),
+            })?,
+        };
+        let mut parts = Vec::with_capacity(manifest.component_count());
+        for i in 0..manifest.component_count() {
+            // The SUIT component id is `[component, part]`; the part id is segment 1.
+            let part = manifest
+                .component_id(i)
+                .and_then(|segs| segs.get(1))
+                .map(|seg| String::from_utf8_lossy(seg).into_owned())
+                .ok_or_else(|| Error::BadL2 {
+                    component: component.clone(),
+                    reason: format!("component {i} has no part-id segment"),
+                })?;
+            // The payload uri is the ciphertext content-address (`sha256:<hex>`).
+            let uri = manifest.uri(i).ok_or_else(|| Error::BadL2 {
+                component: component.clone(),
+                reason: format!("part '{part}' has no payload uri"),
+            })?;
+            let outer = uri.parse::<ContentHash>().map_err(|_| Error::BadL2 {
+                component: component.clone(),
+                reason: format!("part '{part}' uri '{uri}' is not a content address"),
+            })?;
+            parts.push(L1Part { part, outer });
+        }
+        components.push(L1Component {
+            component,
+            envelope: l2.clone(),
+            parts,
+        });
+    }
+    Ok(components)
+}
+
+/// Turn decoded L1 components into engine [`FlashJob`]s, fetching each part's
+/// ciphertext from Tower 2's blob store. `only` keeps a single component (the
+/// singleshot-in-its-own-transaction path). Payload order mirrors the manifest's
+/// component order — the device pairs pushed payloads positionally — and each
+/// payload keeps the `#<part>` uri the current push wire uses: cosmetic to the
+/// device (it routes by order and reads the uri/digest from the manifest), but it
+/// keeps parts distinct within a job even when two ship byte-identical content.
+async fn l1_jobs(
+    hub: &SoftwareClient,
+    components: Vec<L1Component>,
+    only: Option<&str>,
+) -> Result<Vec<FlashJob>, Error> {
+    let mut jobs = Vec::new();
+    for c in components {
+        if only.is_some_and(|o| o != c.component) {
+            continue;
+        }
+        let mut payloads = Vec::with_capacity(c.parts.len());
+        for p in &c.parts {
+            let ciphertext =
+                hub.get_blob(&p.outer)
+                    .await?
+                    .ok_or_else(|| Error::PayloadMissing {
+                        outer: p.outer.to_prefixed(),
+                    })?;
+            payloads.push(Payload {
+                uri: format!("#{}", p.part),
+                source: PayloadSource::Bytes(ciphertext),
+            });
+        }
+        jobs.push(FlashJob {
+            component_id: c.component,
+            gateway_id: None,
+            envelope: c.envelope,
+            payloads,
+        });
+    }
+    Ok(jobs)
+}
+
+/// The L1 selector: the L1 endpoint resolves a `(channel, device, architecture)`
+/// target, so both the device and architecture must be explicit (unlike the
+/// single-target channel tree the read-only preview resolves).
+fn l1_selector(target: &ChannelTarget) -> Result<(&str, &str), Error> {
+    match (target.device.as_deref(), target.architecture.as_deref()) {
+        (Some(device), Some(architecture)) => Ok((device, architecture)),
+        _ => Err(Error::L1NeedsSelector {
+            channel: target.channel.clone(),
+        }),
+    }
+}
+
+/// The shared plan source for the push: read the rig, ask Tower 2 for the signed
+/// L1 for this device (relaying the Tower-1 `device_pubkey` and the vehicle's
+/// current state), and fan it out into engine [`FlashJob`]s + the sw-authority
+/// trust anchor. Also returns the observed tree — the campaign partitions its jobs
+/// by the device's per-component update-mode, read here.
+#[allow(clippy::too_many_arguments)] // rig + two tower URLs, selector, flag — all distinct
+async fn l1_flash_plan(
+    rig_url: &str,
+    hub_url: &str,
+    ca_url: &str,
+    target: &ChannelTarget,
+    device_id: &str,
+    only: Option<&str>,
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+) -> Result<(Vec<FlashJob>, Vec<u8>, Tree), Error> {
+    let observed = read_rig_state(rig_url, insecure, ca_cert_pem).await?;
+    // The vehicle's self-report flows up as the source of truth (the tower records
+    // it; reconciliation stays on the vehicle).
+    let current_state =
+        serde_json::to_value(&observed).map_err(|e| Error::StateEncode(e.to_string()))?;
+    // The relayed Tower-1 identity — the orchestrator hands identity, never a secret.
+    let pubkey = device_pubkey(ca_url, device_id).await?;
+    let (device, architecture) = l1_selector(target)?;
+    let hub = SoftwareClient::new(hub_url);
+    // The signed L1 IS the plan: Tower 2 does the diff + per-device assembly and
+    // signs the result; the orchestrator relays it, never rebuilds it.
+    let l1 = hub
+        .channel_target_l1(
+            &target.channel,
+            device,
+            architecture,
+            &pubkey,
+            device_id,
+            Some(&current_state),
+            1,
+        )
+        .await?;
+    let jobs = l1_jobs(&hub, fanout_l1(&l1)?, only).await?;
+    let trust_anchor = hub.signer_pubkey().await?;
+    Ok((jobs, trust_anchor, observed))
+}
+
 /// Build the engine [`FlashPlan`] to bring the rig to `target`'s desired state,
-/// plus the SUIT trust anchor the engine validates manifests against. For each
-/// shipping component: a Tower-2 signed envelope (CEK re-wrapped to the device)
-/// and its ciphertext payloads fetched from Tower 2. Payloads are buffered
-/// (`PayloadSource::Bytes`) — fine for the offboard orchestrator; the onboard
-/// adapter streams instead.
+/// plus the SUIT trust anchor the engine validates manifests against. Sourced
+/// from Tower 2's signed **L1 campaign** for this device ([`l1_flash_plan`]): one
+/// signed L2 envelope per component (CEK re-wrapped to the device), whose firmware
+/// ciphertext is fetched from Tower 2's blob store and pushed alongside it.
+/// Payloads are buffered (`PayloadSource::Bytes`) — fine for the offboard
+/// orchestrator; the onboard adapter streams instead.
 #[allow(clippy::too_many_arguments)] // rig + two tower URLs, selector, flag — all distinct
 pub async fn build_flash_plan(
     rig_url: &str,
@@ -714,43 +900,17 @@ pub async fn build_flash_plan(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(FlashPlan, Vec<u8>), Error> {
-    let plan = apply_plan(rig_url, hub_url, target, only, insecure, ca_cert_pem).await?;
-    let pubkey = device_pubkey(ca_url, device_id).await?;
-    let hub = SoftwareClient::new(hub_url);
-    let trust_anchor = hub.signer_pubkey().await?;
-
-    let mut jobs = Vec::new();
-    for c in &plan.components {
-        if c.ship.is_empty() {
-            continue;
-        }
-        let parts: Vec<(String, ContentHash)> =
-            c.ship.iter().map(|s| (s.part.clone(), s.content)).collect();
-        let envelope = hub
-            .build_envelope(&pubkey, device_id, &c.entity, &parts, 1)
-            .await?;
-        let mut payloads = Vec::new();
-        for s in &c.ship {
-            if let Some(b) = &s.blob {
-                let ciphertext =
-                    hub.get_blob(&b.outer)
-                        .await?
-                        .ok_or_else(|| Error::PayloadMissing {
-                            outer: b.outer.to_prefixed(),
-                        })?;
-                payloads.push(Payload {
-                    uri: format!("#{}", s.part),
-                    source: PayloadSource::Bytes(ciphertext),
-                });
-            }
-        }
-        jobs.push(FlashJob {
-            component_id: c.entity.clone(),
-            gateway_id: None,
-            envelope,
-            payloads,
-        });
-    }
+    let (jobs, trust_anchor, _observed) = l1_flash_plan(
+        rig_url,
+        hub_url,
+        ca_url,
+        target,
+        device_id,
+        only,
+        insecure,
+        ca_cert_pem,
+    )
+    .await?;
     Ok((FlashPlan { jobs }, trust_anchor))
 }
 
@@ -812,14 +972,15 @@ pub async fn flash_execute(
     })
 }
 
-/// Run the rig campaign over the shared engine: resolve the channel target, group
-/// the shipping components into ordered steps (each singleshot alone, the banked
-/// group together), and drive [`FlashEngine::run_campaign`] — per step
+/// Run the rig campaign over the shared engine: fan out Tower 2's signed L1 for
+/// the device, group its per-component jobs into ordered steps by update mode
+/// (each singleshot alone, the banked group together), and drive
+/// [`FlashEngine::run_campaign`] — per step
 /// `guard → stage → reset → health (CameUp) → commit | rollback + abort`, on one
 /// committed baseline. An unhealthy step rolls back its trial and aborts the chain.
 /// `no_commit` leaves healthy banked steps in trial for a manual verdict. Returns
-/// each component's final state; an empty result means the rig was already at the
-/// target. **Destructive: mutates the rig.**
+/// each component's final state; an empty result means the L1 carried no
+/// components. **Destructive: mutates the rig.**
 #[allow(clippy::too_many_arguments)] // rig + two tower URLs, selector, flag, token — all distinct
 pub async fn campaign_execute(
     rig_url: &str,
@@ -832,71 +993,54 @@ pub async fn campaign_execute(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<Vec<ComponentFlashResult>, Error> {
-    // Resolve + partition the shipping components by update mode: singleshot
-    // (irreversible, write-through) vs banked (reversible trial) — the same source
-    // the engine's no-mix guard reads off the device.
-    let plan = apply_plan(rig_url, hub_url, target, None, insecure, ca_cert_pem).await?;
-    let shipping: Vec<&ComponentApply> = plan
-        .components
-        .iter()
-        .filter(|c| !c.ship.is_empty())
-        .collect();
-    if shipping.is_empty() {
+    // The signed L1 IS the plan: fan it out into per-component jobs once. The
+    // observed tree carries each component's update mode — the same source the
+    // engine's no-mix guard reads off the device — used to group the jobs.
+    let (jobs, trust_anchor, observed) = l1_flash_plan(
+        rig_url,
+        hub_url,
+        ca_url,
+        target,
+        device_id,
+        None,
+        insecure,
+        ca_cert_pem,
+    )
+    .await?;
+    if jobs.is_empty() {
         return Ok(Vec::new());
     }
-    let (singleshot, banked): (Vec<&ComponentApply>, Vec<&ComponentApply>) = shipping
-        .into_iter()
-        .partition(|c| c.supports_rollback == Some(false));
 
-    // Build the ordered steps. Each component's plan is built individually
-    // (`only = Some`), so a step's jobs don't depend on prior steps' device state;
-    // the banked components are then grouped into ONE step (`force_ecu_reset`: a
-    // single coalesced node reboot activates them together). Singleshot steps come
-    // first (each its own transaction), the banked group last.
-    let mut steps: Vec<CampaignStep> = Vec::new();
-    let mut trust_anchor: Option<Vec<u8>> = None;
-    for c in &singleshot {
-        let (p, ta) = build_flash_plan(
-            rig_url,
-            hub_url,
-            ca_url,
-            target,
-            device_id,
-            Some(&c.entity),
-            insecure,
-            ca_cert_pem,
-        )
-        .await?;
-        trust_anchor.get_or_insert(ta);
-        steps.push(CampaignStep {
-            jobs: p.jobs,
+    // Partition by update mode: singleshot (irreversible, write-through) vs banked
+    // (reversible trial). A component the device doesn't classify defaults to
+    // banked — the reversible, safe assumption.
+    let is_singleshot = |component: &str| {
+        observed
+            .entities
+            .get(component)
+            .and_then(|e| e.update_mode.as_ref())
+            .map(|m| m.supports_rollback)
+            == Some(false)
+    };
+    let (singleshot, banked): (Vec<FlashJob>, Vec<FlashJob>) = jobs
+        .into_iter()
+        .partition(|job| is_singleshot(&job.component_id));
+
+    // Ordered steps: each singleshot alone (its own transaction), first — its node
+    // reboot must not interrupt a banked trial; then the banked group in ONE step
+    // (`force_ecu_reset`: a single coalesced node reboot activates them together).
+    let mut steps: Vec<CampaignStep> = singleshot
+        .into_iter()
+        .map(|job| CampaignStep {
+            jobs: vec![job],
             force_ecu_reset: false,
-        });
-    }
+        })
+        .collect();
     if !banked.is_empty() {
-        let mut jobs = Vec::new();
-        for c in &banked {
-            let (p, ta) = build_flash_plan(
-                rig_url,
-                hub_url,
-                ca_url,
-                target,
-                device_id,
-                Some(&c.entity),
-                insecure,
-                ca_cert_pem,
-            )
-            .await?;
-            trust_anchor.get_or_insert(ta);
-            jobs.extend(p.jobs);
-        }
         steps.push(CampaignStep {
-            jobs,
+            jobs: banked,
             force_ecu_reset: true,
         });
-    }
-    if steps.is_empty() {
-        return Ok(Vec::new());
     }
 
     // One engine + the rig's (boot-aware) minting token; `run_campaign` varies
@@ -906,7 +1050,7 @@ pub async fn campaign_execute(
     let engine = FlashEngine::new(
         rig_url,
         Arc::new(token),
-        trust_anchor.unwrap_or_default(),
+        trust_anchor,
         EngineTimeouts::default(),
         insecure,
         ca_cert_pem.map(|c| c.to_vec()),
@@ -1138,5 +1282,103 @@ fn component_result(s: &EcuStatus) -> ComponentFlashResult {
         entity: s.component_id.clone(),
         update_id: s.update_id.clone(),
         state: format!("{:?}", s.state),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sumo_offboard::cose_key::CoseKey;
+    use sumo_offboard::image_builder::{ComponentSpec, MultiComponentBuilder};
+    use sumo_offboard::{keygen, CampaignBuilder};
+
+    /// Build one signed L2 image for `component` — a multi-component SUIT envelope
+    /// whose parts carry a content-address `sha256:<outer>` payload uri, exactly
+    /// the shape Tower 2's `channel_target_l1` emits (encryption elided: the
+    /// fan-out reads component-id + uri, never the CEK).
+    fn build_l2(key: &CoseKey, component: &str, parts: &[(&str, ContentHash)]) -> Vec<u8> {
+        let mut b = MultiComponentBuilder::new()
+            .signing_time(1_751_800_000)
+            .sequence_number(1);
+        for (part, outer) in parts {
+            b = b.add_component(ComponentSpec {
+                id: vec![component.to_string(), part.to_string()],
+                digest: vec![0u8; 32],
+                size: 16,
+                uri: outer.to_prefixed(),
+                encryption_info: None,
+            });
+        }
+        b.build(key).unwrap()
+    }
+
+    /// `fanout_l1` decodes the integrated L2s of a signed L1 into per-component
+    /// slices, preserving each L2's SUIT component order (load-bearing: the device
+    /// pairs pushed payloads to manifest components positionally) and parsing each
+    /// `sha256:<hex>` uri back to the blob's outer hash.
+    #[test]
+    fn fanout_l1_decodes_components_and_ordered_parts() {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let kernel = ContentHash::of(b"vm1-kernel-ciphertext");
+        let rootfs = ContentHash::of(b"vm1-rootfs-ciphertext");
+        let app = ContentHash::of(b"rt-app-ciphertext");
+
+        let l2_vm1 = build_l2(&key, "vm1", &[("kernel", kernel), ("rootfs", rootfs)]);
+        let l2_rt = build_l2(&key, "rt", &[("app", app)]);
+        let l1 = CampaignBuilder::new()
+            .signing_time(1_751_800_000)
+            .sequence_number(1)
+            .add_integrated_image("vm1".to_string(), &l2_vm1)
+            .add_integrated_image("rt".to_string(), &l2_rt)
+            .build(&key)
+            .unwrap();
+
+        let fanned = fanout_l1(&l1).unwrap();
+        assert_eq!(fanned.len(), 2);
+        let by: std::collections::BTreeMap<&str, &L1Component> =
+            fanned.iter().map(|c| (c.component.as_str(), c)).collect();
+
+        // The multi-part L2: the job envelope is the L2 bytes verbatim, and its
+        // parts stay in manifest order (kernel = component 0, rootfs = component 1).
+        let vm1 = by["vm1"];
+        assert_eq!(vm1.envelope, l2_vm1);
+        let parts: Vec<(&str, ContentHash)> = vm1
+            .parts
+            .iter()
+            .map(|p| (p.part.as_str(), p.outer))
+            .collect();
+        assert_eq!(parts, vec![("kernel", kernel), ("rootfs", rootfs)]);
+
+        // The single-part L2 (no SET_COMPONENT_INDEX) still resolves its uri.
+        let rt = by["rt"];
+        assert_eq!(rt.parts.len(), 1);
+        assert_eq!(rt.parts[0].part, "app");
+        assert_eq!(rt.parts[0].outer, app);
+    }
+
+    /// Bytes that aren't a SUIT campaign surface a typed decode error, not a panic.
+    #[test]
+    fn fanout_l1_rejects_non_campaign_bytes() {
+        assert!(matches!(
+            fanout_l1(b"not a suit envelope"),
+            Err(Error::DecodeL1(_))
+        ));
+    }
+
+    /// The L1 push path needs an explicit device + architecture (the endpoint
+    /// resolves a (channel, device, architecture) target); a bare channel errors.
+    #[test]
+    fn l1_selector_requires_device_and_architecture() {
+        let bare = ChannelTarget::channel("bleeding");
+        assert!(matches!(
+            l1_selector(&bare),
+            Err(Error::L1NeedsSelector { .. })
+        ));
+        let full = ChannelTarget {
+            channel: "bleeding".into(),
+            device: Some("rig".into()),
+            architecture: Some("arm64".into()),
+        };
+        assert_eq!(l1_selector(&full).unwrap(), ("rig", "arm64"));
     }
 }

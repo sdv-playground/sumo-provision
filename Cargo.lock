@@ -413,6 +413,7 @@ version = "0.0.0"
 dependencies = [
  "reqwest",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "wire",
 ]
@@ -1724,6 +1725,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sovd-client",
+ "sumo-codec",
+ "sumo-offboard",
+ "sumo-onboard",
  "sumo-sovd-flash-engine",
  "thiserror 1.0.69",
  "tokio",

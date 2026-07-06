@@ -30,6 +30,19 @@ struct EnvelopePartReq {
     content: ContentHash,
 }
 
+/// `POST /channel-targets/l1` request body (mirrors Tower 2's `L1Request`).
+#[derive(Serialize)]
+struct L1Req<'a> {
+    channel: &'a str,
+    device: &'a str,
+    architecture: &'a str,
+    device_pubkey: &'a str,
+    device_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_state: Option<&'a serde_json::Value>,
+    seq: u64,
+}
+
 /// Error talking to a tower.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -229,6 +242,46 @@ impl SoftwareClient {
             .tower
             .http
             .post(format!("{}/admin/envelope", self.tower.base))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .to_vec())
+    }
+
+    /// `POST /channel-targets/l1` — the "vehicle state in → signed L1 out" call.
+    /// Returns the per-device, sw-authority-signed **L1 campaign** (CBOR): one
+    /// embedded L2 image per component, each part's CEK re-wrapped to
+    /// `device_pubkey`, with firmware ciphertext kept content-addressed in the
+    /// blob store (fetched via [`get_blob`](Self::get_blob)). `current_state` is
+    /// the vehicle's self-report, flowed up as the source of truth. The
+    /// orchestrator relays this opaque signed artifact with no device private key.
+    #[allow(clippy::too_many_arguments)] // channel selector + identity + seq — all distinct
+    pub async fn channel_target_l1(
+        &self,
+        channel: &str,
+        device: &str,
+        architecture: &str,
+        device_pubkey: &str,
+        device_id: &str,
+        current_state: Option<&serde_json::Value>,
+        seq: u64,
+    ) -> Result<Vec<u8>, ClientError> {
+        let body = L1Req {
+            channel,
+            device,
+            architecture,
+            device_pubkey,
+            device_id,
+            current_state,
+            seq,
+        };
+        Ok(self
+            .tower
+            .http
+            .post(format!("{}/channel-targets/l1", self.tower.base))
             .json(&body)
             .send()
             .await?
@@ -474,5 +527,49 @@ mod tests {
             TowerClient::new("http://localhost:8081/").base(),
             "http://localhost:8081"
         );
+    }
+
+    /// The L1 request body must match Tower 2's `L1Request` on the wire: the
+    /// selector + relayed identity + seq, with `current_state` omitted when the
+    /// vehicle self-report is absent (the tower defaults it).
+    #[test]
+    fn l1_request_body_omits_absent_current_state() {
+        let body = L1Req {
+            channel: "bleeding",
+            device: "rig",
+            architecture: "arm64",
+            device_pubkey: "a1b2",
+            device_id: "managed-cvc",
+            current_state: None,
+            seq: 7,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["channel"], "bleeding");
+        assert_eq!(v["device"], "rig");
+        assert_eq!(v["architecture"], "arm64");
+        assert_eq!(v["device_pubkey"], "a1b2");
+        assert_eq!(v["device_id"], "managed-cvc");
+        assert_eq!(v["seq"], 7);
+        assert!(
+            v.get("current_state").is_none(),
+            "absent state must be skipped, not null"
+        );
+    }
+
+    /// A present vehicle self-report is carried through verbatim.
+    #[test]
+    fn l1_request_body_carries_current_state() {
+        let state = serde_json::json!({ "entities": { "vm1": { "kind": "vm" } } });
+        let body = L1Req {
+            channel: "bleeding",
+            device: "rig",
+            architecture: "arm64",
+            device_pubkey: "a1b2",
+            device_id: "managed-cvc",
+            current_state: Some(&state),
+            seq: 1,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["current_state"], state);
     }
 }
