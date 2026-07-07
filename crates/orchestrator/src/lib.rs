@@ -964,6 +964,13 @@ async fn l1_flash_plan(
             1,
         )
         .await?;
+    // An empty body (Tower 2 returns 204 No Content) means every component was
+    // skipped — the vehicle is already at target. A clean no-op: return no jobs so
+    // campaign_execute / flash_execute short-circuit (both gate on jobs.is_empty()).
+    // `fanout_l1` would otherwise fail to decode the empty body.
+    if l1.is_empty() {
+        return Ok((Vec::new(), Vec::new(), observed));
+    }
     // Diff each fanned-out component against the vehicle's self-report: unchanged
     // components push manifest-only (device copy-forwards), the rest push full.
     let jobs = l1_jobs(&hub, fanout_l1(&l1)?, &observed, only).await?;
@@ -1034,6 +1041,15 @@ pub async fn flash_execute(
         ca_cert_pem,
     )
     .await?;
+    // Nothing to flash — the vehicle is already at target (Tower 2 skipped every
+    // component). A clean no-op: don't spin up the engine or reset the rig.
+    if plan.jobs.is_empty() {
+        return Ok(FlashResult {
+            channel: target.channel.clone(),
+            device: device_id.to_string(),
+            components: Vec::new(),
+        });
+    }
     // `reboot_to_activate` (the workshop campaign) activates the whole step via one
     // node reboot — both banks boot their new images together, no racy per-VM
     // relaunch. The onboard/field path leaves it false (no orchestrator reboot;

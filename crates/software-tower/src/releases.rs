@@ -14,7 +14,7 @@
 //! number); `created_at` is the build time (when this content was first cut).
 
 use axum::extract::{Path, Query, State};
-use axum::http::header;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -408,10 +408,12 @@ pub struct L1Request {
     pub device_pubkey: String,
     /// Device id — the recipient `kid` for the per-device CEK re-wrap.
     pub device_id: String,
-    /// The vehicle's self-reported current state — accepted so the source of
-    /// truth flows up. The tower is authoritative about the *target* and the
-    /// vehicle reconciles the L1 against its own banks (copy-vs-fetch), so this
-    /// is reserved for future path/dependency resolution (unused today).
+    /// The vehicle's self-reported current state — the orchestrator serializes its
+    /// observed [`wire::Tree`] here. The tower uses it to OMIT components the
+    /// vehicle already carries (matched by plaintext content digest) so it neither
+    /// builds their L2 nor re-wraps their CEK: the L1 then carries only components
+    /// that differ or are unknown to the vehicle. Absent (`None`) ⇒ nothing is
+    /// skipped and the full target is built (the tower stays authoritative).
     #[serde(default)]
     pub current_state: Option<Value>,
     /// SUIT sequence number (anti-replay) for the L1 and its L2s.
@@ -433,28 +435,39 @@ fn default_l1_seq() -> u64 {
 /// signed artifact and streams ciphertext from the blob store with no device
 /// private key.
 ///
-/// The L1 is the full authoritative target (every component, even ones already
-/// installed); the vehicle reconciles it against its own banks. `current_state`
-/// is accepted so it flows up as the source of truth but is not yet used.
+/// When the request carries the vehicle's `current_state`, components it already
+/// holds (matched by plaintext content digest) are omitted, so the L1 carries only
+/// what differs or is unknown; the vehicle reconciles each against its own banks.
+/// Without a `current_state` the full authoritative target is built (every
+/// component, even ones already installed) — the pre-skip behavior.
 pub async fn channel_target_l1(
     State(s): State<AppState>,
-    Json(req): Json<L1Request>,
+    Json(mut req): Json<L1Request>,
 ) -> Result<Response, AppError> {
     let device_pubkey = hex::decode(req.device_pubkey.trim())
         .map_err(|_| AppError::BadRequest("device_pubkey must be hex".into()))?;
     CoseKey::from_cose_key_bytes(&device_pubkey)
         .map_err(|_| AppError::BadRequest("device_pubkey is not a valid COSE_Key".into()))?;
 
-    // The vehicle's self-report flows up as the source of truth; the tower is
-    // authoritative about the target and the vehicle reconciles, so we record it
-    // but don't act on it yet (path/dependency logic is the next step).
-    if req.current_state.is_some() {
-        tracing::debug!(
-            channel = %req.channel,
-            device = %req.device,
-            "L1 request carried a vehicle-state report (recorded; reconciliation is on the vehicle)"
-        );
-    }
+    // The vehicle's self-report (the orchestrator's serialized observed tree) lets
+    // us omit components it already carries. Parse leniently: an unparseable report
+    // means we skip nothing and build the full target — never skip on uncertainty.
+    let reported_state: Option<Tree> = match req.current_state.take() {
+        None => None,
+        Some(value) => match serde_json::from_value::<Tree>(value) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                tracing::warn!(
+                    channel = %req.channel,
+                    device = %req.device,
+                    error = %e,
+                    "L1 request carried an unparseable vehicle-state report; \
+                     building the full target"
+                );
+                None
+            }
+        },
+    };
 
     let tree = resolve_channel_target(
         s.pool()?,
@@ -466,12 +479,27 @@ pub async fn channel_target_l1(
     .map_err(db)?
     .ok_or(AppError::NotFound)?;
 
-    // One per-device L2 per component that has parts; wrap them into the L1.
-    let mut l2s: Vec<(String, Vec<u8>)> = Vec::new();
-    for (path, entity) in &tree.entities {
-        if entity.parts.is_empty() {
-            continue;
-        }
+    // Split the target's components into those to build and those the vehicle
+    // already carries (omitted from the L1 — no L2 build, no CEK re-wrap).
+    let (included, skipped) = partition_l1_components(&tree, reported_state.as_ref());
+    for path in &skipped {
+        tracing::info!(
+            channel = %req.channel,
+            device = %req.device,
+            component = %path,
+            "L1 skip: vehicle already carries this component (agreed by content digest)"
+        );
+    }
+
+    // One per-device L2 per included component; wrap them into the L1.
+    let mut l2s: Vec<(String, Vec<u8>)> = Vec::with_capacity(included.len());
+    for (path, entity) in included {
+        tracing::info!(
+            channel = %req.channel,
+            device = %req.device,
+            component = %path,
+            "L1 include: building component into the campaign"
+        );
         let mut parts = Vec::with_capacity(entity.parts.len());
         for p in &entity.parts {
             let entry = s.index.get(&p.content).await?.ok_or(AppError::NotFound)?;
@@ -496,7 +524,18 @@ pub async fn channel_target_l1(
             .map_err(|e| AppError::Internal(anyhow::anyhow!("L2 build failed for {path}: {e}")))?;
         l2s.push((path.clone(), l2));
     }
+    // Empty ⇒ nothing to ship. Two distinct reasons, distinct signals — because
+    // `CampaignBuilder` cannot encode a zero-dependency campaign (it errors by
+    // design), so an empty L1 has no CBOR body to return:
+    //   * every component agreed (`skipped` non-empty) ⇒ the vehicle is already at
+    //     target. A clean NO-OP, not an error: 204 No Content, which the
+    //     orchestrator treats as "nothing to flash" (an empty campaign).
+    //   * no shippable parts at all (`skipped` empty) ⇒ a genuinely empty target,
+    //     the same 404 this handler already returned.
     if l2s.is_empty() {
+        if !skipped.is_empty() {
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
         return Err(AppError::NotFound);
     }
 
@@ -505,6 +544,57 @@ pub async fn channel_target_l1(
         .build_campaign(&l2s, req.seq)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("L1 build failed: {e}")))?;
     Ok(([(header::CONTENT_TYPE, "application/cbor")], l1).into_response())
+}
+
+/// Whether the vehicle's self-reported `reported` state already carries this
+/// resolved entity — so the tower can OMIT it from the L1. AGREED iff the report
+/// has an entity at the same `path` AND every one of the resolved entity's parts
+/// has its plaintext `content` digest present among that reported entity's parts.
+///
+/// Matched by digest value, never by part name: the vehicle reports files under
+/// their on-disk bank filenames (a layout remap of the part id), so a name join
+/// would silently never fire — equal digest ⇔ equal content. An entity absent from
+/// the report, or any resolved part whose digest the vehicle lacks, is NOT agreed
+/// (include it — the safe default; never skip on uncertainty). This mirrors the
+/// orchestrator's `component_unchanged` push-diff: the tower's `content` and the
+/// vehicle's reported `content` are the same currency (32-byte plaintext SHA-256).
+///
+/// Called only for entities that have parts (see [`partition_l1_components`]), so
+/// the `all` is never vacuously true here.
+fn entity_agreed(reported: &Tree, path: &str, resolved: &Entity) -> bool {
+    let Some(rep) = reported.entities.get(path) else {
+        return false;
+    };
+    resolved
+        .parts
+        .iter()
+        .all(|p| rep.parts.iter().any(|rp| rp.content == p.content))
+}
+
+/// Partition a resolved target tree's components for L1 assembly against the
+/// vehicle's self-reported `reported` state: `(included, skipped)`.
+///
+/// A component is SKIPPED (omitted from the L1 — no L2 build, no CEK re-wrap) when
+/// the vehicle already carries it ([`entity_agreed`]); otherwise it is INCLUDED and
+/// built as the authoritative target. Entities with no parts are in neither set
+/// (they carry nothing to ship). `reported` `None` ⇒ nothing is skipped: the tower
+/// stays authoritative and builds the full target (exactly the pre-skip behavior).
+fn partition_l1_components<'a>(
+    tree: &'a Tree,
+    reported: Option<&Tree>,
+) -> (Vec<(&'a String, &'a Entity)>, Vec<&'a String>) {
+    let mut included = Vec::new();
+    let mut skipped = Vec::new();
+    for (path, entity) in &tree.entities {
+        if entity.parts.is_empty() {
+            continue;
+        }
+        match reported {
+            Some(rep) if entity_agreed(rep, path, entity) => skipped.push(path),
+            _ => included.push((path, entity)),
+        }
+    }
+    (included, skipped)
 }
 
 /// `GET /admin/artifacts/{inner}` — does Tower 2 already have this content?
@@ -700,6 +790,9 @@ mod tests {
     use crate::content::AppState;
     use crate::signer::Signer;
     use crate::store::{FsBlobStore, PgIndex};
+    use sumo_crypto::RustCryptoBackend;
+    use sumo_offboard::keygen;
+    use sumo_onboard::validator::Validator;
 
     fn part(id: &str, kind: &str, content: &str) -> NewPart {
         NewPart {
@@ -707,6 +800,188 @@ mod tests {
             kind: kind.into(),
             content: ContentHash::of(content.as_bytes()),
         }
+    }
+
+    // --- tower-side skip (current_state → omit already-carried components) ------
+
+    fn wpart(id: &str, content: &[u8]) -> Part {
+        Part {
+            kind: "file".into(),
+            id: id.into(),
+            content: ContentHash::of(content),
+        }
+    }
+
+    fn wentity(parts: Vec<Part>) -> Entity {
+        Entity {
+            kind: "vm".into(),
+            version: None,
+            update_mode: None,
+            parts,
+        }
+    }
+
+    fn wtree(entries: Vec<(&str, Entity)>) -> Tree {
+        Tree {
+            entities: entries
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn entity_agreed_matches_by_digest_ignoring_part_name() {
+        // The tower names parts kernel/rootfs; the vehicle reports the SAME content
+        // under remapped on-disk filenames — agreement must still fire (digest join).
+        let resolved = wentity(vec![wpart("kernel", b"K"), wpart("rootfs", b"R")]);
+        let reported = wtree(vec![(
+            "vm1",
+            wentity(vec![wpart("boot.img", b"K"), wpart("rootfs.img", b"R")]),
+        )]);
+        assert!(entity_agreed(&reported, "vm1", &resolved));
+    }
+
+    #[test]
+    fn entity_agreed_false_when_entity_absent_or_part_missing() {
+        let resolved = wentity(vec![wpart("kernel", b"K2"), wpart("rootfs", b"R")]);
+        // Vehicle reports nothing for vm1 → not agreed (absent).
+        assert!(!entity_agreed(&Tree::default(), "vm1", &resolved));
+        // Vehicle has rootfs R but only the OLD kernel K1 — the K2 digest is absent.
+        let stale = wtree(vec![(
+            "vm1",
+            wentity(vec![wpart("boot.img", b"K1"), wpart("rootfs.img", b"R")]),
+        )]);
+        assert!(!entity_agreed(&stale, "vm1", &resolved));
+    }
+
+    #[test]
+    fn partition_skips_agreed_includes_rest_and_ignores_partless() {
+        let tree = wtree(vec![
+            (
+                "vm1",
+                wentity(vec![wpart("kernel", b"K"), wpart("rootfs", b"R")]),
+            ),
+            ("vm2", wentity(vec![wpart("kernel", b"K2")])),
+            ("empty", wentity(vec![])),
+        ]);
+        // Vehicle carries vm1's content (remapped names) but not vm2.
+        let reported = wtree(vec![(
+            "vm1",
+            wentity(vec![wpart("boot.img", b"K"), wpart("rootfs.img", b"R")]),
+        )]);
+
+        let (included, skipped) = partition_l1_components(&tree, Some(&reported));
+        let inc: Vec<&str> = included.iter().map(|(p, _)| p.as_str()).collect();
+        let skp: Vec<&str> = skipped.iter().map(|p| p.as_str()).collect();
+        assert_eq!(inc, vec!["vm2"], "only the changed component is built");
+        assert_eq!(skp, vec!["vm1"], "the already-carried component is skipped");
+
+        // None ⇒ every entity WITH parts is included, nothing skipped (the partless
+        // entity is excluded either way — it carries nothing to ship).
+        let (included, skipped) = partition_l1_components(&tree, None);
+        let inc: Vec<&str> = included.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(inc, vec!["vm1", "vm2"]);
+        assert!(skipped.is_empty());
+    }
+
+    /// Every component agreed ⇒ nothing included, everything skipped — the "vehicle
+    /// already at target" case the handler turns into a 204 no-op (an empty L1 has
+    /// no `CampaignBuilder` encoding, so it can't be a signed body).
+    #[test]
+    fn partition_all_agreed_includes_nothing() {
+        let tree = wtree(vec![
+            ("vm1", wentity(vec![wpart("kernel", b"K")])),
+            ("vm2", wentity(vec![wpart("kernel", b"K2")])),
+        ]);
+        // Vehicle carries both (remapped on-disk names, same content digests).
+        let reported = wtree(vec![
+            ("vm1", wentity(vec![wpart("boot.img", b"K")])),
+            ("vm2", wentity(vec![wpart("boot.img", b"K2")])),
+        ]);
+        let (included, skipped) = partition_l1_components(&tree, Some(&reported));
+        assert!(included.is_empty(), "nothing to build — vehicle at target");
+        let skp: Vec<&str> = skipped.iter().map(|p| p.as_str()).collect();
+        assert_eq!(skp, vec!["vm1", "vm2"], "every component skipped");
+    }
+
+    /// Build a signed L1 over `included` (fake CEK/IV/outer — no blob store in a
+    /// unit test) exactly as the handler does, and return the validated campaign
+    /// manifest so a test can assert which components it carries. Reuses the signer
+    /// + `Validator` path the signer tests use.
+    fn build_l1(
+        signer: &Signer,
+        device_pubkey: &[u8],
+        included: &[(&String, &Entity)],
+    ) -> sumo_onboard::Manifest {
+        let mut l2s: Vec<(String, Vec<u8>)> = Vec::new();
+        for &(path, entity) in included {
+            let parts: Vec<EnvelopePart> = entity
+                .parts
+                .iter()
+                .map(|p| EnvelopePart {
+                    id: p.id.clone(),
+                    inner: *p.content.as_bytes(),
+                    size: 42,
+                    cek: [7u8; 16],
+                    iv: [9u8; 12],
+                    outer: Some(ContentHash::of(p.id.as_bytes())),
+                })
+                .collect();
+            let l2 = signer
+                .build_envelope(device_pubkey, b"dev-1", path, &parts, 1)
+                .unwrap();
+            l2s.push((path.clone(), l2));
+        }
+        let l1 = signer.build_campaign(&l2s, 3).expect("L1 builds");
+        // The campaign keys each embedded L2 as `#<component>`; validating against
+        // the sw-authority anchor returns the decoded manifest we inspect.
+        Validator::new(&signer.public_key_cbor(), None)
+            .validate_envelope(&l1, &RustCryptoBackend::new(), 0)
+            .expect("L1 validates against the sw-authority anchor")
+    }
+
+    #[test]
+    fn built_l1_omits_agreed_and_keeps_changed() {
+        let signer = Signer::generate().unwrap();
+        let device = keygen::generate_device_key(keygen::ES256).unwrap();
+        let pubkey = device.public_key_bytes();
+
+        let tree = wtree(vec![
+            ("vm1", wentity(vec![wpart("kernel", b"K")])),
+            ("vm2", wentity(vec![wpart("kernel", b"K2")])),
+        ]);
+        // Vehicle already carries vm1 (remapped name); vm2 is new/changed.
+        let reported = wtree(vec![("vm1", wentity(vec![wpart("boot.img", b"K")]))]);
+
+        let (included, _) = partition_l1_components(&tree, Some(&reported));
+        let m = build_l1(&signer, &pubkey, &included);
+        assert!(
+            m.integrated_payload("#vm2").is_some(),
+            "changed component must be present in the L1"
+        );
+        assert!(
+            m.integrated_payload("#vm1").is_none(),
+            "agreed component must be omitted from the L1"
+        );
+    }
+
+    #[test]
+    fn built_l1_without_state_includes_all_components() {
+        let signer = Signer::generate().unwrap();
+        let device = keygen::generate_device_key(keygen::ES256).unwrap();
+        let pubkey = device.public_key_bytes();
+
+        let tree = wtree(vec![
+            ("vm1", wentity(vec![wpart("kernel", b"K")])),
+            ("vm2", wentity(vec![wpart("kernel", b"K2")])),
+        ]);
+        // None current_state ⇒ no skip: both components are built into the L1.
+        let (included, skipped) = partition_l1_components(&tree, None);
+        assert!(skipped.is_empty());
+        let m = build_l1(&signer, &pubkey, &included);
+        assert!(m.integrated_payload("#vm1").is_some());
+        assert!(m.integrated_payload("#vm2").is_some());
     }
 
     #[test]
