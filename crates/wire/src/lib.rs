@@ -154,6 +154,13 @@ pub struct Device {
     /// The device's public key, once known (filled at enrollment).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pubkey: Option<String>,
+    /// The device's immutable ECU id — the lowercase-hex SHA-256 thumbprint of
+    /// its device key's SPKI DER, i.e. exactly what the device serves at
+    /// `x-sumo-id` and verifies as the token `aud`. Derived from `pubkey`
+    /// (None until enrolled). The roster `id` is a mutable label; THIS is the
+    /// crypto identity a minter must put in `aud`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ecu_id: Option<String>,
     // Device leaf certs are now per-(device, key_id) — see the device_certs
     // table — so the roster view no longer carries a single cert's metadata.
 }

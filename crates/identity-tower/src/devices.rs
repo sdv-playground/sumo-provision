@@ -278,11 +278,63 @@ pub async fn get_device(
 }
 
 fn device_from_row(r: &sqlx::postgres::PgRow) -> Device {
+    let pubkey: Option<String> = r.get("pubkey");
+    let ecu_id = pubkey.as_deref().and_then(ecu_id_from_cose_hex);
     Device {
         id: r.get("id"),
         model: r.get("model"),
         status: r.get("status"),
-        pubkey: r.get("pubkey"),
+        pubkey,
+        ecu_id,
+    }
+}
+
+/// The device's immutable ECU id from its roster pubkey (hex COSE_Key):
+/// lowercase-hex SHA-256 of the key's SPKI DER — the same derivation the
+/// device itself uses for `x-sumo-id`, and the exact string its authorizer
+/// verifies as the token `aud`. `None` when the pubkey is absent/garbled
+/// (an unenrolled or legacy row) rather than an error: the roster read must
+/// not fail over one bad row.
+fn ecu_id_from_cose_hex(pubkey_cose_hex: &str) -> Option<String> {
+    use p256::pkcs8::EncodePublicKey;
+    use sha2::{Digest, Sha256};
+    let cose = hex::decode(pubkey_cose_hex).ok()?;
+    let sec1 = crate::keystore::cose_to_sec1(&cose).ok()?;
+    let spki = p256::PublicKey::from_sec1_bytes(&sec1)
+        .ok()?
+        .to_public_key_der()
+        .ok()?;
+    Some(hex::encode(Sha256::digest(spki.as_bytes())))
+}
+
+#[cfg(test)]
+mod ecu_id_tests {
+    use super::*;
+    use p256::ecdsa::SigningKey;
+    use p256::pkcs8::EncodePublicKey;
+    use sha2::{Digest, Sha256};
+
+    /// The roster-derived ecu_id must equal the device's own derivation:
+    /// sha256(SPKI DER) of the device key — through the COSE round-trip the
+    /// enroll path stores.
+    #[test]
+    fn ecu_id_matches_the_device_side_spki_thumbprint() {
+        let mut scalar = [0u8; 32];
+        scalar[31] = 7;
+        let sk = SigningKey::from_bytes(&p256::FieldBytes::from(scalar)).unwrap();
+        let vk = sk.verifying_key();
+        let sec1: [u8; 65] = vk
+            .to_encoded_point(false)
+            .as_bytes()
+            .try_into()
+            .expect("uncompressed SEC1");
+        let spki = vk.to_public_key_der().unwrap();
+        let want = hex::encode(Sha256::digest(spki.as_bytes()));
+
+        let cose_hex = hex::encode(crate::keystore::sec1_to_cose(&sec1));
+        assert_eq!(ecu_id_from_cose_hex(&cose_hex), Some(want));
+        assert_eq!(ecu_id_from_cose_hex("not-hex"), None);
+        assert_eq!(ecu_id_from_cose_hex(""), None);
     }
 }
 
