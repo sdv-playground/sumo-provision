@@ -101,11 +101,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/artifacts/{inner}", get(releases::artifact_exists))
         .route(
             "/admin/component-releases",
-            post(releases::create_component_release),
+            post(releases::create_component_release).get(releases::list_component_releases),
         )
         .route(
             "/admin/vehicle-releases",
-            post(releases::create_vehicle_release),
+            post(releases::create_vehicle_release).get(releases::list_vehicle_releases),
         )
         .route("/admin/channels", get(releases::list_channels))
         .route(

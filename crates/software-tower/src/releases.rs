@@ -136,6 +136,48 @@ pub struct VehicleRef {
     pub created_at: String,
 }
 
+/// Query for the release-history lists — an optional filter on the release's
+/// stable key (`entity_path` for components, `tag` for vehicles). Omit to list
+/// the whole history across all entities/tags.
+#[derive(Deserialize)]
+pub struct HistoryFilter {
+    pub entity_path: Option<String>,
+    pub tag: Option<String>,
+}
+
+/// `GET /admin/component-releases` row — one historical L2 component release with
+/// its content parts. History is inherent: content-identity means each distinct
+/// content is its own timestamped, revert-safe row.
+#[derive(Serialize)]
+pub struct ComponentReleaseRow {
+    pub id: i64,
+    pub entity_path: String,
+    pub entity_kind: String,
+    pub version: String,
+    pub identity_hash: Option<String>,
+    pub created_at: String,
+    pub parts: Vec<PartRow>,
+}
+
+#[derive(Serialize)]
+pub struct PartRow {
+    pub id: String,
+    pub kind: String,
+    pub content_hash: String,
+}
+
+/// `GET /admin/vehicle-releases` row — one historical L1 vehicle release with the
+/// ids of its member component releases.
+#[derive(Serialize)]
+pub struct VehicleReleaseRow {
+    pub id: i64,
+    pub tag: String,
+    pub version: String,
+    pub identity_hash: Option<String>,
+    pub created_at: String,
+    pub members: Vec<i64>,
+}
+
 // --- handlers --------------------------------------------------------------
 
 /// `POST /admin/component-releases` — mint an L2 component release, idempotent on
@@ -250,6 +292,102 @@ pub async fn create_vehicle_release(
         .map_err(db)?;
     }
     Ok(Json(ReleaseRef::from_row(&row, false)))
+}
+
+/// `GET /admin/component-releases[?entity_path=]` — the L2 release history,
+/// newest first, each with its content parts. Content-identity makes this a true
+/// timeline: every distinct content is its own row, and a revert re-selects the
+/// existing row rather than cutting a duplicate.
+pub async fn list_component_releases(
+    State(s): State<AppState>,
+    Query(f): Query<HistoryFilter>,
+) -> Result<Json<Vec<ComponentReleaseRow>>, AppError> {
+    let pool = s.pool()?;
+    let rows = sqlx::query(
+        "SELECT id, entity_path, entity_kind, version, identity_hash, \
+                created_at::text AS created_at \
+         FROM component_releases \
+         WHERE ($1::text IS NULL OR entity_path = $1) \
+         ORDER BY created_at DESC, id DESC",
+    )
+    .bind(&f.entity_path)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let id: i64 = r.get("id");
+        let part_rows = sqlx::query(
+            "SELECT part_id, part_kind, content_hash FROM component_release_parts \
+             WHERE release_id = $1 ORDER BY part_id",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .map_err(db)?;
+        out.push(ComponentReleaseRow {
+            id,
+            entity_path: r.get("entity_path"),
+            entity_kind: r.get("entity_kind"),
+            version: r.get("version"),
+            identity_hash: r.get("identity_hash"),
+            created_at: r.get("created_at"),
+            parts: part_rows
+                .into_iter()
+                .map(|p| PartRow {
+                    id: p.get("part_id"),
+                    kind: p.get("part_kind"),
+                    content_hash: p.get("content_hash"),
+                })
+                .collect(),
+        });
+    }
+    Ok(Json(out))
+}
+
+/// `GET /admin/vehicle-releases[?tag=]` — the L1 release history, newest first,
+/// each with the ids of its member component releases.
+pub async fn list_vehicle_releases(
+    State(s): State<AppState>,
+    Query(f): Query<HistoryFilter>,
+) -> Result<Json<Vec<VehicleReleaseRow>>, AppError> {
+    let pool = s.pool()?;
+    let rows = sqlx::query(
+        "SELECT id, tag, version, identity_hash, created_at::text AS created_at \
+         FROM vehicle_releases \
+         WHERE ($1::text IS NULL OR tag = $1) \
+         ORDER BY created_at DESC, id DESC",
+    )
+    .bind(&f.tag)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let id: i64 = r.get("id");
+        let member_rows = sqlx::query(
+            "SELECT component_release_id FROM vehicle_release_members \
+             WHERE vehicle_release_id = $1 ORDER BY component_release_id",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .map_err(db)?;
+        out.push(VehicleReleaseRow {
+            id,
+            tag: r.get("tag"),
+            version: r.get("version"),
+            identity_hash: r.get("identity_hash"),
+            created_at: r.get("created_at"),
+            members: member_rows
+                .into_iter()
+                .map(|m| m.get::<i64, _>("component_release_id"))
+                .collect(),
+        });
+    }
+    Ok(Json(out))
 }
 
 /// `PUT /admin/channel-targets` — point (channel, device, architecture) at a
