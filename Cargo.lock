@@ -1096,7 +1096,7 @@ dependencies = [
 [[package]]
 name = "hsm"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#3661aa3c115085fdc1445b44c426d84b72a33853"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#08f900fc958b4dcd961092c27b9fc5bfd50ea5cb"
 dependencies = [
  "ciborium",
  "coset",
@@ -1111,7 +1111,7 @@ dependencies = [
 [[package]]
 name = "hsm-contract"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#3661aa3c115085fdc1445b44c426d84b72a33853"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#08f900fc958b4dcd961092c27b9fc5bfd50ea5cb"
 dependencies = [
  "vhsm-proto",
 ]
@@ -1119,7 +1119,7 @@ dependencies = [
 [[package]]
 name = "hsm-link-b"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#3661aa3c115085fdc1445b44c426d84b72a33853"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#08f900fc958b4dcd961092c27b9fc5bfd50ea5cb"
 
 [[package]]
 name = "http"
@@ -3299,7 +3299,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vhsm-proto"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#3661aa3c115085fdc1445b44c426d84b72a33853"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#08f900fc958b4dcd961092c27b9fc5bfd50ea5cb"
 
 [[package]]
 name = "want"
