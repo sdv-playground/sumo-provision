@@ -56,6 +56,28 @@ cargo run -p cli -- hub ping            # Tower 2 health/version
 cargo run -p cli -- hub publish FILE    # publish an artifact
 ```
 
+### Fully containerized (no host toolchain)
+
+`start.sh` runs the towers as host processes (fast dev loop: rebuild with cargo,
+no image rebuild). To run **everything** in Docker instead — both towers plus a
+Postgres instance each — use the containerized stack:
+
+```sh
+./towers-up.sh            # build (first run) + up; waits until both healthy
+./towers-up.sh --build    # force a tower image rebuild
+./towers-up.sh --down     # stop (keep data volumes)
+./towers-up.sh --wipe     # stop + delete all state
+```
+
+This builds one image (`Dockerfile`) carrying both `sumo-ca` and `sumo-hub`, and
+`compose.towers.yml` runs it twice against **separate Postgres instances**
+(`postgres-ca` / `postgres-hub` — fault-domain isolation; a Tower 2 compromise
+can't reach Tower 1's identity DB). Key material + blobs persist in named volumes
+and auto-generate on first run. This is the stack `sumo-autoloader` supervises for
+its pull-and-run delivery. The workshop minter (sovd-token-helper) is not in this
+stack — it needs a Tower-1 delegate cert at startup; use
+`examples/tower-provision/up.sh` for it, pointed at these containers.
+
 ## License
 
 To be decided before this repository is made public.

@@ -16,10 +16,11 @@
 # The defaults below cover a manual `docker compose up` from the typical first
 # user (1000:1000).
 #
-# The tower services (sumo-ca, sumo-hub) join this file once their container
-# images exist (see architecture.md, roadmap). Until then, run them with
-# `cargo run -p identity-tower` / `cargo run -p software-tower` against these
-# services.
+# This file runs ONLY the backing services; the towers run as host processes
+# (start.sh cargo-builds + runs them). For a FULLY containerized stack — both
+# towers in Docker, a Postgres instance each — use compose.towers.yml /
+# ./towers-up.sh instead. This file remains the fast host-dev loop (rebuild a
+# tower with cargo, no image rebuild).
 
 services:
   postgres:

@@ -1,0 +1,14 @@
+# Keep the Docker build context small + never ship local state/secrets into it.
+target/
+**/target/
+data/
+local-state/
+keys/
+*.key
+*.pem
+*.cek
+.env
+.env.*
+.git/
+tasks/
+*.md
