@@ -56,32 +56,28 @@ cargo run -p cli -- hub ping            # Tower 2 health/version
 cargo run -p cli -- hub publish FILE    # publish an artifact
 ```
 
-### Fully containerized (no host toolchain)
+### Container image
 
 `start.sh` runs the towers as host processes (fast dev loop: rebuild with cargo,
-no image rebuild). To run **everything** in Docker instead — both towers plus a
-Postgres instance each — use the containerized stack:
+no image rebuild). This repo also ships a **`Dockerfile`** that builds a runtime
+image carrying both binaries (`sumo-ca` + `sumo-hub`) — the packaging seam for
+running the towers in Docker.
 
 ```sh
-./towers-up.sh            # build (first run) + up; waits until both healthy
-./towers-up.sh --build    # force a tower image rebuild
-./towers-up.sh --down     # stop (keep data volumes)
-./towers-up.sh --wipe     # stop + delete all state
+docker build -t sumo-towers .          # both tower binaries in one image
+docker run … sumo-towers sumo-ca       # Tower 1
+docker run … sumo-towers sumo-hub      # Tower 2
 ```
 
-This builds one image (`Dockerfile`) carrying both `sumo-ca` and `sumo-hub`, and
-`compose.towers.yml` runs it twice against **separate Postgres instances**
-(`postgres-ca` / `postgres-hub` — fault-domain isolation; a Tower 2 compromise
-can't reach Tower 1's identity DB). Key material + blobs persist in named volumes
-and auto-generate on first run. This is the stack `sumo-autoloader` supervises for
-its pull-and-run delivery.
+The towers are 12-factor (bind / `DATABASE_URL` / key paths are env vars; key
+material auto-generates on first run), so the image needs only those env + a
+Postgres to point at.
 
-The stack also includes the **workshop minter** (`sovd-token-helper`, `:9200`) —
-the offboard JWT minter a device write (flash / commit / factory-reset) requires.
-It's a delegate of Tower 1, so its container entrypoint bootstraps a delegate cert
-(waits for `sumo-ca`, `POST /admin/workshop/delegate-cert`, then starts) — no host
-step. Its image is built from the sibling `../sovd-token-helper` checkout. So the
-whole trust stack — towers + minter — runs in Docker.
+**The composed, runnable stack** — both towers + the workshop minter + Postgres
+(one instance per tower) + minio, pulled-and-run with nothing else on the host —
+lives in its own repo, **`tools/supernova-towers`**. It submodules this repo,
+builds + publishes this image in CI, and owns the compose + `towers-up.sh`. That's
+the stack `sumo-autoloader` supervises for its pull-and-run delivery.
 
 ## License
 

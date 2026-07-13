@@ -17,10 +17,10 @@
 # user (1000:1000).
 #
 # This file runs ONLY the backing services; the towers run as host processes
-# (start.sh cargo-builds + runs them). For a FULLY containerized stack — both
-# towers in Docker, a Postgres instance each — use compose.towers.yml /
-# ./towers-up.sh instead. This file remains the fast host-dev loop (rebuild a
-# tower with cargo, no image rebuild).
+# (start.sh cargo-builds + runs them) — the fast host-dev loop. For a FULLY
+# containerized, pull-and-run stack (both towers + the minter + a Postgres per
+# tower), see the tools/supernova-towers repo, which builds this repo's Dockerfile
+# into a published image and owns the composition.
 
 services:
   postgres:
