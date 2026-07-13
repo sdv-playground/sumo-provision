@@ -67,10 +67,13 @@ services:
 
   # ---- Tower 1 — identity (sumo-ca) ---------------------------------------
   sumo-ca:
+    # Pull the CI-published runtime image by default; `docker compose … build`
+    # (or towers-up.sh --build) still builds locally from the Dockerfile below —
+    # pull-and-run with a build fallback. Override TOWERS_IMAGE for a mirror.
+    image: ${TOWERS_IMAGE:-gitlab-registry.collaborationlayer-traton.com/vcf-ee-sw-and-services-backbone/projects-group/vcf/traton-one-os/playground/sumo-workspace/sumo-towers:latest}
     build:
       context: .
       dockerfile: Dockerfile
-    image: sumo-provision/towers
     command: sumo-ca
     depends_on:
       postgres-ca:
@@ -94,10 +97,11 @@ services:
 
   # ---- Tower 2 — software (sumo-hub) --------------------------------------
   sumo-hub:
+    # Same image as sumo-ca (one image, both binaries); pull by default, build fallback.
+    image: ${TOWERS_IMAGE:-gitlab-registry.collaborationlayer-traton.com/vcf-ee-sw-and-services-backbone/projects-group/vcf/traton-one-os/playground/sumo-workspace/sumo-towers:latest}
     build:
       context: .
       dockerfile: Dockerfile
-    image: sumo-provision/towers
     command: sumo-hub
     depends_on:
       postgres-hub:
@@ -123,10 +127,12 @@ services:
   # sibling sovd-token-helper checkout (a separate repo/submodule). depends_on is
   # plain (sumo-ca has no healthcheck); the entrypoint polls /healthz itself.
   minter:
+    # Pull the CI-published minter image by default; build fallback from the
+    # sibling checkout. Override MINTER_IMAGE for a mirror.
+    image: ${MINTER_IMAGE:-gitlab-registry.collaborationlayer-traton.com/vcf-ee-sw-and-services-backbone/projects-group/vcf/traton-one-os/playground/sumo-workspace/sumo-minter:latest}
     build:
       context: ../sovd-token-helper
       dockerfile: Dockerfile
-    image: sumo-provision/minter
     depends_on:
       - sumo-ca
     environment:
