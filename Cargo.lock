@@ -1096,7 +1096,6 @@ dependencies = [
 [[package]]
 name = "hsm"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#08f900fc958b4dcd961092c27b9fc5bfd50ea5cb"
 dependencies = [
  "ciborium",
  "coset",
@@ -1111,7 +1110,6 @@ dependencies = [
 [[package]]
 name = "hsm-contract"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#08f900fc958b4dcd961092c27b9fc5bfd50ea5cb"
 dependencies = [
  "vhsm-proto",
 ]
@@ -1119,7 +1117,6 @@ dependencies = [
 [[package]]
 name = "hsm-link-b"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#08f900fc958b4dcd961092c27b9fc5bfd50ea5cb"
 
 [[package]]
 name = "http"
@@ -3299,7 +3296,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vhsm-proto"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#08f900fc958b4dcd961092c27b9fc5bfd50ea5cb"
 
 [[package]]
 name = "want"
@@ -3926,3 +3922,59 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "app-mgr"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "component-factory"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "component-mgr"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "host-metrics"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "host-os-mgr"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "hsm-rustls"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "hsm-sim-backend"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "log-rotate"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "machine-mgr"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "nv-store"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "secstore"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "vhsm-ssd"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "vm-devices"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "vm-service"
+version = "0.1.0"
