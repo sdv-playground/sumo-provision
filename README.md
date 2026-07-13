@@ -74,9 +74,14 @@ This builds one image (`Dockerfile`) carrying both `sumo-ca` and `sumo-hub`, and
 (`postgres-ca` / `postgres-hub` — fault-domain isolation; a Tower 2 compromise
 can't reach Tower 1's identity DB). Key material + blobs persist in named volumes
 and auto-generate on first run. This is the stack `sumo-autoloader` supervises for
-its pull-and-run delivery. The workshop minter (sovd-token-helper) is not in this
-stack — it needs a Tower-1 delegate cert at startup; use
-`examples/tower-provision/up.sh` for it, pointed at these containers.
+its pull-and-run delivery.
+
+The stack also includes the **workshop minter** (`sovd-token-helper`, `:9200`) —
+the offboard JWT minter a device write (flash / commit / factory-reset) requires.
+It's a delegate of Tower 1, so its container entrypoint bootstraps a delegate cert
+(waits for `sumo-ca`, `POST /admin/workshop/delegate-cert`, then starts) — no host
+step. Its image is built from the sibling `../sovd-token-helper` checkout. So the
+whole trust stack — towers + minter — runs in Docker.
 
 ## License
 

@@ -13,10 +13,11 @@
 # own DB via POSTGRES_DB, so there's no manual `createdb` bootstrap step (the old
 # host start.sh needed one). Key material + blobs persist in named volumes.
 #
-# Ports match the host flow: CA :8080, hub :8081, minio :9000/:9001. The minter
-# (sovd-token-helper) lives in a sibling repo and needs a Tower-1 delegate cert
-# minted at startup, so it stays out of this file — bring it up with the tower-
-# provision example's up.sh, pointed at these containers, when you need it.
+# Ports match the host flow: CA :8080, hub :8081, minter :9200, minio :9000/:9001.
+# The minter (sovd-token-helper) lives in a sibling repo and needs a Tower-1
+# delegate cert minted at startup — its container entrypoint does that bootstrap
+# (wait for sumo-ca, POST /admin/workshop/delegate-cert, then start), so the full
+# trust stack — including the token minter a device write requires — is in Docker.
 
 name: sumo-towers
 
@@ -114,6 +115,34 @@ services:
       - hub-keys:/keys
       - hub-blobs:/data
 
+  # ---- workshop minter (sovd-token-helper) --------------------------------
+  # The offboard JWT minter — issues the short-lived, boot-bound SOVD tokens a
+  # device requires for a write (flash / commit / factory-reset). A DELEGATE of
+  # Tower 1: its entrypoint waits for sumo-ca, mints itself a delegate leaf cert
+  # (POST /admin/workshop/delegate-cert), then signs JWTs with it. Built from the
+  # sibling sovd-token-helper checkout (a separate repo/submodule). depends_on is
+  # plain (sumo-ca has no healthcheck); the entrypoint polls /healthz itself.
+  minter:
+    build:
+      context: ../sovd-token-helper
+      dockerfile: Dockerfile
+    image: sumo-provision/minter
+    depends_on:
+      - sumo-ca
+    environment:
+      CA_URL: "http://sumo-ca:8080"
+      SOVD_MINTER_PORT: "9200"
+      # Dev operator bearer — matches up.sh's default; a real deployment gates
+      # POST /mint on badge/smartcard/SSO instead.
+      SOVD_MINTER_OPERATOR_TOKEN: "dev-workshop-operator"
+      SOVD_MINTER_KID: "workshop-minter-1"
+      SOVD_MINTER_ISSUER: "workshop-ca"
+      MINTER_STATE_DIR: "/state"
+    ports:
+      - "9200:9200"
+    volumes:
+      - minter-state:/state
+
 volumes:
   ca-db:
   hub-db:
@@ -121,3 +150,4 @@ volumes:
   ca-keys:
   hub-keys:
   hub-blobs:
+  minter-state:

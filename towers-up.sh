@@ -30,22 +30,23 @@ BUILD_FLAG=()
 echo "==> Starting the tower stack in Docker ..."
 "${COMPOSE[@]}" up -d --force-recreate "${BUILD_FLAG[@]}"
 
-echo "==> Waiting for both towers to answer /healthz ..."
-ok_ca=0 ok_hub=0
-for _ in $(seq 1 60); do
-  [ "$ok_ca" -eq 0 ] && curl -sf -o /dev/null http://localhost:8080/healthz 2>/dev/null && { ok_ca=1; echo "    Tower 1 (sumo-ca)  :8080 healthy"; }
-  [ "$ok_hub" -eq 0 ] && curl -sf -o /dev/null http://localhost:8081/healthz 2>/dev/null && { ok_hub=1; echo "    Tower 2 (sumo-hub) :8081 healthy"; }
-  [ "$ok_ca" -eq 1 ] && [ "$ok_hub" -eq 1 ] && break
+echo "==> Waiting for the towers + minter to answer /healthz ..."
+ok_ca=0 ok_hub=0 ok_mint=0
+for _ in $(seq 1 90); do
+  [ "$ok_ca" -eq 0 ]   && curl -sf -o /dev/null http://localhost:8080/healthz 2>/dev/null && { ok_ca=1;   echo "    Tower 1 (sumo-ca)  :8080 healthy"; }
+  [ "$ok_hub" -eq 0 ]  && curl -sf -o /dev/null http://localhost:8081/healthz 2>/dev/null && { ok_hub=1;  echo "    Tower 2 (sumo-hub) :8081 healthy"; }
+  # The minter bootstraps a delegate cert from Tower 1 first, so it comes up last.
+  [ "$ok_mint" -eq 0 ] && curl -sf -o /dev/null http://localhost:9200/health  2>/dev/null && { ok_mint=1; echo "    workshop minter    :9200 healthy"; }
+  [ "$ok_ca" -eq 1 ] && [ "$ok_hub" -eq 1 ] && [ "$ok_mint" -eq 1 ] && break
   sleep 1
 done
 
-if [ "$ok_ca" -ne 1 ] || [ "$ok_hub" -ne 1 ]; then
-  echo "==> ERROR: a tower did not come up. Recent logs:" >&2
-  "${COMPOSE[@]}" logs --tail 30 sumo-ca sumo-hub >&2
+if [ "$ok_ca" -ne 1 ] || [ "$ok_hub" -ne 1 ] || [ "$ok_mint" -ne 1 ]; then
+  echo "==> ERROR: a service did not come up. Recent logs:" >&2
+  "${COMPOSE[@]}" logs --tail 30 sumo-ca sumo-hub minter >&2
   exit 1
 fi
 
-echo "==> Tower stack up:  sumo-ca :8080   sumo-hub :8081   minio :9000/:9001"
+echo "==> Stack up:  sumo-ca :8080   sumo-hub :8081   minter :9200   minio :9000/:9001"
 echo "    Stop with ./towers-up.sh --down  (or --wipe to also delete state)."
-echo "    Note: the workshop minter (sovd-token-helper) is NOT in this stack — it"
-echo "    needs a Tower-1 delegate cert at startup; use tower-provision/up.sh for it."
+echo "    Full trust stack in Docker — nothing on the host but the daemon."
