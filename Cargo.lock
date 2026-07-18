@@ -165,7 +165,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
- "axum-macros",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -209,17 +208,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
-]
-
-[[package]]
-name = "axum-macros"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7aa268c23bfbbd2c4363b9cd302a4f504fb2a9dfe7e3451d66f35dd392e20aca"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -2487,10 +2475,9 @@ dependencies = [
 [[package]]
 name = "sovd-client"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#4f0dd78f4f3ac79ca79214ddc8adfa6aa30695d0"
+source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#f0cd4484487fd92692216c2003368418ae957040"
 dependencies = [
  "anyhow",
- "axum",
  "bytes",
  "futures",
  "hex",
@@ -2510,7 +2497,7 @@ dependencies = [
 [[package]]
 name = "sovd-core"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#4f0dd78f4f3ac79ca79214ddc8adfa6aa30695d0"
+source = "git+https://github.com/sdv-playground/SOVDd.git?branch=main#f0cd4484487fd92692216c2003368418ae957040"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2822,7 +2809,7 @@ dependencies = [
 [[package]]
 name = "sumo-sovd-flash-engine"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#9c84103200410658cbc1c1e0cffc9350b3d9800e"
+source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#375b6b344da53bd7654030e2f615730f053404a3"
 dependencies = [
  "async-trait",
  "reqwest",
