@@ -29,6 +29,10 @@ sumo-sovd-flash-engine = { git = "https://github.com/sdv-playground/sumo-sovd.gi
 # factory signing keys + KeyRole). default-features=false → schema + enums only
 # (no suit/crypto, no sumo-rs pull). Tower 1 mints the keystore against this.
 hsm = { git = "https://github.com/sdv-playground/sumo-machine-manager.git", branch = "main", default-features = false }
+# external — the vHSM wire/contract crate. The CLI's off-box CWT minter imports
+# the CWT claim labels + audience from vhsm_proto::cwt — the same definitions
+# the on-device daemon validates against, so the two ends cannot drift.
+vhsm-proto = { git = "https://github.com/sdv-playground/sumo-machine-manager.git", branch = "main" }
 # external — sumo-rs SUIT toolkit (open-source): encrypt-once + per-device CEK
 # rewrap, manifest signing. Tower 2 reuses it so we don't fork the envelope format.
 sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
@@ -41,6 +45,9 @@ sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.
 sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
 sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
 coset = "0.3"
+# ciborium: CBOR values/serde for the CWT claim map (coset 0.3 exchanges
+# ciborium::value::Value in its public API, so the versions travel together).
+ciborium = "0.2"
 # zstd: compress published artifacts *before* encrypt-once, matching sumo-offboard's
 # producer (level 3). The device sniffs the zstd frame magic in the first decrypted
 # bytes and decompresses — no manifest flag, so the blob just has to be compressed.

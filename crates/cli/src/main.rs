@@ -5,6 +5,8 @@
 //! the reusable `client` library, so anything embedding the towers shares the
 //! same access layer.
 
+mod vhsm;
+
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -158,6 +160,52 @@ enum CaCmd {
         /// absent).
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Generate a vHSM bootstrap token for a guest: the raw 32-byte token
+    /// (goes into the guest's firmware bank as `vhsm-bootstrap.token`) plus
+    /// the daemon-side `bootstrap.yaml` entry carrying only its SHA-256. The
+    /// guest exchanges the token for its CWT cert via the daemon's in-box
+    /// ENROLL — the common first-boot path.
+    VhsmBootstrapToken {
+        /// Principal name (cert subject) the token will authorise.
+        #[arg(long)]
+        vm_id: String,
+        /// Output path for the raw 32-byte token (binary). Required — it
+        /// can't be reconstructed from the hash.
+        #[arg(long)]
+        token_out: PathBuf,
+        /// Output path for the YAML fragment. If omitted, writes to stdout.
+        #[arg(long)]
+        state_out: Option<PathBuf>,
+        /// Emit a complete standalone `bootstrap.yaml` document instead of a
+        /// fragment (first-time provisioning).
+        #[arg(long, default_value = "false")]
+        standalone: bool,
+    },
+    /// Mint a vHSM v3 CWT cert off-box, signed by a local ecu-signing key —
+    /// for pre-provisioning ahead of deployment, cert rotation without
+    /// re-ENROLL, or test fixtures. The `aud` claim and layout come from the
+    /// shared `vhsm-proto` contract the daemon validates against.
+    VhsmMintCwt {
+        /// Path to the ecu-signing private key (COSE_Key CBOR, EC2 P-256).
+        #[arg(long)]
+        signing_key: PathBuf,
+        /// Principal name (cert subject; the CWT's `sub` claim).
+        #[arg(long)]
+        vm_id: String,
+        /// Issuer string for the `iss` claim. Informational on the daemon side.
+        #[arg(long, default_value = "device-vhsm-tool")]
+        issuer: String,
+        /// Path to the guest's identity pubkey (COSE_Key CBOR, EC2 P-256);
+        /// bound via the `cnf` claim.
+        #[arg(long)]
+        cnf_pub: PathBuf,
+        /// Cert lifetime in seconds (default 1 year).
+        #[arg(long, default_value = "31536000")]
+        lifetime_secs: u64,
+        /// Output path for the signed CWT (raw bytes).
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -555,6 +603,95 @@ async fn run_ca(args: CaArgs) -> anyhow::Result<()> {
             for p in &written {
                 eprintln!("  {}", p.display());
             }
+        }
+        CaCmd::VhsmBootstrapToken {
+            vm_id,
+            token_out,
+            state_out,
+            standalone,
+        } => {
+            let token = vhsm::generate_token();
+            let sha = vhsm::token_sha256_hex(&token);
+
+            // Raw token: restrictive perms while it sits on the operator's
+            // machine. Best-effort; a chmod failure warns, not aborts.
+            std::fs::write(&token_out, token)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                if let Err(e) =
+                    std::fs::set_permissions(&token_out, std::fs::Permissions::from_mode(0o600))
+                {
+                    eprintln!(
+                        "warning: failed to set 0600 on {}: {e}",
+                        token_out.display()
+                    );
+                }
+            }
+            eprintln!(
+                "wrote bootstrap token ({}B) to {}",
+                token.len(),
+                token_out.display()
+            );
+
+            let yaml = if standalone {
+                vhsm::bootstrap_yaml_document(&vm_id, &sha)
+            } else {
+                vhsm::bootstrap_yaml_fragment(&vm_id, &sha)
+            };
+            match state_out {
+                Some(p) => {
+                    std::fs::write(&p, &yaml)?;
+                    eprintln!(
+                        "wrote {} for vm_id={vm_id} ({} bytes) to {}",
+                        if standalone {
+                            "bootstrap.yaml"
+                        } else {
+                            "yaml fragment"
+                        },
+                        yaml.len(),
+                        p.display(),
+                    );
+                }
+                None => print!("{yaml}"),
+            }
+        }
+        CaCmd::VhsmMintCwt {
+            signing_key,
+            vm_id,
+            issuer,
+            cnf_pub,
+            lifetime_secs,
+            output,
+        } => {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            use sumo_offboard::CoseKey;
+
+            let signer_bytes = std::fs::read(&signing_key)?;
+            let signer_cose = CoseKey::from_cose_key_bytes(&signer_bytes)?;
+            let signer_sk = signer_cose.to_p256_signing_key()?;
+
+            let cnf_bytes = std::fs::read(&cnf_pub)?;
+            let cnf_cose = CoseKey::from_cose_key_bytes(&cnf_bytes)?;
+            let (x, y) = cnf_cose.ec2_public_xy()?;
+
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| anyhow::anyhow!("system time before epoch: {e}"))?
+                .as_secs();
+            let validity = vhsm::ValidityWindow::from_now(now_unix, lifetime_secs);
+
+            let cwt = vhsm::mint_cwt(&signer_sk, &vm_id, &issuer, &x, &y, validity)?;
+            std::fs::write(&output, &cwt)?;
+            eprintln!(
+                "wrote CWT cert ({} bytes) for vm_id={vm_id} to {}",
+                cwt.len(),
+                output.display(),
+            );
+            eprintln!(
+                "  issuer={issuer}  iat={}  exp={}",
+                validity.iat, validity.exp
+            );
         }
     }
     Ok(())

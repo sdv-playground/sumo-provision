@@ -20,3 +20,17 @@ hex = { workspace = true }
 # Display the flash engine's progress logs (per-payload upload size/time/throughput).
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Off-box vHSM enrollment provisioning (src/vhsm.rs): CWT mint + bootstrap
+# tokens. Claim labels/audience come from the shared vhsm-proto contract;
+# sumo-offboard supplies the COSE_Key file loader.
+vhsm-proto = { workspace = true }
+sumo-offboard = { workspace = true }
+coset = { workspace = true }
+ciborium = { workspace = true }
+p256 = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# The bootstrap.yaml fragments we emit must parse as the daemon would read them.
+serde_yaml = "0.9"
