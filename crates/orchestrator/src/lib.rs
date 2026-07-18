@@ -1148,6 +1148,26 @@ pub async fn campaign_execute(
         });
     }
 
+    // Surface the step plan through tracing, not just the CLI's banner: embedders
+    // (the autoloader GUI streams these events) must let the operator SEE the
+    // no-mix discipline — irreversible singleshots as their own steps ahead of
+    // the banked trial — without reading engine internals.
+    let singleshot_count = steps.len() - usize::from(steps.last().is_some_and(|s| s.force_ecu_reset));
+    tracing::info!(
+        steps = steps.len(),
+        singleshot = singleshot_count,
+        "campaign plan: singleshot (irreversible, write-through) steps first, then the banked group as one trial step"
+    );
+    for (n, step) in steps.iter().enumerate() {
+        let components: Vec<&str> = step.jobs.iter().map(|j| j.component_id.as_str()).collect();
+        let mode = if step.force_ecu_reset {
+            "banked, trial (flash → reboot → trial → commit)"
+        } else {
+            "singleshot, irreversible (write-through; NO rollback)"
+        };
+        tracing::info!(step = n + 1, ?components, mode, "campaign step");
+    }
+
     // One engine + the rig's (boot-aware) minting token; `run_campaign` varies
     // `force_ecu_reset` per step internally, and the token re-mints across the
     // reboots. `CameUp` is the shared default health gate — the rig's former
