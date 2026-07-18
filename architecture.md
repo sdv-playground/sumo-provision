@@ -1,7 +1,7 @@
 # sumo-provision — architecture
 
 > **Status:** living document. Keep it current as the code evolves.
-> **Last updated:** 2026-06-05
+> **Last updated:** 2026-07-18
 >
 > ## ⚠ Scope: development / test infrastructure only
 > `sumo-provision` is for provisioning and updating **lab rigs** during
@@ -24,8 +24,8 @@ orchestrator**:
 
 - **Tower 1 — Identity & Key Authority.** Owns device identity and key material.
   Blind to software.
-- **Tower 2 — Software & Signing.** Owns content, channels, the digital twin, and
-  the software signing key.
+- **Tower 2 — Software & Signing.** Owns content, channels/targets, and the
+  software signing key.
 - **The orchestrator.** The only component that talks to *both* a tower and a
   rig. It relays identity, reports rig state, asks for an update, and flashes.
 
@@ -46,7 +46,7 @@ everywhere. So: Tower-style control plane, SUIT/SOVD execution underneath.
 ## 2. Architecture at a glance
 
 The dividing line between the towers is **identity/keys (T1) vs everything-software
-(T2)**. "Software" includes the mutable parts — channels, the twin, the security
+(T2)**. "Software" includes the mutable parts — channels/targets, the security
 version — not just immutable blobs. T1 is pure identity and barely changes; T2
 changes on every build.
 
@@ -59,15 +59,15 @@ locally.
    tester / CI  ── publish (blobs, CEKs, hashes) ─▶ ┌─────────────────────────┐
         │                                           │  T2  Software Tower     │
         │ invoke / drive                            │  content-addr blobs,    │ passive
-        ▼                                           │  channels, twin,        │ (never
-  ┌──────────────┐   diff request + per-node ──────▶│  per-node signer        │  dials
-  │ Orchestrator │◀── signed manifest ─────────────│  (sw-authority key)     │  a rig)
+        ▼                                           │  channel targets,       │ (never
+  ┌──────────────┐   state + channel target ───────▶│  per-device signer      │  dials
+  │ Orchestrator │◀── signed L1 campaign ──────────│  (sw-authority key)     │  a rig)
   │  the only    │                                  └─────────────────────────┘
   │  dual-homed  │   CSR + enrol + keystore ───────▶┌─────────────────────────┐
   │  component   │◀── signed keystore envelope ─────│  T1  Identity Tower     │ passive
   └──────┬───────┘                                  │  enrol, key-authority   │
-         │                                          │  HSM, trust anchors,    │
-         │ SOVD: flash, read state, unlock,         │  identity roster        │
+         │                                          │  CA, trust anchors,     │
+         │ SOVD (JWT bearer): flash, read state,    │  identity roster        │
          │ factory-reset                            └─────────────────────────┘
          ▼
   ┌──────────────────────────────────────────────┐
@@ -89,7 +89,7 @@ Because the towers never dial a rig:
 
 ## 3. Tower 1 — Identity & Key Authority
 
-Binary: `sumo-ca` *(name provisional)*.
+Binary: `sumo-ca`.
 
 ### Owns / holds / knows / blind-to
 - **Owns** the identity roster — which rigs exist — keyed by the device CSR.
@@ -105,7 +105,8 @@ Binary: `sumo-ca` *(name provisional)*.
 The inventory entry is the device identity (CSR / public key) plus dev metadata:
 a label, an owner, and the rig's SOVD URL so the orchestrator can reach it.
 Registration is "POST this CSR." Note: the roster is *identity only*. **What
-software is on a rig is the twin, which lives in T2.**
+software is on a rig is observed from the rig itself (§4.4) — never stored
+in T1.**
 
 ### Enrollment / bootstrap (dev-simple)
 No factory-floor ceremony. The trust root is "whoever can reach the rig's
@@ -123,21 +124,25 @@ factory-reset and CSR endpoints," which for a lab rig is acceptable.
 T1 never reaches the rig — the CSR and the flash are **relayed by the
 orchestrator**. The device *public* key is public, so relaying it leaks nothing.
 
-### API sketch
+### API (as built — `crates/identity-tower`)
 ```
-POST   /rigs                  register a CSR → identity record
-GET    /rigs/{id}             identity + metadata (NOT software state)
-POST   /rigs/{id}/keystore    mint signed+encrypted HSM keystore envelope
-POST   /sw-authorities        register an sw-authority PUBLIC key (a trust anchor)
+POST   /admin/devices               register a CSR → identity record
+GET    /devices    /devices/{id}    roster: identity + metadata (NOT software state)
+POST   /admin/devices/{id}/enroll   mint the signed+encrypted HSM keystore envelope
+GET    /admin/ca/cert               the key-authority (CA) certificate
+GET    /admin/ca/trust-bundle       trust anchors to provision into a rig
 GET    /healthz   /version
 ```
+CLI: `ca register / device / enroll / mint-keystore / ca-cert / trust-bundle`;
+the rig side installs with `rig install-keystore` (relayed, as designed — T1
+never touches the rig).
 
 ---
 
 ## 4. Tower 2 — Software & Signing
 
-Binary: `sumo-hub` *(name provisional)*. Owns content, channels, the twin, the
-security-version semantics, **and the software (sw-authority) signing key**.
+Binary: `sumo-hub`. Owns content, channels/targets, the security-version
+semantics, **and the software (sw-authority) signing key**.
 
 ### 4.1 Content & encryption — encrypt once, two hashes
 Each artifact is encrypted **exactly once**. T2 keeps three things per artifact:
@@ -151,8 +156,8 @@ the **outer hash** (of the ciphertext).
   the download; the **inner hash is the device-independent identity of the
   software** — it verifies decryption, and it is the *same hash the rig already
   uses for secure boot* (the signed manifest carries it; the rig verifies on-disk
-  content against it at boot). Secure-boot identity, twin identity, and diff key
-  are one value, not three.
+  content against it at boot). Secure-boot identity, reported-state identity,
+  and delta key are one value, not three.
 - Re-encrypting an artifact (new CEK → new outer hash) does **not** move the inner
   hash, so it never triggers a false "needs update."
 - The blob store holds only ciphertext, useless without the CEKs — so the big
@@ -166,9 +171,11 @@ hash — like a git branch → commit, or a container tag → digest.
 - `stable` → the last blessed / tagged release. `bleeding-edge` → the latest green
   `main` build. `release/x.y.z` → a pinned tag.
 - **Promotion is pointer juggling over immutable content.** Git is the upstream
-  truth for *what gets built*; T2 holds a thin pointer table
-  (`channel → manifest_hash, source_ref, updated_at`) plus the twin. T2 **records**
-  what CI and tags resolved to; it does not **decide** what is blessed.
+  truth for *what gets built*; T2 holds a thin pointer table — a channel target
+  keyed `(channel, device, architecture) → vehicle release` — over immutable,
+  content-addressed releases. T2 **records** what CI and tags resolved to; it
+  does not **decide** what is blessed. Governance (audit, blessing) sits at the
+  promotion boundary; the vehicle just executes signed manifests.
 - Channels are **whole-system, coherent sets** (the whole rig blessed together),
   never per-component — otherwise you get combinatorial "which mix was ever
   tested."
@@ -184,46 +191,66 @@ a local build and a CI build are **indistinguishable to the rig** — both are j
 blobs. The developer publishes their local artifact to T2 and the orchestrator
 composes the effective manifest.
 
-### 4.4 The twin & diff-based dispatch
-T2 holds, per rig, the **observed installed state** (the twin), keyed on the inner
-hash. Because T2 holds both the channel (desired) and the twin (observed), an
-update is `reconcile(observed, desired)` — flash only what differs.
+### 4.4 Observed state & delta dispatch
+The stored per-rig twin never materialized — better: **T2 keeps no per-rig
+state at all**. The orchestrator reads the rig's observed tree over SOVD each
+run (ground truth, always fresh — the rig persists plaintext digests in its
+installed manifest, so this is a read, not a re-hash) and supplies it **with
+the request** (`current_state` on the L1 endpoint). Delta happens at three
+layers, outermost first:
 
-- The twin is a **cache**; the rig is ground truth (its reported version + image
-  hash). Populate write-through on flash, reconcile by read-back against the rig
-  to catch drift. The rig must **persist the inner (plaintext) hash at install**
-  so reporting the twin is an O(1) lookup, not a re-hash of the rootfs every poll.
-- The security version is a manifest field; the **rig** enforces the anti-rollback
-  floor. T2 knows the numbers and can pre-warn "the rig will reject this
-  downgrade," but T1 never counts. Dev downgrade = factory-reset (wipes the floor)
-  then diff-from-empty.
+- **Tower-side skip:** `channel_target_l1` omits components whose plaintext
+  digest already matches, so the signed L1 carries only what differs or is
+  unknown; nothing differs → `204 No Content` and the orchestrator
+  short-circuits.
+- **Orchestrator push-diff (fallback):** components the vehicle already holds
+  are pushed **manifest-only** (an L2 with no payload bytes), matched by
+  digest so bank remaps can't fool it.
+- **Device copy-forward (the safety):** for every component the update did not
+  carry bytes for, the device copies its **own active bank** forward,
+  verifying the copied plaintext digest against the signed manifest —
+  mismatch is an error. The orchestrator's delta is the *optimization*; the
+  device's digest check at copy time is the *authority*.
 
-### 4.5 Per-node manifest signing
-T2 is the **single software signer**. At dispatch it builds a **per-node
-manifest**: it wraps the CEK to the rig's device public key (supplied by the
-orchestrator with the request — public, so T1 stays out of the software path) and
-carries both hashes. The whole per-node manifest is signed by the **sw-authority
-private key T2 holds** (in its own soft-HSM). Signing is sub-millisecond; the hot
-path doesn't care. Because T2 signs, developers route local builds through T2's
-signer and no per-developer signing key is needed.
+The security version is a manifest field; the **rig** enforces the
+anti-rollback floor. T2 knows the numbers and can pre-warn "the rig will
+reject this downgrade," but T1 never counts. Dev downgrade = factory-reset
+(wipes the floor) then diff-from-empty.
 
-### API sketch
+### 4.5 Per-device campaign signing
+T2 is the **single software signer**. At dispatch it builds a **per-device L1
+campaign**: the L1 names one L2 per component with content-addressed payload
+URIs (`sha256:<outer>`), each component's CEK wrapped to the rig's device
+public key (supplied by the orchestrator with the request — public, so T1
+stays out of the software path), the whole thing signed by the **sw-authority
+private key T2 holds**. The orchestrator *relays* the device pubkey and *fans
+out* the signed result; it never wraps or signs anything itself. Because T2
+signs, developers route local builds through T2's signer and no per-developer
+signing key is needed.
+
+### API (as built — `crates/software-tower`)
 ```
-# read surface (orchestrator / rig)
-GET    /rigs/{id}/updates?channel=…   diff(twin, channel[+overrides]) →
-                                      per-node signed manifest, or "nothing"
-GET    /manifests/{hash}              immutable, content-addressed
-GET    /blobs/{hash}                  ciphertext blob, range-able, cacheable
-# state + publish surface
-PUT    /rigs/{id}/twin                report observed state (inner hashes)
-PUT    /rigs/{id}/channel             set subscription {rig → channel}
-POST   /admin/artifacts               publish: ciphertext blob + CEK + hashes
-PUT    /admin/channels/{name}         advance a channel pointer (CI / importer)
+# dispatch surface (orchestrator)
+POST   /channel-targets/l1        state-in → signed-L1-out: resolve the
+                                  (channel, device, architecture) target,
+                                  skip components current_state already has,
+                                  sign per-device; all-agreed → 204
+GET    /channel-targets/tree      the desired wire::Tree (operator preview/diff)
+GET    /blobs/{outer}             ciphertext blob, content-addressed, cacheable
+# publish + admin surface
+POST   /admin/artifacts           publish: ciphertext blob + CEK + hashes
+GET    /admin/artifacts/{inner}   existence check (build steps skip re-uploads)
+POST   /admin/component-releases  mint an L2 (component release)
+POST   /admin/vehicle-releases    mint an L1 tree (whole-vehicle release)
+PUT    /admin/channel-targets     point (channel, device, architecture) → release
+POST   /admin/channels            advance a channel pointer (CI / importer)
+POST   /admin/envelope            per-component signed envelope (re-wrap CEK)
+GET    /admin/signer/pubkey       the sw-authority trust anchor
 GET    /healthz   /version
 ```
 
 A CI importer is just a publisher: it pulls CI artifacts with a CI job token and
-calls `/admin/artifacts` + `/admin/channels`.
+calls the publish surface.
 
 ### 4.6 The vehicle model & diff
 
@@ -254,21 +281,24 @@ It is "what an update would touch" — uniform across files, containers, and blo
 
 **Delta & bank isolation.** Flashing is **per-component A/B**: an update writes a
 component's *inactive* bank, then the device copies every file the update did not
-carry from that **same component's active bank** (vm-mgr's `seed_target_from_active`,
-by slot). So the orchestrator's delta job is only to compute each component's
-**ship-set** — the parts whose content differs from (or is absent in) that
-component's *own* active bank; the rest the device reuses bank-to-bank.
-`flash_plan(observed, desired)` does exactly that, classifying each desired part
-`Ship` or `Reuse`, scoped strictly per component — **a component is never sourced
-from another's bank** (no cross-component data flow), even when two components hold
+carry from that **same component's active bank** (component-mgr's
+`seed_target_from_active`, by slot; digest-verified copy-forward, §4.4). So the
+delta's job is only to compute each component's **ship-set** — the parts whose
+content differs from (or is absent in) that component's *own* active bank; the
+rest the device reuses bank-to-bank. The authoritative version of that decision
+is the tower-side skip + push-diff (§4.4); the client-side
+`flash_plan(observed, desired)` (`Ship`/`Reuse` per part) survives as the
+**read-only operator preview** (`rig diff --plan` / `rig apply`). Both are
+scoped strictly per component — **a component is never sourced from another's
+bank** (no cross-component data flow), even when two components hold
 byte-identical content (e.g. a shared CA bundle). Content addressing still earns
 its keep at Tower 2: when a part *is* shipped, encrypt-once de-dups storage and the
 build step's existence check (`GET /admin/artifacts/{inner}`) skips re-uploads.
 
 **Update mode & the no-mix guard.** The device reports each component's update
 capability (`x-sumo-update-mode`: `banked`/rollbackable vs `singleshot`/
-irreversible — the HSM keystore). `read_rig_state` syncs it onto the twin
-(`Entity.update_mode`, the device is the source of truth), and `apply_plan`
+irreversible — the HSM keystore). `read_rig_state` carries it on the observed
+tree (`Entity.update_mode`, the device is the source of truth), and the guard
 **rejects a campaign that mixes rollbackable with irreversible** components — a
 rollback would leave the device undefined, so the HSM keystore flashes as its own
 campaign. Unknown (older firmware that doesn't serve it) degrades gracefully.
@@ -281,14 +311,25 @@ example — nothing fleet-specific touches the engine.
 
 ## 5. The orchestrator
 
-The reconcile loop:
-1. **report** — read the rig's state, `PUT /rigs/{id}/twin`.
-2. **set channel** — `PUT /rigs/{id}/channel`.
-3. **ask if needed** — `GET /rigs/{id}/updates?channel=…`; T2 computes the diff
-   server-side and returns a per-node signed manifest or "nothing."
-4. **apply** — drive the flash over SOVD (unlocking via the security helper),
-   pulling shared blobs from T2.
-5. **report** — write the new twin back.
+The campaign loop (`orchestrator::campaign_execute`, driven by
+`rig campaign --channel <name> --device <id> --architecture <arch>`):
+1. **observe** — `read_rig_state` walks the rig's SOVD entity tree into a
+   `wire::Tree` (plaintext digests from the installed manifest).
+2. **ask** — `POST /channel-targets/l1` with the observed state; T2 resolves the
+   `(channel, device, architecture)` target, skips agreed components, and
+   returns a per-device **signed L1 campaign** — or `204`, done.
+3. **fan out** — decode the L1 into per-component L2s; fetch each shipped
+   ciphertext from the blob store by content address; unchanged components get
+   their L2 manifest-only.
+4. **drive** — group by the device-reported update mode
+   (banked vs singleshot, the no-mix guard first), then run the shared flash
+   engine's campaign lifecycle per step: stage → reset → health-gate →
+   commit/rollback, on one committed baseline.
+5. **authorize** — every SOVD write carries a JWT bearer. The token comes from
+   `--token` or is minted on demand from the workshop minter
+   (`client::MinterClient`; `RigToken` re-mints when the rig's boot id moves,
+   since reset routes are boot-bound). In-vehicle UDS unlock is **transparent
+   and device-side** after token auth — never an orchestrator step.
 
 ### Self-healing, not a resumable transcript
 The loop reconciles, so after any reboot or revert the orchestrator **re-observes
@@ -298,12 +339,18 @@ reverted," it reads reality and recomputes. The only durable state is **intent**
 that defers to the rig as source of truth. *Re-observe beats remember.*
 
 ### Two drivers, one core
-The orchestration core is a shared library with two thin drivers:
-- **Now — a tester CLI (off-rig).** Authenticates to the towers as a developer.
-- **Later — a daemon on the rig.** Auto-reconciles, authenticates as the device.
-  It is a **T2-only client**: keeping a rig current on a channel needs only T2;
-  enrollment / re-key are inherently external, tester-time operations against an
-  empty rig. So **T2 self-drives, T1 stays in the tester's hands.**
+The orchestration core is a shared library (`crates/orchestrator`) with thin
+drivers:
+- **The tester CLI** (`sumo-provision rig …`) — authenticates to the towers as
+  a developer; campaigns, previews, verdicts, enrollment relay.
+- **The workshop autoloader** (external repo) — embeds the orchestrator crate
+  as a library (no CLI shelling) and supervises the composed tower stack for
+  pull-and-run delivery.
+- **Later — onboard.** An in-vehicle orchestrator consuming the same signed
+  campaigns (pull), exposed as a SOVD `update` operation. Inherently a
+  **T2-only client**: keeping a rig current needs only T2; enrollment / re-key
+  stay tester-time operations against an empty rig. **T2 self-drives, T1 stays
+  in the tester's hands.**
 
 ### The self-update problem
 A reconciler running *on* a rig cannot cleanly update the guest it runs in (when
@@ -320,7 +367,7 @@ answer is to (a) persist intent durably so the restarted reconciler resumes, and
 | Authority | Private half | Public half | Signs |
 |---|---|---|---|
 | **key-authority** | Tower 1's HSM | provisioned into rig HSM | identity / keystore envelopes |
-| **sw-authority** | **Tower 2's** HSM | **registered with T1**, provisioned into rig HSM | per-node software manifests |
+| **sw-authority** | **Tower 2's** HSM | **registered with T1**, provisioned into rig HSM | per-device L1/L2 campaign manifests |
 
 The rule the whole design hangs on: **T1 holds the sw-authority's public key,
 never its private half.** T1 signs key material that *names* the software trust
@@ -334,9 +381,10 @@ publish:   plaintext ──encrypt once(CEK)──▶ ciphertext
            keep {CEK, inner_hash(plaintext), outer_hash(ciphertext)}
            push ciphertext → /blobs/{outer_hash};  CEK,hashes → T2 index
 
-dispatch:  diff(twin.inner_hashes, channel.inner_hashes) → parts that differ
-           per-node manifest = {parts:[{inner_hash, outer_hash, blob_uri}],
-                                CEK wrapped to rig pubkey}  signed by sw-authority
+dispatch:  T2 skips parts whose inner_hash the supplied observed state
+           already holds (state-in) → signed per-device L1 campaign
+           = per-component L2s {inner_hash, outer_hash, sha256: blob uri,
+             CEK wrapped to rig pubkey}  signed by sw-authority
 
 on-rig:    fetch /blobs/{outer_hash} (shared) → verify outer_hash
            unwrap CEK with device key (in HSM) → decrypt → verify inner_hash
@@ -368,18 +416,24 @@ and deferred.
 ## 7. Stack & deployment
 
 - **Language:** Rust across the board (reuses the stack's SUIT/COSE/SOVD tooling).
-- **Deployment:** Docker; a `docker-compose` brings up the full local environment
-  in one command — T1, T2, Postgres, and an S3-compatible object store (MinIO).
-- **Postgres — metadata/index only.** Channel pointers, the twin, the artifact
-  index (CEK references + inner/outer hashes + versions), the identity roster.
-  **T1 and T2 use separate databases + roles** so a Tower 2 compromise cannot read
-  Tower 1's identity data — the crown-jewel/software split enforced at the DB
-  boundary.
+- **Deployment:** three rungs. Dev loop: root `docker-compose.yml` brings up the
+  backing services (Postgres, MinIO) and `start.sh` runs both towers as host
+  processes (rebuild with cargo, no image rebuild). Packaging: the repo
+  `Dockerfile` builds one runtime image carrying both binaries. The composed
+  pull-and-run stack (towers + the workshop minter + per-tower Postgres + MinIO)
+  lives in a separate internal integration repo that submodules this one — see
+  the README's "Container image" section.
+- **Postgres — metadata/index only.** Channel targets and releases, the artifact
+  index (CEK references + inner/outer hashes), the identity roster. **T1 and T2
+  use separate databases** (independent migration sets under each tower crate)
+  so a Tower 2 compromise cannot read Tower 1's identity data — the
+  crown-jewel/software split enforced at the DB boundary. No per-rig state (§4.4).
 - **Object store — blobs.** Ciphertext blobs, content-addressed by outer hash.
   MinIO locally, S3 in a hosted deployment. Never in Postgres.
-- **Soft-HSM keystores — key material.** Key-authority (T1) and sw-authority (T2),
-  each behind the `HsmProvider` abstraction in its own keystore. Never in Postgres.
-  The abstraction means "real HSM later" is a backend swap, not a refactor.
+- **Key material — on-disk key files, never in Postgres.** Key-authority (T1,
+  `SUMO_CA_KEY`) and sw-authority (T2, `SUMO_HUB_SIGNING_KEY`) are
+  auto-generated on first run at env-configured paths. Moving them behind an
+  HSM-provider abstraction is a deferred backend swap, not a format change.
 
 ### Dependency hygiene (this is a public repo)
 Integrate with the rest of the sumo stack **over the wire** (SOVD/SUIT HTTP), not
@@ -396,16 +450,18 @@ as a public crate or integrated at the wire. Track those decisions here.
 sumo-provision/
 ├── architecture.md          ← this document (keep current)
 ├── README.md
-├── docker-compose.yml        ← local: T1 + T2 + Postgres + MinIO
+├── docker-compose.yml        ← local backing services: Postgres + MinIO
+├── Dockerfile                ← one runtime image, both tower binaries
+├── start.sh                  ← dev loop: towers as host processes
 ├── Cargo.toml                ← workspace
-├── crates/
-│   ├── wire/                 ← shared types: manifest, hash pair, channel, twin
-│   ├── identity-tower/       ← T1 service (binary: sumo-ca)
-│   ├── software-tower/       ← T2 service (binary: sumo-hub)
-│   ├── client/               ← typed T1/T2 clients (the orchestrator links these)
-│   └── cli/                  ← tester/admin CLI (publish, channels, register, reconcile)
-├── migrations/               ← Postgres (per-tower)
-└── docker/                   ← Dockerfiles per service
+└── crates/
+    ├── wire/                 ← shared types: vehicle model (Entity/Part/Tree),
+    │                            diff, flash_plan, hash pair, releases
+    ├── identity-tower/       ← T1 service (binary: sumo-ca) + its migrations/
+    ├── software-tower/       ← T2 service (binary: sumo-hub) + its migrations/
+    ├── orchestrator/         ← the campaign core (embedded by drivers)
+    ├── client/               ← typed T1/T2/minter clients
+    └── cli/                  ← tester CLI (binary: sumo-provision)
 ```
 
 Crates are named by function so the repository name is not woven into package
@@ -419,82 +475,68 @@ names.
 - Dev/test only; production stays on the offline signing path.
 - Two towers on the **identity vs software** axis; T1 blind to software.
 - **T2 is the single software signer** and holds the sw-authority key.
-- **Encrypt-once + dual-hash**; diff on the **inner (plaintext) hash**;
+- **Encrypt-once + dual-hash**; delta on the **inner (plaintext) hash**;
   content-address ciphertext by the outer hash.
 - **Towers passive; the orchestrator is the only dual-homed component.**
-- The twin lives in T2; updates are diffs between twin and channel.
-- A `kid` on every signature and trust anchor from day one.
+- **State-in → signed-L1-out**: T2 keeps no per-rig state; observed state
+  rides the dispatch request; delta = tower skip → manifest-only push →
+  device digest-verified copy-forward (§4.4).
+- **JWT bearer** authorizes every SOVD write (workshop minter); UDS unlock is
+  transparent and device-side — never an orchestrator step.
+- The **no-mix guard**: rollbackable and irreversible components never share
+  a campaign.
 
 ### Deferred
+- A `kid` on signatures/trust anchors + key **rotation** (today the trust
+  anchor is the pinned sw-authority public key; factory-reset + re-enroll is
+  rotation of last resort).
 - Per-developer **delegated trust** (a second sw-authority slot).
-- Key **rotation** mechanism (the `kid` makes it additive later).
 - **Push** notifications (pull-only for now).
-- The **on-rig reconciler daemon** (build the off-rig CLI first; same core).
+- The **onboard orchestrator** (same signed campaigns, consumed in-vehicle as
+  a SOVD `update` operation).
 - Multi-tenant / multi-fleet isolation.
 - Shareable **named personal channels** (override is overlay-only for now).
 
 ### Open questions
-1. Promotion mechanics — precise shape of "git decides, T2 records."
-2. Orchestrator cadence — one-shot CLI vs standing reconciler (likely split by
-   persona).
-3. Who drives a rig's *own* self-update across its reboot.
-4. The soft-HSM backend and the path to a real HSM without an artifact-format
-   change.
-5. Confirming the rig persists the plaintext image hash for O(1) twin reporting.
+1. CI importer shape (job-token publish + channel advance).
+2. Who drives a rig's *own* self-update across its reboot (the onboard case).
+3. The path from on-disk key files to a real HSM backend (format is ready;
+   the swap is deferred).
 
 ---
 
-## 10. Roadmap (rough; subject to the open questions)
-1. **T2 content core** — *done.* `POST /admin/artifacts` (encrypt-once via
-   `sumo-offboard`, AES-128-GCM) + `GET /blobs/{outer}`; filesystem blob store + Postgres index
-   (CEK kept out of the blob store). Manifests deferred to land with channels.
-2. **Client lib + CLI** — *done.* Reusable `client` crate (`SoftwareClient` for
-   T2, `IdentityClient` for T1, same pattern) + the `sumo-provision` CLI (`hub`
-   publish/get/ping, `ca` ping). Next: the orchestrator's `FirmwareResolver`
-   builds on `client` to fetch a package and flash a rig.
-3. **Channels + twin + diff** — *in progress.* Done: the schema-agnostic vehicle
-   model + `wire::diff` (§4.6); the channel storage (L2 `component_releases`, L1
-   `vehicle_releases` = the desired whole-vehicle state, `channels` pointer;
-   `GET /channels/{name}/tree` resolves to the desired `wire::Tree`); content
-   existence (`GET /admin/artifacts/{inner}`) so a build step skips re-uploads;
-   twin reporting (the orchestrator reads the rig's observed tree over SOVD); a
-   build/publish step that mints releases and advances a channel (the private
-   `seed-bleeding.sh`); `sumo-provision rig diff --channel <name>` diffs the rig
-   against a channel, and `--plan` emits the per-component delta
-   (`wire::flash_plan` → ship vs reuse; each component reuses only its own active
-   bank, never another's, mirroring the device's `seed_target_from_active`);
-   `sumo-provision rig apply --channel <name>` (`orchestrator::apply_plan`)
-   resolves the ship-set against Tower 2 — confirming Tower 2 can serve every
-   shipped part, flagging any it can't, and totalling the transfer;
-   `sumo-provision rig flash --channel <name> --device <id>`
-   (`orchestrator::flash_bundle`) assembles the per-device flash bundle — a
-   signed SUIT envelope per component (Tower 2 builds it, CEK re-wrapped to the
-   device's Tower 1 key) plus payload refs — *dry* by default, exactly what would
-   be uploaded over SOVD, without touching the rig. `--execute --token <jwt>`
-   drives the *wet* flash (`orchestrator::flash_execute` → `FlashClient`:
-   open_update → upload manifest + payloads → prepare → execute, with the JWT as a
-   `Bearer` header), staging banked components to awaiting-verdict; the no-mix
-   guard runs first. The verdict — `rig reset` (boot the trial) → `rig commit` /
-   `rig rollback` (`flash_reset`/`flash_commit`/`flash_rollback`) — and the JWT
-   are wired: the JWT comes from `--token` or is minted from `sovd-token-helper`
-   (`--minter-url` + `--operator-token`, the `client::MinterClient`). In-vehicle
-   UDS unlock happens after the JWT auth, device-side. Only the first *live* flash
-   remains — gated on a human go.
-4. **T2 per-node signer** — *done.* A sw-authority ES256 key (persisted via
-   `--signing-key`, generated on first run); `build_envelope` re-wraps each
-   part's stored CEK to a device's key (`rewrap_cek_ecdh`, no re-encryption) and
-   signs a per-device multi-component SUIT manifest via `sumo-offboard`. Exposed
-   as `GET /admin/signer/pubkey` (the trust anchor) + `POST /admin/envelope`
-   (resolve parts from the index → signed envelope). Proven by an encrypt-once →
-   re-wrap → build → validate → decrypt roundtrip. `kid` deferred (the trust
-   anchor is the pinned sw-authority public key).
-5. **T1 (`sumo-ca`)** — *in progress.* The device identity roster
-   (`POST /admin/devices`, `GET /devices`; its own `sumo_ca` DB so its
-   migrations stay independent of Tower 2's) + `ca register` is done. Next:
-   keystore minting, wired to the factory-reset + CSR enrollment flow.
-6. **CI importer** — job-token publish + channel advance.
-7. **Collapse the per-rig scripts** to a registration + a channel subscription.
-8. **(Later)** on-rig reconciler daemon; delegated trust; rotation.
+## 10. Roadmap
+
+### Built (the load-bearing path)
+1. **T2 content core** — encrypt-once publish (`POST /admin/artifacts`,
+   AES-128-GCM via `sumo-offboard`) + content-addressed `GET /blobs/{outer}`;
+   blob store + Postgres index, CEK never in the blob store.
+2. **Releases + channel targets** — L2 `component-releases`, L1
+   `vehicle-releases`, `(channel, device, architecture)` targets;
+   `GET /channel-targets/tree` for previews.
+3. **Per-device signing** — sw-authority ES256 key; `POST /channel-targets/l1`
+   returns the delta L1 campaign signed per device (CEK re-wrapped via ECDH, no
+   re-encryption); `POST /admin/envelope` + `GET /admin/signer/pubkey`.
+4. **The campaign loop** — `orchestrator::campaign_execute` (§5): observe over
+   SOVD → signed L1 → fan out L2s → shared flash-engine lifecycle
+   (stage → reset → health-gate → commit/rollback), no-mix guard, manifest-only
+   push for unchanged components, boot-aware JWT re-mint. Verdict commands
+   (`rig reset/commit/rollback[/‑trials]`) wired. Validated end-to-end on a rig
+   via the embedding workshop driver.
+5. **Operator previews** — `rig state / diff [--plan] / apply / flash` (dry by
+   default): client-side `wire::diff`/`flash_plan` as the read-only view of what
+   the tower-side dispatch will decide.
+6. **T1 enrollment** — roster (`POST /admin/devices`), keystore minting
+   (`/admin/devices/{id}/enroll`, CA cert + trust bundle endpoints), relayed
+   install (`rig install-keystore`), per-key device certs.
+7. **Auth** — JWT bearer on every SOVD write; minted on demand from the
+   workshop minter (`client::MinterClient`) or passed with `--token`.
+
+### Next
+- CI importer (job-token publish + channel advance).
+- Collapse remaining per-rig scripts into registration + channel subscription
+  (the composed stack + autoloader already cover pull-and-run delivery).
+- Onboard orchestrator; delegated trust; `kid` + rotation (see Deferred).
 
 ---
 
