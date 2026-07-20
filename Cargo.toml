@@ -35,15 +35,15 @@ hsm = { git = "https://github.com/sdv-playground/sumo-machine-manager.git", bran
 vhsm-proto = { git = "https://github.com/sdv-playground/sumo-machine-manager.git", branch = "main" }
 # external — sumo-rs SUIT toolkit (open-source): encrypt-once + per-device CEK
 # rewrap, manifest signing. Tower 2 reuses it so we don't fork the envelope format.
-sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
+sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.2" }
 # sumo-codec: the SUIT CBOR codec (`decode_envelope`). The orchestrator decodes the
 # Tower-2 signed L1 campaign (and its embedded L2 images) to fan out the per-device
 # push — decode-only, no signing/crypto.
-sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
+sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.2" }
 # sumo-onboard + sumo-crypto + coset: device-side validate/decrypt, used by the
 # signer's roundtrip test (dev-only) to prove envelopes verify and decrypt.
-sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
-sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
+sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.2" }
+sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.2" }
 coset = "0.3"
 # ciborium: CBOR values/serde for the CWT claim map (coset 0.3 exchanges
 # ciborium::value::Value in its public API, so the versions travel together).

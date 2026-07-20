@@ -1092,6 +1092,7 @@ dependencies = [
 [[package]]
 name = "hsm"
 version = "0.1.0"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#b1e84f332fca2745060f706261ce59d712f21758"
 dependencies = [
  "ciborium",
  "coset",
@@ -1106,6 +1107,7 @@ dependencies = [
 [[package]]
 name = "hsm-contract"
 version = "0.1.0"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#b1e84f332fca2745060f706261ce59d712f21758"
 dependencies = [
  "vhsm-proto",
 ]
@@ -1113,6 +1115,7 @@ dependencies = [
 [[package]]
 name = "hsm-link-b"
 version = "0.1.0"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#b1e84f332fca2745060f706261ce59d712f21758"
 
 [[package]]
 name = "http"
@@ -2756,7 +2759,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sumo-codec"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1#8a9a680df4b216542d4872079f242bac0619597e"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.2#7c1c4544959daea9b3debac87a34f30178c02ca4"
 dependencies = [
  "ciborium",
  "coset",
@@ -2765,7 +2768,7 @@ dependencies = [
 [[package]]
 name = "sumo-crypto"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1#8a9a680df4b216542d4872079f242bac0619597e"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.2#7c1c4544959daea9b3debac87a34f30178c02ca4"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2786,7 +2789,7 @@ dependencies = [
 [[package]]
 name = "sumo-offboard"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1#8a9a680df4b216542d4872079f242bac0619597e"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.2#7c1c4544959daea9b3debac87a34f30178c02ca4"
 dependencies = [
  "ciborium",
  "coset",
@@ -2805,7 +2808,7 @@ dependencies = [
 [[package]]
 name = "sumo-onboard"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.1#8a9a680df4b216542d4872079f242bac0619597e"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.2#7c1c4544959daea9b3debac87a34f30178c02ca4"
 dependencies = [
  "ciborium",
  "coset",
@@ -2817,7 +2820,7 @@ dependencies = [
 [[package]]
 name = "sumo-sovd-flash-engine"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#90ec50ac2615a0b461d1d687a1b254d258dbc71c"
+source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#166859ad9dfb5253cd36dfaa9ea10989846538ed"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -3291,6 +3294,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vhsm-proto"
 version = "0.1.0"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#b1e84f332fca2745060f706261ce59d712f21758"
 
 [[package]]
 name = "want"
@@ -3917,59 +3921,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "app-mgr"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "component-factory"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "component-mgr"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "host-metrics"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "host-os-mgr"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "hsm-rustls"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "hsm-sim-backend"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "log-rotate"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "machine-mgr"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "nv-store"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "secstore"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "vhsm-ssd"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "vm-devices"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "vm-service"
-version = "0.1.0"
