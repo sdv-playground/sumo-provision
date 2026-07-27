@@ -46,6 +46,8 @@ pub enum Error {
     PayloadMissing { outer: String },
     #[error("channel '{channel}' not found on Tower 2")]
     ChannelNotFound { channel: String },
+    #[error("--only '{only}' matched no component in this channel/device's L1 plan (use the bare component id, e.g. 'host')")]
+    OnlyMatchedNothing { only: String },
     #[error("device '{id}' not registered in Tower 1")]
     DeviceNotFound { id: String },
     #[error("device '{id}' has no public key registered")]
@@ -1097,6 +1099,12 @@ pub async fn campaign_execute(
     token: RigToken,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
+    // Restrict the campaign to a single component (BARE id, e.g. "host") — the
+    // phased-provisioning primitive: an unprovisioned device runs only the
+    // Tier-1 provisioning MM, so we flash `Some("host")`, reboot into the full
+    // MM, then re-run with `None` for the rest (rt + vms). `None` = flash the
+    // whole L1. See tasks/two-tier-mm-recovery.md.
+    only: Option<&str>,
 ) -> Result<Vec<ComponentFlashResult>, Error> {
     // The signed L1 IS the plan: fan it out into per-component jobs once. The
     // observed tree carries each component's update mode — the same source the
@@ -1107,12 +1115,22 @@ pub async fn campaign_execute(
         ca_url,
         target,
         device_id,
-        None,
+        only,
         insecure,
         ca_cert_pem,
     )
     .await?;
     if jobs.is_empty() {
+        // A `--only` that matched no L1 component is a caller mistake (bare id
+        // typo, or the component isn't in this channel/device's plan) — the
+        // exact-match filter silently drops everything, so surface it rather
+        // than "succeed" having flashed nothing. Without `only`, empty jobs
+        // legitimately means "already converged".
+        if let Some(o) = only {
+            return Err(Error::OnlyMatchedNothing {
+                only: o.to_string(),
+            });
+        }
         return Ok(Vec::new());
     }
 
