@@ -771,6 +771,10 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
             json,
         } => {
             let target = sel.target();
+            // `--only` is a single bare component id on the CLI; the orchestrator
+            // takes an allowlist (`None` = whole L1), so wrap it as a 1-element slice.
+            let only_vec: Option<Vec<&str>> = only.as_deref().map(|o| vec![o]);
+            let only_slice = only_vec.as_deref();
             if execute {
                 let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
                 let result = orchestrator::flash_execute(
@@ -779,7 +783,7 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
                     &ca_url,
                     &target,
                     &auth.device_id,
-                    only.as_deref(),
+                    only_slice,
                     false, // `rig flash`: respect each component's declared reset_kind
                     token,
                     insecure,
@@ -798,7 +802,7 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
                     &ca_url,
                     &target,
                     &auth.device_id,
-                    only.as_deref(),
+                    only_slice,
                     insecure,
                     ca_cert_pem,
                 )
@@ -868,6 +872,9 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
             // and aborts. The grouping + health + commit loop is now the engine's,
             // shared with the onboard / campaign drivers (the rig's per-step token
             // re-mints across the reboots).
+            // `--only` is a single bare component id on the CLI; the orchestrator
+            // takes an allowlist (`None` = whole L1), so wrap it as a 1-element slice.
+            let only_vec: Option<Vec<&str>> = only.as_deref().map(|o| vec![o]);
             let results = orchestrator::campaign_execute(
                 &args.url,
                 &hub_url,
@@ -878,7 +885,7 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
                 rig_token(&auth, &args.url, insecure, ca_cert_pem)?,
                 insecure,
                 ca_cert_pem,
-                only.as_deref(),
+                only_vec.as_deref(),
             )
             .await?;
             for r in &results {

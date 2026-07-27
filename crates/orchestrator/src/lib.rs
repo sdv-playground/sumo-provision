@@ -46,7 +46,7 @@ pub enum Error {
     PayloadMissing { outer: String },
     #[error("channel '{channel}' not found on Tower 2")]
     ChannelNotFound { channel: String },
-    #[error("--only '{only}' matched no component in this channel/device's L1 plan (use the bare component id, e.g. 'host')")]
+    #[error("component filter [{only}] matched no component in this channel/device's L1 plan (use bare component ids, e.g. 'host')")]
     OnlyMatchedNothing { only: String },
     #[error("device '{id}' not registered in Tower 1")]
     DeviceNotFound { id: String },
@@ -381,7 +381,7 @@ pub async fn apply_plan(
     rig_url: &str,
     hub_url: &str,
     target: &ChannelTarget,
-    only: Option<&str>,
+    only: Option<&[&str]>,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<ApplyPlan, Error> {
@@ -401,8 +401,8 @@ pub async fn apply_plan(
 
     let mut components = Vec::new();
     for (path, entity) in &desired.entities {
-        if let Some(o) = only {
-            if path != o {
+        if let Some(allow) = only {
+            if !allow.contains(&path.as_str()) {
                 continue;
             }
         }
@@ -485,7 +485,7 @@ pub async fn flash_bundle(
     ca_url: &str,
     target: &ChannelTarget,
     device_id: &str,
-    only: Option<&str>,
+    only: Option<&[&str]>,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<FlashBundle, Error> {
@@ -869,19 +869,21 @@ fn component_unchanged(c: &L1Component, observed: &Tree) -> bool {
 /// The decision is component-level, all-or-nothing: the L2's part order is
 /// tower-signed and the device pairs pushed payloads positionally, so we cannot
 /// push an arbitrary subset of a component's parts (intra-component part-diff is a
-/// follow-up). `only` keeps a single component (the singleshot-in-its-own-
-/// transaction path). For a full push, payload order mirrors the manifest's
+/// follow-up). `only` is a component allowlist (`None` = the whole L1) — the
+/// caller restricts the campaign to a drifted subset, e.g. a single singleshot in
+/// its own transaction, or the drifted-and-advertised set for a convergence pass.
+/// For a full push, payload order mirrors the manifest's
 /// component order and each payload keeps the `#<part>` uri the push wire uses.
 /// Every decision is logged so a copy-forward is never a silent skip.
 async fn l1_jobs(
     blobs: &impl BlobSource,
     components: Vec<L1Component>,
     observed: &Tree,
-    only: Option<&str>,
+    only: Option<&[&str]>,
 ) -> Result<Vec<FlashJob>, Error> {
     let mut jobs = Vec::new();
     for c in components {
-        if only.is_some_and(|o| o != c.component) {
+        if only.is_some_and(|allow| !allow.contains(&c.component.as_str())) {
             continue;
         }
         // CAPABILITY GATE: skip a component the device doesn't currently ADVERTISE
@@ -958,7 +960,7 @@ async fn l1_flash_plan(
     ca_url: &str,
     target: &ChannelTarget,
     device_id: &str,
-    only: Option<&str>,
+    only: Option<&[&str]>,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(Vec<FlashJob>, Vec<u8>, Tree), Error> {
@@ -1012,7 +1014,7 @@ pub async fn build_flash_plan(
     ca_url: &str,
     target: &ChannelTarget,
     device_id: &str,
-    only: Option<&str>,
+    only: Option<&[&str]>,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(FlashPlan, Vec<u8>), Error> {
@@ -1044,7 +1046,7 @@ pub async fn flash_execute(
     ca_url: &str,
     target: &ChannelTarget,
     device_id: &str,
-    only: Option<&str>,
+    only: Option<&[&str]>,
     reboot_to_activate: bool,
     token: RigToken,
     insecure: bool,
@@ -1083,10 +1085,10 @@ pub async fn flash_execute(
         ca_cert_pem.map(|c| c.to_vec()),
     )
     .with_force_ecu_reset(reboot_to_activate);
-    // No-mix guard, scoped to this (possibly `--only`-filtered) plan: reject a
+    // No-mix guard, scoped to this (possibly `only`-filtered) plan: reject a
     // mix of rollbackable + irreversible components, reading each job's
-    // x-sumo-update-mode off the device. `--only` is how a singleshot component
-    // (e.g. rt) flashes in its own transaction.
+    // x-sumo-update-mode off the device. The `only` allowlist is how a singleshot
+    // component (e.g. rt) flashes in its own transaction.
     engine.guard(&plan).await?;
     let mut ecus = engine.stage_all(&plan).await?;
     engine.reset_all(&mut ecus).await?;
@@ -1117,12 +1119,14 @@ pub async fn campaign_execute(
     token: RigToken,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
-    // Restrict the campaign to a single component (BARE id, e.g. "host") — the
-    // phased-provisioning primitive: an unprovisioned device runs only the
-    // Tier-1 provisioning MM, so we flash `Some("host")`, reboot into the full
-    // MM, then re-run with `None` for the rest (rt + vms). `None` = flash the
-    // whole L1. See tasks/two-tier-mm-recovery.md.
-    only: Option<&str>,
+    // Restrict the campaign to a set of components (BARE ids, e.g. ["host"]) —
+    // the phased-convergence primitive: the autoloader passes the
+    // drifted-and-advertised subset for each pass (a singleshot alone, or the
+    // banked group), so a component the drift says is in-sync (e.g. rt after its
+    // one write) is never re-flashed, and an irreversible singleshot never rides
+    // in the same invocation as a banked flash. `None` = flash the whole L1.
+    // See tasks/two-tier-mm-recovery.md.
+    only: Option<&[&str]>,
 ) -> Result<Vec<ComponentFlashResult>, Error> {
     // The signed L1 IS the plan: fan it out into per-component jobs once. The
     // observed tree carries each component's update mode — the same source the
@@ -1144,9 +1148,9 @@ pub async fn campaign_execute(
         // exact-match filter silently drops everything, so surface it rather
         // than "succeed" having flashed nothing. Without `only`, empty jobs
         // legitimately means "already converged".
-        if let Some(o) = only {
+        if let Some(allow) = only {
             return Err(Error::OnlyMatchedNothing {
-                only: o.to_string(),
+                only: allow.join(", "),
             });
         }
         return Ok(Vec::new());
@@ -1812,5 +1816,63 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].payloads.len(), 1);
         assert_eq!(blobs.fetches(), 1);
+    }
+
+    /// A two-component L1 the allowlist can restrict — `host` + `rt`, both
+    /// advertised and both changed (so both would flash without a filter).
+    fn l1_host_and_rt(key: &CoseKey) -> Vec<u8> {
+        let mk = |c: &str| {
+            let (ok, dk) = (ContentHash::of(c.as_bytes()), ContentHash::of(c.as_bytes()));
+            MultiComponentBuilder::new()
+                .signing_time(1_751_800_000)
+                .sequence_number(1)
+                .add_component(ComponentSpec {
+                    id: vec![c.to_string(), "img".to_string()],
+                    digest: dk.as_bytes().to_vec(),
+                    size: 16,
+                    uri: ok.to_prefixed(),
+                    encryption_info: None,
+                })
+                .build(key)
+                .unwrap()
+        };
+        CampaignBuilder::new()
+            .signing_time(1_751_800_000)
+            .sequence_number(1)
+            .add_integrated_image("host".to_string(), &mk("host"))
+            .add_integrated_image("rt".to_string(), &mk("rt"))
+            .build(key)
+            .unwrap()
+    }
+
+    /// The `only` ALLOWLIST restricts the campaign to the listed subset — the
+    /// convergence-pass primitive. Drift says `rt` is in sync (autoloader omits it
+    /// from the pass allowlist), so even though the L1 carries both host + rt and
+    /// the device advertises both, only `host` becomes a job — `rt`
+    /// (irreversible singleshot) is NOT re-flashed. This is the fix for the
+    /// convergence loop re-committing rt every pass.
+    #[tokio::test]
+    async fn l1_jobs_allowlist_restricts_to_listed_subset() {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let l1 = l1_host_and_rt(&key);
+
+        // Both advertised (stale content → each would push full without a filter).
+        let mut observed = observed_of("host", &[("img", ContentHash::of(b"stale-host"))]);
+        observed.entities.insert(
+            "rt".to_string(),
+            observed_of("rt", &[("img", ContentHash::of(b"stale-rt"))])
+                .entities
+                .remove("rt")
+                .unwrap(),
+        );
+
+        let blobs = FakeBlobs::new();
+        let jobs = l1_jobs(&blobs, fanout_l1(&l1).unwrap(), &observed, Some(&["host"]))
+            .await
+            .unwrap();
+
+        assert_eq!(jobs.len(), 1, "allowlist [host] keeps only host");
+        assert_eq!(jobs[0].component_id, "host");
+        assert_eq!(blobs.fetches(), 1, "rt not in the allowlist → not fetched");
     }
 }
