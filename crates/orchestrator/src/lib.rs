@@ -1787,7 +1787,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(jobs.is_empty(), "unadvertised component must be deferred, not flashed");
+        assert!(
+            jobs.is_empty(),
+            "unadvertised component must be deferred, not flashed"
+        );
         assert_eq!(blobs.fetches(), 0, "deferred → no ciphertext fetched");
     }
 
