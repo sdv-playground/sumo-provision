@@ -306,6 +306,12 @@ enum RigCmd {
         /// system is healthy — for a manual verdict (`./commit.sh` / `rig commit`).
         #[arg(long)]
         no_commit: bool,
+        /// Restrict the campaign to a single component (bare id, e.g. `host`).
+        /// Phased-provisioning primitive: an unprovisioned device runs only the
+        /// Tier-1 provisioning MM (no VM slots), so `--only host`, reboot into
+        /// the full MM, then re-run without --only for rt + vms.
+        #[arg(long)]
+        only: Option<String>,
     },
     /// Commit a staged update once its trial boot is healthy.
     Commit {
@@ -811,6 +817,7 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
             auth,
             execute,
             no_commit,
+            only,
         } => {
             let target = sel.target();
             let plan =
@@ -871,6 +878,7 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
                 rig_token(&auth, &args.url, insecure, ca_cert_pem)?,
                 insecure,
                 ca_cert_pem,
+                only.as_deref(),
             )
             .await?;
             for r in &results {
