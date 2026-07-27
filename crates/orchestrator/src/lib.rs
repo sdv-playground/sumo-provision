@@ -884,6 +884,24 @@ async fn l1_jobs(
         if only.is_some_and(|o| o != c.component) {
             continue;
         }
+        // CAPABILITY GATE: skip a component the device doesn't currently ADVERTISE
+        // (`observed` = the device's live component list over SOVD). This is what
+        // makes phased provisioning automatic: an unprovisioned device runs only
+        // the Tier-1 MM (advertises host+hsm+rt, NOT vm1/vm2), so the channel's
+        // desired VMs are DEFERRED — flashed on a later campaign pass, after the
+        // host bank is flashed + the device reboots into the full MM that DOES
+        // advertise them. Without this the campaign would try to flash VMs the
+        // device can't run and fail mid-campaign. `observed.entities` is keyed by
+        // the bare component id — the same id space as `c.component` (see the
+        // component-naming contract). Logged, never a silent drop.
+        if !observed.entities.contains_key(&c.component) {
+            tracing::info!(
+                component = %c.component,
+                "capability-defer: device does not advertise this component yet — \
+                 skipping (a later campaign pass picks it up once advertised)"
+            );
+            continue;
+        }
         let payloads = if component_unchanged(&c, observed) {
             tracing::info!(
                 component = %c.component,
@@ -1751,18 +1769,44 @@ mod tests {
         assert_eq!(blobs.fetches(), 2);
     }
 
-    /// A component the vehicle doesn't report (no self-report / brand-new) → full.
+    /// CAPABILITY GATE: a component the device doesn't ADVERTISE is DEFERRED, not
+    /// flashed — the device can't flash what it isn't running (e.g. VMs on a
+    /// Tier-1 provisioning MM). A later campaign pass picks it up once the device
+    /// advertises it (post host-bank flash + reboot into the full MM). (Was
+    /// `l1_jobs_unknown_vehicle_pushes_full`, which pushed full — the wrong
+    /// behavior for phased provisioning.)
     #[tokio::test]
-    async fn l1_jobs_unknown_vehicle_pushes_full() {
+    async fn l1_jobs_unadvertised_component_is_deferred() {
         let key = keygen::generate_signing_key(keygen::ES256).unwrap();
         let (ok, dk) = (ContentHash::of(b"k-ct"), ContentHash::of(b"k-pt"));
         let l1 = l1_one_component(&key, "vm1", &[("kernel", ok, dk)]);
 
+        // Empty observed tree = device advertises nothing → vm1 deferred.
         let blobs = FakeBlobs::new();
         let jobs = l1_jobs(&blobs, fanout_l1(&l1).unwrap(), &Tree::default(), None)
             .await
             .unwrap();
 
+        assert!(jobs.is_empty(), "unadvertised component must be deferred, not flashed");
+        assert_eq!(blobs.fetches(), 0, "deferred → no ciphertext fetched");
+    }
+
+    /// The gate lets ADVERTISED components through: a device that reports `vm1`
+    /// (as a changed/unknown-content entity) flashes it full.
+    #[tokio::test]
+    async fn l1_jobs_advertised_component_flashes() {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let (ok, dk) = (ContentHash::of(b"k-ct"), ContentHash::of(b"k-pt"));
+        let l1 = l1_one_component(&key, "vm1", &[("kernel", ok, dk)]);
+
+        // Device advertises vm1 but with different content → push full.
+        let observed = observed_of("vm1", &[("kernel", ContentHash::of(b"stale"))]);
+        let blobs = FakeBlobs::new();
+        let jobs = l1_jobs(&blobs, fanout_l1(&l1).unwrap(), &observed, None)
+            .await
+            .unwrap();
+
+        assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].payloads.len(), 1);
         assert_eq!(blobs.fetches(), 1);
     }
