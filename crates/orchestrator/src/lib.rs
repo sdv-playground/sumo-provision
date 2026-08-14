@@ -155,6 +155,50 @@ pub async fn node_update_state(
         .map_err(|e| Error::NodeState(e.to_string()))
 }
 
+/// Connect a [`SovdClient`] to the rig, scheme-probing: try `sovd_url` as given,
+/// and if that fails with a transport/TLS error (the classic symptom of speaking
+/// HTTPS to an unprovisioned device that serves plain HTTP — or vice versa),
+/// retry with the scheme swapped. A device flips between HTTP (unprovisioned, no
+/// leaf cert yet) and HTTPS (provisioned) across factory-reset/provision, so we
+/// must not assume — mirrors the autoloader's `live_base` probe, but here so every
+/// `read_rig_state` caller (drift view, provision CLI) tolerates both states.
+///
+/// The probe uses `list_components()` — which `read_rig_state` needs anyway, so
+/// the components fetched here are RETURNED to avoid a second round trip. A
+/// transport error (`HttpError`) means "wrong scheme for the device's current
+/// state" → try the next candidate; any HTTP-level outcome (including a server
+/// error) means the scheme is live, so that result is returned as-is.
+async fn connect_sovd(
+    sovd_url: &str,
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+) -> Result<(SovdClient, Vec<sovd_client::Component>), Error> {
+    let base = sovd_url.trim_end_matches('/');
+    let candidates: Vec<String> = match base.split_once("://") {
+        Some(("https", rest)) => vec![base.to_string(), format!("http://{rest}")],
+        Some(("http", rest)) => vec![base.to_string(), format!("https://{rest}")],
+        // No recognizable scheme → nothing to swap; use as-is.
+        _ => vec![base.to_string()],
+    };
+
+    let mut last_err: Option<SovdClientError> = None;
+    for url in &candidates {
+        let client = SovdClient::new_verifying(url, insecure, ca_cert_pem)?;
+        match client.list_components().await {
+            // Reached the device on this scheme — hand back the components too.
+            Ok(components) => return Ok((client, components)),
+            // Live scheme but a server-level error: don't try the other scheme
+            // (the device answered) — surface it.
+            Err(e @ SovdClientError::ServerError { .. }) => return Err(Error::Sovd(e)),
+            // Transport/TLS error → wrong scheme; try the next candidate.
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err
+        .map(Error::Sovd)
+        .unwrap_or_else(|| Error::NodeState(format!("no reachable SOVD scheme for {sovd_url}"))))
+}
+
 /// Read a rig's observed state over SOVD as a [`wire::Tree`]: each component is
 /// an entity, and the files in its signed installed manifest are its parts
 /// (`kind = "file"`, `id = path`, `content = sha256`). Components with no signed
@@ -164,9 +208,9 @@ pub async fn read_rig_state(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<Tree, Error> {
-    let client = SovdClient::new_verifying(sovd_url, insecure, ca_cert_pem)?;
+    let (client, components) = connect_sovd(sovd_url, insecure, ca_cert_pem).await?;
     let mut tree = Tree::default();
-    for c in client.list_components().await? {
+    for c in components {
         let mut entity = Entity {
             kind: c.component_type.unwrap_or_default(),
             ..Default::default()
