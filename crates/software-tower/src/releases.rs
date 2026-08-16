@@ -943,19 +943,40 @@ async fn resolve_members_to_tree(pool: &PgPool, vehicle_id: i64) -> sqlx::Result
                 .fetch_all(pool)
                 .await?;
         for p in parts {
-            let content: String = p.get("content_hash");
-            let Ok(content) = content.parse::<ContentHash>() else {
-                continue;
-            };
+            let part_id: String = p.get("part_id");
+            let content_hash: String = p.get("content_hash");
+            let content = parse_stored_hash(&content_hash, vehicle_id, rid, &path, &part_id)?;
             entity.parts.push(Part {
                 kind: p.get("part_kind"),
-                id: p.get("part_id"),
+                id: part_id,
                 content,
             });
         }
         tree.entities.insert(path, entity);
     }
     Ok(tree)
+}
+
+/// Parse a content hash read from a release row into a [`ContentHash`], failing
+/// loudly when it doesn't parse. A stored release is authoritative *desired*
+/// state, so a malformed hash is corruption — it fails the whole tree resolution
+/// (surfaced as a 500 by `db` → `AppError::Internal`) rather than silently dropping
+/// the part into invisible drift. The message names the release, component and part
+/// plus the offending string so the corrupt row is findable.
+fn parse_stored_hash(
+    content_hash: &str,
+    vehicle_release_id: i64,
+    component_release_id: i64,
+    entity_path: &str,
+    part_id: &str,
+) -> sqlx::Result<ContentHash> {
+    content_hash.parse::<ContentHash>().map_err(|_| {
+        sqlx::Error::Protocol(format!(
+            "vehicle release {vehicle_release_id}, component release \
+             {component_release_id} ({entity_path}), part '{part_id}': malformed \
+             content hash '{content_hash}'"
+        ))
+    })
 }
 
 /// Content-stable canonical hash of a resolved tree: entity paths in order (the
@@ -1477,6 +1498,29 @@ mod tests {
         assert_ne!(
             vehicle_identity(&[1, 2], &[]),
             vehicle_identity(&[1, 2, 3], &[])
+        );
+    }
+
+    /// A stored release row is authoritative desired state: a content hash that no
+    /// longer parses is corruption, not drift, so resolution fails loudly and the
+    /// error names the offending part (and quotes the bad string) — never a silent
+    /// drop. (Mirrors the per-part parse in `resolve_members_to_tree`.)
+    #[test]
+    fn parse_stored_hash_rejects_corrupt_member_naming_the_part() {
+        let err = parse_stored_hash("not-a-content-hash", 7, 42, "vm1", "kernel")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("kernel"), "error must name the part: {err}");
+        assert!(
+            err.contains("not-a-content-hash"),
+            "error must quote the offending hash: {err}"
+        );
+
+        // A well-formed hash still parses back to its ContentHash.
+        let good = ContentHash::of(b"k").to_prefixed();
+        assert_eq!(
+            parse_stored_hash(&good, 7, 42, "vm1", "kernel").unwrap(),
+            ContentHash::of(b"k")
         );
     }
 

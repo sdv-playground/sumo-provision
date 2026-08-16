@@ -218,20 +218,39 @@ pub async fn read_rig_state(
         if let Some(m) = read_installed(&client, &c.id).await? {
             let label = format!("{} {}", m.identity.name, m.identity.version);
             entity.version = Some(label.trim().to_string());
-            for f in m.files {
-                if let Ok(content) = f.sha256.parse::<ContentHash>() {
-                    entity.parts.push(Part {
-                        kind: "file".to_string(),
-                        id: f.path,
-                        content,
-                    });
-                }
-            }
+            entity.parts = installed_files_to_parts(sovd_url, &c.id, m.files);
         }
         entity.update_mode = read_update_mode(&client, &c.id).await?;
         tree.entities.insert(c.id, entity);
     }
     Ok(tree)
+}
+
+/// Project a component's installed-manifest files into content-hashed [`Part`]s.
+///
+/// Observed (device-reported) state, so a file whose `sha256` doesn't parse is
+/// **dropped** rather than fatal: the omitted part reads as drift and forces a
+/// push (fail-safe). It is never silent, though — a malformed sha means the device
+/// reported corruption, logged loudly so it isn't mistaken for ordinary drift.
+fn installed_files_to_parts(device: &str, component: &str, files: Vec<InstalledFile>) -> Vec<Part> {
+    let mut parts = Vec::with_capacity(files.len());
+    for f in files {
+        match f.sha256.parse::<ContentHash>() {
+            Ok(content) => parts.push(Part {
+                kind: "file".to_string(),
+                id: f.path,
+                content,
+            }),
+            Err(_) => tracing::error!(
+                device,
+                component,
+                part = %f.path,
+                sha = %f.sha256,
+                "device reported malformed part sha — treating as drifted"
+            ),
+        }
+    }
+    parts
 }
 
 /// Read one component's `x-sumo-update-mode` capability; `None` when the device
@@ -834,10 +853,23 @@ fn fanout_l1(l1: &[u8]) -> Result<Vec<L1Component>, Error> {
             // The expected plaintext image digest (SUIT image-digest, always
             // SHA-256 here). A non-32-byte or absent digest → `None`, and the
             // component is pushed full (never copy-forwarded on a guess).
-            let inner = manifest
-                .image_digest(i)
-                .and_then(|(d,)| <[u8; 32]>::try_from(d.bytes.as_slice()).ok())
-                .map(ContentHash::from_bytes);
+            let inner = match manifest.image_digest(i) {
+                Some((d,)) => match <[u8; 32]>::try_from(d.bytes.as_slice()) {
+                    Ok(bytes) => Some(ContentHash::from_bytes(bytes)),
+                    // Present but not 32 bytes: still safe (the component is pushed
+                    // full), but a malformed digest must not pass silently.
+                    Err(_) => {
+                        tracing::warn!(
+                            component = %component,
+                            part = %part,
+                            len = d.bytes.len(),
+                            "SUIT image-digest is not 32 bytes — forcing full push for this part"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
             parts.push(L1Part { part, outer, inner });
         }
         components.push(L1Component {
@@ -1671,6 +1703,33 @@ mod tests {
             },
         );
         tree
+    }
+
+    /// `read_rig_state`'s file→part projection is FAIL-SAFE on observed (device)
+    /// state: a file whose `sha256` doesn't parse is dropped (so it reads as drift
+    /// and forces a push) while the well-formed files are kept. The drop is logged
+    /// loudly (the `tracing::error!` in `installed_files_to_parts`); this module
+    /// doesn't capture logs, so that line is verified by review, not asserted here.
+    #[test]
+    fn installed_files_to_parts_drops_malformed_sha_keeping_the_rest() {
+        let files = vec![
+            InstalledFile {
+                path: "kernel".into(),
+                sha256: ContentHash::of(b"k").to_prefixed(),
+            },
+            InstalledFile {
+                path: "rootfs".into(),
+                sha256: "not-a-sha".into(),
+            },
+        ];
+        let parts = installed_files_to_parts("https://rig.example", "vm1", files);
+        let ids: Vec<&str> = parts.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["kernel"],
+            "the malformed part is omitted from the tree"
+        );
+        assert_eq!(parts[0].content, ContentHash::of(b"k"));
     }
 
     /// `fanout_l1` surfaces each part's expected plaintext image-digest (the SUIT
