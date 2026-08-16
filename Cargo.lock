@@ -1092,7 +1092,7 @@ dependencies = [
 [[package]]
 name = "hsm"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#c3bd044dc471e6e7e79293f6e61bb79ebe3f3097"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#9df17439dcb7a97b6541495b2ee60cfb5a39c3a5"
 dependencies = [
  "ciborium",
  "coset",
@@ -1107,7 +1107,7 @@ dependencies = [
 [[package]]
 name = "hsm-contract"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#c3bd044dc471e6e7e79293f6e61bb79ebe3f3097"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#9df17439dcb7a97b6541495b2ee60cfb5a39c3a5"
 dependencies = [
  "vhsm-proto",
 ]
@@ -1115,7 +1115,7 @@ dependencies = [
 [[package]]
 name = "hsm-link-b"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#c3bd044dc471e6e7e79293f6e61bb79ebe3f3097"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#9df17439dcb7a97b6541495b2ee60cfb5a39c3a5"
 
 [[package]]
 name = "http"
@@ -2821,7 +2821,7 @@ dependencies = [
 [[package]]
 name = "sumo-sovd-flash-engine"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#b9d0a950fe26edf99790530b7fca7be843a0b4cf"
+source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#9362a6a37792314730bec62418838f49b705d770"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2836,6 +2836,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3296,7 +3297,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vhsm-proto"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#c3bd044dc471e6e7e79293f6e61bb79ebe3f3097"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#9df17439dcb7a97b6541495b2ee60cfb5a39c3a5"
 
 [[package]]
 name = "want"
