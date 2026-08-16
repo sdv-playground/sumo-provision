@@ -262,6 +262,12 @@ pub struct Entity {
     /// The updatable units on this entity.
     #[serde(default)]
     pub parts: Vec<Part>,
+    /// Administratively **disabled** in the release — deactivated rather than
+    /// flashed. Set only on a desired (release) tree; L1 assembly emits a signed
+    /// disable manifest for it instead of a flash envelope. Default (`false`)
+    /// keeps the pre-disable behavior; an observed tree never sets it.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// A vehicle's state as a flat tree keyed by entity path (`"vm1"`,
@@ -500,6 +506,7 @@ mod model_tests {
             version: None,
             update_mode: None,
             parts,
+            disabled: false,
         }
     }
     fn tree(entries: Vec<(&str, Entity)>) -> Tree {

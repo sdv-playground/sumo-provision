@@ -52,6 +52,11 @@ pub struct NewVehicleRelease {
     pub tag: String,
     pub version: String,
     pub members: Vec<i64>,
+    /// Member ids (a subset of `members`) to mark **disabled** — deactivated in
+    /// this release rather than flashed. Additive: absent ⇒ every member enabled
+    /// (the pre-disable behavior). Ids not in `members` have no effect.
+    #[serde(default)]
+    pub disabled_members: Vec<i64>,
     #[serde(default)]
     pub config_snapshot: Option<Value>,
 }
@@ -240,7 +245,7 @@ pub async fn create_vehicle_release(
     Json(req): Json<NewVehicleRelease>,
 ) -> Result<Json<ReleaseRef>, AppError> {
     let pool = s.pool()?;
-    let identity = vehicle_identity(&req.members);
+    let identity = vehicle_identity(&req.members, &req.disabled_members);
 
     if let Some(row) = sqlx::query(
         "SELECT id, version, created_at::text AS created_at FROM vehicle_releases \
@@ -282,11 +287,12 @@ pub async fn create_vehicle_release(
 
     for m in &req.members {
         sqlx::query(
-            "INSERT INTO vehicle_release_members (vehicle_release_id, component_release_id) \
-             VALUES ($1, $2)",
+            "INSERT INTO vehicle_release_members (vehicle_release_id, component_release_id, disabled) \
+             VALUES ($1, $2, $3)",
         )
         .bind(id)
         .bind(m)
+        .bind(req.disabled_members.contains(m))
         .execute(pool)
         .await
         .map_err(db)?;
@@ -617,9 +623,10 @@ pub async fn channel_target_l1(
     .map_err(db)?
     .ok_or(AppError::NotFound)?;
 
-    // Split the target's components into those to build and those the vehicle
-    // already carries (omitted from the L1 — no L2 build, no CEK re-wrap).
-    let (included, skipped) = partition_l1_components(&tree, reported_state.as_ref());
+    // Split the target's components into those to build, those disabled (a signed
+    // disable manifest, not a flash), and those the vehicle already carries
+    // (omitted from the L1 — no L2 build, no CEK re-wrap).
+    let (included, disabled, skipped) = partition_l1_components(&tree, reported_state.as_ref());
     for path in &skipped {
         tracing::info!(
             channel = %req.channel,
@@ -629,37 +636,55 @@ pub async fn channel_target_l1(
         );
     }
 
-    // One per-device L2 per included component; wrap them into the L1.
-    let mut l2s: Vec<(String, Vec<u8>)> = Vec::with_capacity(included.len());
-    for (path, entity) in included {
-        tracing::info!(
-            channel = %req.channel,
-            device = %req.device,
-            component = %path,
-            "L1 include: building component into the campaign"
-        );
-        let mut parts = Vec::with_capacity(entity.parts.len());
-        for p in &entity.parts {
-            let entry = s.index.get(&p.content).await?.ok_or(AppError::NotFound)?;
-            parts.push(EnvelopePart {
-                id: p.id.clone(),
-                inner: *p.content.as_bytes(),
-                size: entry.size,
-                cek: entry.cek,
-                iv: entry.nonce,
-                outer: Some(entry.outer),
-            });
-        }
-        let l2 = s
-            .signer
-            .build_envelope(
-                &device_pubkey,
-                req.device_id.as_bytes(),
-                path,
-                &parts,
-                req.seq,
-            )
-            .map_err(|e| AppError::Internal(anyhow::anyhow!("L2 build failed for {path}: {e}")))?;
+    // One per-device L2 per included component, plus a signed disable manifest per
+    // disabled member; wrap them all into the L1. A disabled member is deactivated,
+    // not flashed — its `build_disable_envelope` output is the same `Vec<u8>` shape
+    // `build_campaign` embeds, so the campaign ships it like any other L2.
+    let mut l2s: Vec<(String, Vec<u8>)> = Vec::with_capacity(included.len() + disabled.len());
+    for (path, entity) in included.into_iter().chain(disabled) {
+        let l2 = if entity.disabled {
+            tracing::info!(
+                channel = %req.channel,
+                device = %req.device,
+                component = %path,
+                "L1 disable: emitting a signed disable manifest for this component"
+            );
+            s.signer
+                .build_disable_envelope(path, req.seq)
+                .map_err(|e| {
+                    AppError::Internal(anyhow::anyhow!("L2 disable build failed for {path}: {e}"))
+                })?
+        } else {
+            tracing::info!(
+                channel = %req.channel,
+                device = %req.device,
+                component = %path,
+                "L1 include: building component into the campaign"
+            );
+            let mut parts = Vec::with_capacity(entity.parts.len());
+            for p in &entity.parts {
+                let entry = s.index.get(&p.content).await?.ok_or(AppError::NotFound)?;
+                parts.push(EnvelopePart {
+                    id: p.id.clone(),
+                    inner: *p.content.as_bytes(),
+                    size: entry.size,
+                    cek: entry.cek,
+                    iv: entry.nonce,
+                    outer: Some(entry.outer),
+                });
+            }
+            s.signer
+                .build_envelope(
+                    &device_pubkey,
+                    req.device_id.as_bytes(),
+                    path,
+                    &parts,
+                    req.seq,
+                )
+                .map_err(|e| {
+                    AppError::Internal(anyhow::anyhow!("L2 build failed for {path}: {e}"))
+                })?
+        };
         l2s.push((path.clone(), l2));
     }
     // Empty ⇒ nothing to ship. Two distinct reasons, distinct signals — because
@@ -709,21 +734,39 @@ fn entity_agreed(reported: &Tree, path: &str, resolved: &Entity) -> bool {
         .all(|p| rep.parts.iter().any(|rp| rp.content == p.content))
 }
 
+/// A resolved component for L1 assembly: its tree path and entity. The pair
+/// [`partition_l1_components`] hands the build loop to turn into a flash envelope
+/// or a disable manifest.
+type ComponentEntry<'a> = (&'a String, &'a Entity);
+
 /// Partition a resolved target tree's components for L1 assembly against the
-/// vehicle's self-reported `reported` state: `(included, skipped)`.
+/// vehicle's self-reported `reported` state: `(included, disabled, skipped)`.
 ///
-/// A component is SKIPPED (omitted from the L1 — no L2 build, no CEK re-wrap) when
-/// the vehicle already carries it ([`entity_agreed`]); otherwise it is INCLUDED and
-/// built as the authoritative target. Entities with no parts are in neither set
+/// A DISABLED component (its release marks it deactivated) always goes to the
+/// `disabled` bucket — checked first, so a disable is honored as an explicit flag,
+/// never treated as "empty parts" nor skipped as already-carried; L1 assembly
+/// emits a signed disable manifest for it. Otherwise a component is SKIPPED
+/// (omitted from the L1 — no L2 build, no CEK re-wrap) when the vehicle already
+/// carries it ([`entity_agreed`]); else it is INCLUDED and built as the
+/// authoritative target. Enabled entities with no parts are in none of the sets
 /// (they carry nothing to ship). `reported` `None` ⇒ nothing is skipped: the tower
 /// stays authoritative and builds the full target (exactly the pre-skip behavior).
 fn partition_l1_components<'a>(
     tree: &'a Tree,
     reported: Option<&Tree>,
-) -> (Vec<(&'a String, &'a Entity)>, Vec<&'a String>) {
+) -> (
+    Vec<ComponentEntry<'a>>,
+    Vec<ComponentEntry<'a>>,
+    Vec<&'a String>,
+) {
     let mut included = Vec::new();
+    let mut disabled = Vec::new();
     let mut skipped = Vec::new();
     for (path, entity) in &tree.entities {
+        if entity.disabled {
+            disabled.push((path, entity));
+            continue;
+        }
         if entity.parts.is_empty() {
             continue;
         }
@@ -732,7 +775,7 @@ fn partition_l1_components<'a>(
             _ => included.push((path, entity)),
         }
     }
-    (included, skipped)
+    (included, disabled, skipped)
 }
 
 /// `GET /admin/artifacts/{inner}` — does Tower 2 already have this content?
@@ -776,18 +819,44 @@ fn component_identity(entity_kind: &str, parts: &[NewPart]) -> String {
 }
 
 /// A vehicle release's content identity: a hash over its (sorted, deduped)
-/// member component-release ids. Member ids are themselves content-deduped, so
-/// the same whole-vehicle content yields the same identity.
-fn vehicle_identity(members: &[i64]) -> String {
+/// member component-release ids, plus the subset of those members marked
+/// **disabled**. Member ids are themselves content-deduped, so the same
+/// whole-vehicle content yields the same identity.
+///
+/// A disabled member is a distinct whole-vehicle state (the member is deactivated,
+/// not flashed), so it MUST fold into the identity — otherwise a disable would
+/// reuse (silently no-op against) the enabled release. An enabled-only release
+/// (no disabled members) hashes exactly as before, so existing releases still
+/// dedup; a disabled id that isn't a member has no stored effect and so does not
+/// perturb the identity (kept consistent with the resolved [`tree_hash`]).
+fn vehicle_identity(members: &[i64], disabled_members: &[i64]) -> String {
     let mut sorted = members.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    let joined = sorted
+    let mut buf = sorted
         .iter()
         .map(|m| m.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    ContentHash::of(joined.as_bytes()).to_prefixed()
+
+    let mut disabled: Vec<i64> = disabled_members
+        .iter()
+        .copied()
+        .filter(|d| sorted.binary_search(d).is_ok())
+        .collect();
+    disabled.sort_unstable();
+    disabled.dedup();
+    if !disabled.is_empty() {
+        buf.push_str("\ndisabled:");
+        buf.push_str(
+            &disabled
+                .iter()
+                .map(|m| m.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    ContentHash::of(buf.as_bytes()).to_prefixed()
 }
 
 // --- resolution ------------------------------------------------------------
@@ -844,7 +913,7 @@ async fn channel_target_vehicle(
 /// -> their entities + parts).
 async fn resolve_members_to_tree(pool: &PgPool, vehicle_id: i64) -> sqlx::Result<Tree> {
     let members = sqlx::query(
-        "SELECT component_release_id FROM vehicle_release_members WHERE vehicle_release_id = $1",
+        "SELECT component_release_id, disabled FROM vehicle_release_members WHERE vehicle_release_id = $1",
     )
     .bind(vehicle_id)
     .fetch_all(pool)
@@ -853,6 +922,7 @@ async fn resolve_members_to_tree(pool: &PgPool, vehicle_id: i64) -> sqlx::Result
     let mut tree = Tree::default();
     for m in members {
         let rid: i64 = m.get("component_release_id");
+        let disabled: bool = m.get("disabled");
         let row = sqlx::query(
             "SELECT entity_path, entity_kind, version FROM component_releases WHERE id = $1",
         )
@@ -865,6 +935,7 @@ async fn resolve_members_to_tree(pool: &PgPool, vehicle_id: i64) -> sqlx::Result
             version: Some(row.get("version")),
             update_mode: None,
             parts: Vec::new(),
+            disabled,
         };
         let parts =
             sqlx::query("SELECT part_id, part_kind, content_hash FROM component_release_parts WHERE release_id = $1")
@@ -897,6 +968,12 @@ fn tree_hash(tree: &Tree) -> String {
     for (path, entity) in &tree.entities {
         buf.push_str(path);
         buf.push('\n');
+        // A disabled member is a distinct desired state (deactivated, not flashed),
+        // so it MUST change the tree hash; an enabled entity is byte-identical to
+        // before (additive).
+        if entity.disabled {
+            buf.push_str("disabled\n");
+        }
         let mut parts: Vec<&Part> = entity.parts.iter().collect();
         parts.sort_by(|a, b| a.id.cmp(&b.id));
         for p in parts {
@@ -928,6 +1005,8 @@ mod tests {
     use crate::content::AppState;
     use crate::signer::Signer;
     use crate::store::{FsBlobStore, PgIndex};
+    use sumo_codec::commands::CommandValue;
+    use sumo_codec::labels::SUIT_DIRECTIVE_DISABLE;
     use sumo_crypto::RustCryptoBackend;
     use sumo_offboard::keygen;
     use sumo_onboard::validator::Validator;
@@ -956,6 +1035,7 @@ mod tests {
             version: None,
             update_mode: None,
             parts,
+            disabled: false,
         }
     }
 
@@ -1009,18 +1089,20 @@ mod tests {
             wentity(vec![wpart("boot.img", b"K"), wpart("rootfs.img", b"R")]),
         )]);
 
-        let (included, skipped) = partition_l1_components(&tree, Some(&reported));
+        let (included, disabled, skipped) = partition_l1_components(&tree, Some(&reported));
         let inc: Vec<&str> = included.iter().map(|(p, _)| p.as_str()).collect();
         let skp: Vec<&str> = skipped.iter().map(|p| p.as_str()).collect();
         assert_eq!(inc, vec!["vm2"], "only the changed component is built");
         assert_eq!(skp, vec!["vm1"], "the already-carried component is skipped");
+        assert!(disabled.is_empty(), "no members disabled in this tree");
 
         // None ⇒ every entity WITH parts is included, nothing skipped (the partless
         // entity is excluded either way — it carries nothing to ship).
-        let (included, skipped) = partition_l1_components(&tree, None);
+        let (included, disabled, skipped) = partition_l1_components(&tree, None);
         let inc: Vec<&str> = included.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(inc, vec!["vm1", "vm2"]);
         assert!(skipped.is_empty());
+        assert!(disabled.is_empty());
     }
 
     /// Every component agreed ⇒ nothing included, everything skipped — the "vehicle
@@ -1037,38 +1119,45 @@ mod tests {
             ("vm1", wentity(vec![wpart("boot.img", b"K")])),
             ("vm2", wentity(vec![wpart("boot.img", b"K2")])),
         ]);
-        let (included, skipped) = partition_l1_components(&tree, Some(&reported));
+        let (included, disabled, skipped) = partition_l1_components(&tree, Some(&reported));
         assert!(included.is_empty(), "nothing to build — vehicle at target");
+        assert!(disabled.is_empty(), "no members disabled in this tree");
         let skp: Vec<&str> = skipped.iter().map(|p| p.as_str()).collect();
         assert_eq!(skp, vec!["vm1", "vm2"], "every component skipped");
     }
 
-    /// Build a signed L1 over `included` (fake CEK/IV/outer — no blob store in a
-    /// unit test) exactly as the handler does, and return the validated campaign
-    /// manifest so a test can assert which components it carries. Reuses the signer
-    /// + `Validator` path the signer tests use.
+    /// Build a signed L1 over `included` + `disabled` (fake CEK/IV/outer — no blob
+    /// store in a unit test) exactly as the handler does: included components get a
+    /// flash envelope, disabled members get a `build_disable_envelope` manifest.
+    /// Returns the validated campaign manifest so a test can assert which components
+    /// it carries. Reuses the signer + `Validator` path the signer tests use.
     fn build_l1(
         signer: &Signer,
         device_pubkey: &[u8],
         included: &[(&String, &Entity)],
+        disabled: &[(&String, &Entity)],
     ) -> sumo_onboard::Manifest {
         let mut l2s: Vec<(String, Vec<u8>)> = Vec::new();
-        for &(path, entity) in included {
-            let parts: Vec<EnvelopePart> = entity
-                .parts
-                .iter()
-                .map(|p| EnvelopePart {
-                    id: p.id.clone(),
-                    inner: *p.content.as_bytes(),
-                    size: 42,
-                    cek: [7u8; 16],
-                    iv: [9u8; 12],
-                    outer: Some(ContentHash::of(p.id.as_bytes())),
-                })
-                .collect();
-            let l2 = signer
-                .build_envelope(device_pubkey, b"dev-1", path, &parts, 1)
-                .unwrap();
+        for &(path, entity) in included.iter().chain(disabled) {
+            let l2 = if entity.disabled {
+                signer.build_disable_envelope(path, 1).unwrap()
+            } else {
+                let parts: Vec<EnvelopePart> = entity
+                    .parts
+                    .iter()
+                    .map(|p| EnvelopePart {
+                        id: p.id.clone(),
+                        inner: *p.content.as_bytes(),
+                        size: 42,
+                        cek: [7u8; 16],
+                        iv: [9u8; 12],
+                        outer: Some(ContentHash::of(p.id.as_bytes())),
+                    })
+                    .collect();
+                signer
+                    .build_envelope(device_pubkey, b"dev-1", path, &parts, 1)
+                    .unwrap()
+            };
             l2s.push((path.clone(), l2));
         }
         let l1 = signer.build_campaign(&l2s, 3).expect("L1 builds");
@@ -1092,8 +1181,8 @@ mod tests {
         // Vehicle already carries vm1 (remapped name); vm2 is new/changed.
         let reported = wtree(vec![("vm1", wentity(vec![wpart("boot.img", b"K")]))]);
 
-        let (included, _) = partition_l1_components(&tree, Some(&reported));
-        let m = build_l1(&signer, &pubkey, &included);
+        let (included, disabled, _) = partition_l1_components(&tree, Some(&reported));
+        let m = build_l1(&signer, &pubkey, &included, &disabled);
         assert!(
             m.integrated_payload("#vm2").is_some(),
             "changed component must be present in the L1"
@@ -1115,11 +1204,109 @@ mod tests {
             ("vm2", wentity(vec![wpart("kernel", b"K2")])),
         ]);
         // None current_state ⇒ no skip: both components are built into the L1.
-        let (included, skipped) = partition_l1_components(&tree, None);
+        let (included, disabled, skipped) = partition_l1_components(&tree, None);
         assert!(skipped.is_empty());
-        let m = build_l1(&signer, &pubkey, &included);
+        let m = build_l1(&signer, &pubkey, &included, &disabled);
         assert!(m.integrated_payload("#vm1").is_some());
         assert!(m.integrated_payload("#vm2").is_some());
+    }
+
+    /// A release with a member DISABLED assembles an L1 where that component's L2 is
+    /// a `build_disable_envelope` output (no firmware, carries the
+    /// `suit-directive-disable`), while an enabled member is still flashed with a
+    /// normal envelope (carries firmware). Mirrors the handler's build loop.
+    #[test]
+    fn built_l1_disables_disabled_member_and_flashes_enabled() {
+        let signer = Signer::generate().unwrap();
+        let device = keygen::generate_device_key(keygen::ES256).unwrap();
+        let pubkey = device.public_key_bytes();
+
+        // vm1 enabled (flash), vm2 disabled (deactivate).
+        let mut vm2 = wentity(vec![wpart("kernel", b"K2")]);
+        vm2.disabled = true;
+        let tree = wtree(vec![
+            ("vm1", wentity(vec![wpart("kernel", b"K")])),
+            ("vm2", vm2),
+        ]);
+
+        // No reported state ⇒ vm1 → included, vm2 → disabled bucket, nothing skipped.
+        let (included, disabled, skipped) = partition_l1_components(&tree, None);
+        let inc: Vec<&str> = included.iter().map(|(p, _)| p.as_str()).collect();
+        let dis: Vec<&str> = disabled.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(inc, vec!["vm1"], "the enabled member is flashed");
+        assert_eq!(dis, vec!["vm2"], "the disabled member is routed to disable");
+        assert!(skipped.is_empty());
+
+        let l1 = build_l1(&signer, &pubkey, &included, &disabled);
+        let crypto = RustCryptoBackend::new();
+
+        // vm1: an ordinary flash envelope — carries a firmware payload.
+        let vm1_l2 = l1
+            .integrated_payload("#vm1")
+            .expect("enabled member present in the L1");
+        let vm1_m = Validator::new(&signer.public_key_cbor(), None)
+            .validate_envelope(vm1_l2, &crypto, 0)
+            .expect("enabled L2 validates");
+        assert!(
+            vm1_m.has_firmware(),
+            "the enabled member is flashed (carries firmware)"
+        );
+
+        // vm2: a disable manifest — no firmware, carries suit-directive-disable.
+        let vm2_l2 = l1
+            .integrated_payload("#vm2")
+            .expect("disabled member present in the L1");
+        let vm2_m = Validator::new(&signer.public_key_cbor(), None)
+            .validate_envelope(vm2_l2, &crypto, 0)
+            .expect("disable L2 validates");
+        assert!(
+            !vm2_m.has_firmware(),
+            "the disabled member carries no firmware"
+        );
+        let disable = vm2_m
+            .envelope()
+            .manifest
+            .common
+            .shared_sequence
+            .items
+            .iter()
+            .find(|c| c.label == SUIT_DIRECTIVE_DISABLE)
+            .expect("disable directive present");
+        assert!(matches!(disable.value, CommandValue::Disable));
+    }
+
+    /// THE critical invariant: a disable is a NEW immutable, content-addressed
+    /// release. A member marked disabled MUST change BOTH the vehicle identity and
+    /// the resolved tree hash vs. the same release with it enabled — otherwise the
+    /// disable reuses (silently no-ops against) the enabled release. Enabled-only
+    /// inputs are unchanged (additive), and a disabled id that isn't a member has no
+    /// effect (kept consistent with the resolved tree).
+    #[test]
+    fn disabled_member_changes_identity_and_tree_hash() {
+        // vehicle_identity: disabling a member yields a distinct identity.
+        assert_ne!(
+            vehicle_identity(&[1, 2, 3], &[]),
+            vehicle_identity(&[1, 2, 3], &[2]),
+            "a disabled member must change the vehicle identity"
+        );
+        // Additive: no disabled members ⇒ the pre-disable identity, and a disabled
+        // id that isn't a member has no stored effect ⇒ no identity change.
+        assert_eq!(
+            vehicle_identity(&[1, 2, 3], &[]),
+            vehicle_identity(&[1, 2, 3], &[99])
+        );
+
+        // tree_hash: the same resolved tree with a member disabled hashes
+        // differently than with it enabled.
+        let enabled = wtree(vec![("vm1", wentity(vec![wpart("kernel", b"K")]))]);
+        let mut dis = wentity(vec![wpart("kernel", b"K")]);
+        dis.disabled = true;
+        let disabled = wtree(vec![("vm1", dis)]);
+        assert_ne!(
+            tree_hash(&enabled),
+            tree_hash(&disabled),
+            "a disabled member must change the tree hash"
+        );
     }
 
     #[test]
@@ -1279,12 +1466,18 @@ mod tests {
 
     #[test]
     fn vehicle_identity_ignores_order_and_dupes() {
-        assert_eq!(vehicle_identity(&[1, 2, 3]), vehicle_identity(&[3, 2, 1]));
         assert_eq!(
-            vehicle_identity(&[1, 2, 2, 3]),
-            vehicle_identity(&[1, 2, 3])
+            vehicle_identity(&[1, 2, 3], &[]),
+            vehicle_identity(&[3, 2, 1], &[])
         );
-        assert_ne!(vehicle_identity(&[1, 2]), vehicle_identity(&[1, 2, 3]));
+        assert_eq!(
+            vehicle_identity(&[1, 2, 2, 3], &[]),
+            vehicle_identity(&[1, 2, 3], &[])
+        );
+        assert_ne!(
+            vehicle_identity(&[1, 2], &[]),
+            vehicle_identity(&[1, 2, 3], &[])
+        );
     }
 
     fn test_app(pool: PgPool) -> Router {

@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use sumo_offboard::cose_key::CoseKey;
-use sumo_offboard::image_builder::{ComponentSpec, MultiComponentBuilder};
+use sumo_offboard::image_builder::{ComponentSpec, ImageManifestBuilder, MultiComponentBuilder};
 use sumo_offboard::recipient::Recipient;
 use sumo_offboard::{encryptor, keygen, CampaignBuilder, OffboardError};
 use wire::ContentHash;
@@ -146,6 +146,31 @@ impl Signer {
         }
         builder.build(&self.key)
     }
+
+    /// Build a signed **disable** manifest for `component` — a minimal, no-payload
+    /// SUIT manifest carrying `suit-directive-disable` for the target component
+    /// (selected via set-component-index). Signed with the same sw-authority key
+    /// as a flash manifest, so the device's existing trust anchor validates it and
+    /// routes it to `Deactivator::deactivate()`; the campaign ships it like any
+    /// other envelope.
+    pub fn build_disable_envelope(
+        &self,
+        component: &str,
+        seq: u64,
+    ) -> Result<Vec<u8>, OffboardError> {
+        // Manifest signing time (iat): the tower's wall clock at build time — the
+        // disable manifest is a signed manifest too, carrying the same lower bound
+        // on real time the device ratchets from (see docs/design/safe-time-floor.md).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        ImageManifestBuilder::new()
+            .signing_time(now)
+            .sequence_number(seq)
+            .component_id(vec![component.to_string()])
+            .build_disable(&self.key)
+    }
 }
 
 // --- handlers --------------------------------------------------------------
@@ -228,6 +253,8 @@ pub async fn create_envelope(
 mod tests {
     use super::*;
     use coset::CborSerializable;
+    use sumo_codec::commands::CommandValue;
+    use sumo_codec::labels::SUIT_DIRECTIVE_DISABLE;
     use sumo_crypto::RustCryptoBackend;
     use sumo_onboard::decryptor::{InMemoryKeyUnwrap, StreamingDecryptor};
     use sumo_onboard::validator::Validator;
@@ -328,5 +355,43 @@ mod tests {
         validator
             .validate_envelope(&l1, &crypto, 0)
             .expect("L1 validates against the sw-authority anchor");
+    }
+
+    /// `build_disable_envelope` mints a signed, no-payload disable manifest that
+    /// validates against the pinned sw-authority anchor and carries
+    /// `suit-directive-disable` for the target component — the artifact the
+    /// campaign ships to route the device to `Deactivator::deactivate()`.
+    #[test]
+    fn build_disable_envelope_produces_a_signed_disable_manifest() {
+        let crypto = RustCryptoBackend::new();
+        let signer = Signer::generate().unwrap();
+
+        let envelope = signer
+            .build_disable_envelope("vm1", 5)
+            .expect("disable manifest builds");
+
+        // Validates against the pinned anchor => signed by the sw-authority key.
+        let validator = Validator::new(&signer.public_key_cbor(), None);
+        let manifest = validator
+            .validate_envelope(&envelope, &crypto, 0)
+            .expect("disable manifest validates against the sw-authority anchor");
+
+        // No firmware payload.
+        assert!(
+            !manifest.has_firmware(),
+            "disable manifest carries no firmware"
+        );
+
+        // Carries suit-directive-disable for the selected component.
+        let disable = manifest
+            .envelope()
+            .manifest
+            .common
+            .shared_sequence
+            .items
+            .iter()
+            .find(|c| c.label == SUIT_DIRECTIVE_DISABLE)
+            .expect("disable directive present");
+        assert!(matches!(disable.value, CommandValue::Disable));
     }
 }
