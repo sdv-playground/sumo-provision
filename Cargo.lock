@@ -1092,7 +1092,7 @@ dependencies = [
 [[package]]
 name = "hsm"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#03dec3bf6d58f593e883d51f78505473a28d7798"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#ffa99cc9dfdc452410e989993a18c1fa4bc0cefc"
 dependencies = [
  "ciborium",
  "coset",
@@ -1107,7 +1107,7 @@ dependencies = [
 [[package]]
 name = "hsm-contract"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#03dec3bf6d58f593e883d51f78505473a28d7798"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#ffa99cc9dfdc452410e989993a18c1fa4bc0cefc"
 dependencies = [
  "vhsm-proto",
 ]
@@ -1115,7 +1115,7 @@ dependencies = [
 [[package]]
 name = "hsm-link-b"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#03dec3bf6d58f593e883d51f78505473a28d7798"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#ffa99cc9dfdc452410e989993a18c1fa4bc0cefc"
 
 [[package]]
 name = "http"
@@ -2821,7 +2821,7 @@ dependencies = [
 [[package]]
 name = "sumo-sovd-flash-engine"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#468a3ce0516de26b6b8d8a4f457495895928bcf3"
+source = "git+https://github.com/sdv-playground/sumo-sovd.git?branch=main#598946a0f9e71b454df43209088e3117c9e60b71"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -3296,7 +3296,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vhsm-proto"
 version = "0.1.0"
-source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#03dec3bf6d58f593e883d51f78505473a28d7798"
+source = "git+https://github.com/sdv-playground/sumo-machine-manager.git?branch=main#ffa99cc9dfdc452410e989993a18c1fa4bc0cefc"
 
 [[package]]
 name = "want"
