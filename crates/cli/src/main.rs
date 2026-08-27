@@ -397,6 +397,8 @@ impl ChannelSel {
             channel: self.channel.clone(),
             device: self.device.clone(),
             architecture: self.architecture.clone(),
+            vehicle_release_id: None,
+            tree_hash: None,
         }
     }
 }

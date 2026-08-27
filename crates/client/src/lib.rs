@@ -33,7 +33,12 @@ struct EnvelopePartReq {
 /// `POST /channel-targets/l1` request body (mirrors Tower 2's `L1Request`).
 #[derive(Serialize)]
 struct L1Req<'a> {
-    channel: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vehicle_release_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tree_hash: Option<&'a str>,
     device: &'a str,
     architecture: &'a str,
     device_pubkey: &'a str,
@@ -214,6 +219,29 @@ impl SoftwareClient {
         Ok(Some(resp.error_for_status()?.json().await?))
     }
 
+    /// Resolve an immutable vehicle release directly, without following a channel.
+    pub async fn vehicle_release_tree(
+        &self,
+        vehicle_release_id: i64,
+        tree_hash: Option<&str>,
+    ) -> Result<Option<Tree>, ClientError> {
+        let mut q = vec![("vehicle_release_id", vehicle_release_id.to_string())];
+        if let Some(hash) = tree_hash {
+            q.push(("tree_hash", hash.to_string()));
+        }
+        let resp = self
+            .tower
+            .http
+            .get(format!("{}/channel-targets/tree", self.tower.base))
+            .query(&q)
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
     /// `POST /admin/envelope` — build a signed SUIT envelope for `component`'s
     /// `parts` (id + inner-hash), with each part's CEK re-wrapped to the device.
     /// Returns the manifest bytes.
@@ -270,7 +298,46 @@ impl SoftwareClient {
         seq: u64,
     ) -> Result<Vec<u8>, ClientError> {
         let body = L1Req {
-            channel,
+            channel: Some(channel),
+            vehicle_release_id: None,
+            tree_hash: None,
+            device,
+            architecture,
+            device_pubkey,
+            device_id,
+            current_state,
+            seq,
+        };
+        Ok(self
+            .tower
+            .http
+            .post(format!("{}/channel-targets/l1", self.tower.base))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .to_vec())
+    }
+
+    /// Build L1 for an immutable vehicle release rather than a mutable channel.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn vehicle_release_l1(
+        &self,
+        vehicle_release_id: i64,
+        tree_hash: Option<&str>,
+        device: &str,
+        architecture: &str,
+        device_pubkey: &str,
+        device_id: &str,
+        current_state: Option<&serde_json::Value>,
+        seq: u64,
+    ) -> Result<Vec<u8>, ClientError> {
+        let body = L1Req {
+            channel: None,
+            vehicle_release_id: Some(vehicle_release_id),
+            tree_hash,
             device,
             architecture,
             device_pubkey,
@@ -535,7 +602,9 @@ mod tests {
     #[test]
     fn l1_request_body_omits_absent_current_state() {
         let body = L1Req {
-            channel: "bleeding",
+            channel: Some("bleeding"),
+            vehicle_release_id: None,
+            tree_hash: None,
             device: "rig",
             architecture: "arm64",
             device_pubkey: "a1b2",
@@ -561,7 +630,9 @@ mod tests {
     fn l1_request_body_carries_current_state() {
         let state = serde_json::json!({ "entities": { "vm1": { "kind": "vm" } } });
         let body = L1Req {
-            channel: "bleeding",
+            channel: Some("bleeding"),
+            vehicle_release_id: None,
+            tree_hash: None,
             device: "rig",
             architecture: "arm64",
             device_pubkey: "a1b2",
@@ -571,5 +642,24 @@ mod tests {
         };
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(v["current_state"], state);
+    }
+
+    #[test]
+    fn pinned_l1_request_uses_release_identity_not_channel() {
+        let body = L1Req {
+            channel: None,
+            vehicle_release_id: Some(42),
+            tree_hash: Some("sha256:abc"),
+            device: "rig",
+            architecture: "arm64",
+            device_pubkey: "a1b2",
+            device_id: "device-1",
+            current_state: None,
+            seq: 1,
+        };
+        let value = serde_json::to_value(body).unwrap();
+        assert_eq!(value["vehicle_release_id"], 42);
+        assert_eq!(value["tree_hash"], "sha256:abc");
+        assert!(value.get("channel").is_none());
     }
 }

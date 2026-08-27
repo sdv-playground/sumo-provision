@@ -268,6 +268,10 @@ pub struct Entity {
     /// keeps the pre-disable behavior; an observed tree never sets it.
     #[serde(default)]
     pub disabled: bool,
+    /// Observed administrative state reported by the component. `None` means the
+    /// component omitted `x-sumo-runtime.admin_state` and is unknown/non-disableable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_disabled: Option<bool>,
 }
 
 /// A vehicle's state as a flat tree keyed by entity path (`"vm1"`,
@@ -507,6 +511,7 @@ mod model_tests {
             update_mode: None,
             parts,
             disabled: false,
+            admin_disabled: None,
         }
     }
     fn tree(entries: Vec<(&str, Entity)>) -> Tree {

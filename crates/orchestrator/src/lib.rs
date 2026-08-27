@@ -221,9 +221,38 @@ pub async fn read_rig_state(
             entity.parts = installed_files_to_parts(sovd_url, &c.id, m.files);
         }
         entity.update_mode = read_update_mode(&client, &c.id).await?;
+        entity.admin_disabled = read_admin_disabled(&client, &c.id).await?;
         tree.entities.insert(c.id, entity);
     }
     Ok(tree)
+}
+
+/// Read flattened `/status` `x-sumo-runtime.admin_state`. Components that omit
+/// it are non-disableable, represented as unknown rather than implicitly enabled.
+async fn read_admin_disabled(client: &SovdClient, component: &str) -> Result<Option<bool>, Error> {
+    let status = client.read_status(component).await?;
+    parse_admin_disabled(
+        status
+            .extensions
+            .get("x-sumo-runtime")
+            .and_then(|v| v.get("admin_state")),
+    )
+}
+
+fn parse_admin_disabled(value: Option<&serde_json::Value>) -> Result<Option<bool>, Error> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.as_str() {
+        Some("enabled") => Ok(Some(false)),
+        Some("disabled") => Ok(Some(true)),
+        Some(other) => Err(Error::NodeState(format!(
+            "unknown x-sumo-runtime.admin_state '{other}'"
+        ))),
+        None => Err(Error::NodeState(
+            "x-sumo-runtime.admin_state must be a string".into(),
+        )),
+    }
 }
 
 /// Project a component's installed-manifest files into content-hashed [`Part`]s.
@@ -407,6 +436,8 @@ pub struct ChannelTarget {
     pub channel: String,
     pub device: Option<String>,
     pub architecture: Option<String>,
+    pub vehicle_release_id: Option<i64>,
+    pub tree_hash: Option<String>,
 }
 
 impl ChannelTarget {
@@ -416,11 +447,32 @@ impl ChannelTarget {
             channel: channel.into(),
             device: None,
             architecture: None,
+            vehicle_release_id: None,
+            tree_hash: None,
+        }
+    }
+
+    /// An immutable vehicle release, optionally guarded by its canonical tree hash.
+    pub fn pinned(
+        vehicle_release_id: i64,
+        tree_hash: Option<String>,
+        device: impl Into<String>,
+        architecture: impl Into<String>,
+    ) -> Self {
+        Self {
+            channel: format!("vehicle-release:{vehicle_release_id}"),
+            device: Some(device.into()),
+            architecture: Some(architecture.into()),
+            vehicle_release_id: Some(vehicle_release_id),
+            tree_hash,
         }
     }
 
     /// Human label for diagnostics: the channel, plus any narrowing in parens.
     fn label(&self) -> String {
+        if let Some(id) = self.vehicle_release_id {
+            return format!("vehicle release {id}");
+        }
         match (&self.device, &self.architecture) {
             (None, None) => self.channel.clone(),
             (dev, arch) => format!(
@@ -450,16 +502,23 @@ pub async fn apply_plan(
 ) -> Result<ApplyPlan, Error> {
     let observed = read_rig_state(rig_url, insecure, ca_cert_pem).await?;
     let hub = SoftwareClient::new(hub_url);
-    let desired = hub
-        .channel_target_tree(
-            &target.channel,
-            target.device.as_deref(),
-            target.architecture.as_deref(),
-        )
-        .await?
-        .ok_or_else(|| Error::ChannelNotFound {
-            channel: target.label(),
-        })?;
+    let desired = match target.vehicle_release_id {
+        Some(id) => {
+            hub.vehicle_release_tree(id, target.tree_hash.as_deref())
+                .await?
+        }
+        None => {
+            hub.channel_target_tree(
+                &target.channel,
+                target.device.as_deref(),
+                target.architecture.as_deref(),
+            )
+            .await?
+        }
+    }
+    .ok_or_else(|| Error::ChannelNotFound {
+        channel: target.label(),
+    })?;
     let plan = wire::flash_plan(&observed, &desired);
 
     let mut components = Vec::new();
@@ -1051,17 +1110,33 @@ async fn l1_flash_plan(
     let hub = SoftwareClient::new(hub_url);
     // The signed L1 IS the plan: Tower 2 does the diff + per-device assembly and
     // signs the result; the orchestrator relays it, never rebuilds it.
-    let l1 = hub
-        .channel_target_l1(
-            &target.channel,
-            device,
-            architecture,
-            &pubkey,
-            device_id,
-            Some(&current_state),
-            1,
-        )
-        .await?;
+    let l1 = match target.vehicle_release_id {
+        Some(id) => {
+            hub.vehicle_release_l1(
+                id,
+                target.tree_hash.as_deref(),
+                device,
+                architecture,
+                &pubkey,
+                device_id,
+                Some(&current_state),
+                1,
+            )
+            .await?
+        }
+        None => {
+            hub.channel_target_l1(
+                &target.channel,
+                device,
+                architecture,
+                &pubkey,
+                device_id,
+                Some(&current_state),
+                1,
+            )
+            .await?
+        }
+    };
     // An empty body (Tower 2 returns 204 No Content) means every component was
     // skipped — the vehicle is already at target. A clean no-op: return no jobs so
     // campaign_execute / flash_execute short-circuit (both gate on jobs.is_empty()).
@@ -1620,6 +1695,8 @@ mod tests {
             channel: "bleeding".into(),
             device: Some("rig".into()),
             architecture: Some("arm64".into()),
+            vehicle_release_id: None,
+            tree_hash: None,
         };
         assert_eq!(l1_selector(&full).unwrap(), ("rig", "arm64"));
     }
@@ -1977,5 +2054,20 @@ mod tests {
         assert_eq!(jobs.len(), 1, "allowlist [host] keeps only host");
         assert_eq!(jobs[0].component_id, "host");
         assert_eq!(blobs.fetches(), 1, "rt not in the allowlist → not fetched");
+    }
+
+    #[test]
+    fn admin_state_is_absent_valid_or_rejected() {
+        assert_eq!(parse_admin_disabled(None).unwrap(), None);
+        assert_eq!(
+            parse_admin_disabled(Some(&serde_json::json!("enabled"))).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            parse_admin_disabled(Some(&serde_json::json!("disabled"))).unwrap(),
+            Some(true)
+        );
+        assert!(parse_admin_disabled(Some(&serde_json::json!("unknown"))).is_err());
+        assert!(parse_admin_disabled(Some(&serde_json::json!(false))).is_err());
     }
 }

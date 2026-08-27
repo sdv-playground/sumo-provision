@@ -77,9 +77,11 @@ pub struct SetChannelTarget {
 /// supply both to disambiguate when a channel serves several.
 #[derive(Deserialize)]
 pub struct TargetSelector {
-    pub channel: String,
+    pub channel: Option<String>,
     pub device: Option<String>,
     pub architecture: Option<String>,
+    pub vehicle_release_id: Option<i64>,
+    pub tree_hash: Option<String>,
 }
 
 /// A resolved release. `reused` is true when the content already had a release
@@ -407,6 +409,17 @@ pub async fn set_channel_target(
         .await
         .map_err(db)?;
     let th = tree_hash(&tree);
+    let mut tx = pool.begin().await.map_err(db)?;
+    sqlx::query(
+        "INSERT INTO vehicle_release_targets (vehicle_release_id, device, architecture) \
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(req.vehicle_release_id)
+    .bind(&req.device)
+    .bind(&req.architecture)
+    .execute(&mut *tx)
+    .await
+    .map_err(db)?;
     sqlx::query(
         "INSERT INTO channel_targets \
            (channel, device, architecture, vehicle_release_id, tree_hash, updated_at) \
@@ -419,9 +432,10 @@ pub async fn set_channel_target(
     .bind(&req.architecture)
     .bind(req.vehicle_release_id)
     .bind(&th)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(db)?;
+    tx.commit().await.map_err(db)?;
     Ok(Json(ChannelTargetRef {
         channel: req.channel,
         device: req.device,
@@ -480,6 +494,9 @@ pub async fn get_channel_target(
     Query(sel): Query<TargetSelector>,
 ) -> Result<Json<ChannelTargetState>, AppError> {
     let pool = s.pool()?;
+    let channel = sel
+        .channel
+        .ok_or_else(|| AppError::BadRequest("channel is required".into()))?;
     let row = sqlx::query(
         "SELECT ct.device, ct.architecture, v.config_snapshot, v.id, v.tag, v.version, \
                 v.created_at::text AS created_at, ct.tree_hash \
@@ -489,7 +506,7 @@ pub async fn get_channel_target(
            AND ($3::text IS NULL OR ct.architecture = $3) \
          ORDER BY ct.updated_at DESC LIMIT 1",
     )
-    .bind(&sel.channel)
+    .bind(&channel)
     .bind(&sel.device)
     .bind(&sel.architecture)
     .fetch_optional(pool)
@@ -512,7 +529,7 @@ pub async fn get_channel_target(
         None => (None, None, None, None, None),
     };
     Ok(Json(ChannelTargetState {
-        channel: sel.channel,
+        channel,
         device,
         architecture,
         vehicle: target_release.clone(),
@@ -529,22 +546,21 @@ pub async fn channel_target_tree(
     State(s): State<AppState>,
     Query(sel): Query<TargetSelector>,
 ) -> Result<Json<Tree>, AppError> {
-    let tree = resolve_channel_target(
-        s.pool()?,
-        &sel.channel,
-        sel.device.as_deref(),
-        sel.architecture.as_deref(),
-    )
-    .await
-    .map_err(db)?
-    .ok_or(AppError::NotFound)?;
+    let tree = resolve_target(s.pool()?, &sel)
+        .await?
+        .ok_or(AppError::NotFound)?;
     Ok(Json(tree))
 }
 
 /// `POST /channel-targets/l1` body — "vehicle state in → signed L1 out".
 #[derive(Deserialize)]
 pub struct L1Request {
-    pub channel: String,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub vehicle_release_id: Option<i64>,
+    #[serde(default)]
+    pub tree_hash: Option<String>,
     pub device: String,
     pub architecture: String,
     /// Device public key as hex of its COSE_Key CBOR (relayed from Tower 1's
@@ -602,7 +618,7 @@ pub async fn channel_target_l1(
             Ok(state) => Some(state),
             Err(e) => {
                 tracing::warn!(
-                    channel = %req.channel,
+                    target = %target_label(&req.channel, req.vehicle_release_id),
                     device = %req.device,
                     error = %e,
                     "L1 request carried an unparseable vehicle-state report; \
@@ -613,15 +629,24 @@ pub async fn channel_target_l1(
         },
     };
 
-    let tree = resolve_channel_target(
-        s.pool()?,
-        &req.channel,
-        Some(&req.device),
-        Some(&req.architecture),
-    )
-    .await
-    .map_err(db)?
-    .ok_or(AppError::NotFound)?;
+    let selector = TargetSelector {
+        channel: req.channel.clone(),
+        device: Some(req.device.clone()),
+        architecture: Some(req.architecture.clone()),
+        vehicle_release_id: req.vehicle_release_id,
+        tree_hash: req.tree_hash.clone(),
+    };
+    if let Some(id) = req.vehicle_release_id {
+        let matches = release_matches_target(s.pool()?, id, &req.device, &req.architecture)
+            .await
+            .map_err(db)?;
+        if !matches {
+            return Err(AppError::NotFound);
+        }
+    }
+    let tree = resolve_target(s.pool()?, &selector)
+        .await?
+        .ok_or(AppError::NotFound)?;
 
     // Split the target's components into those to build, those disabled (a signed
     // disable manifest, not a flash), and those the vehicle already carries
@@ -629,10 +654,10 @@ pub async fn channel_target_l1(
     let (included, disabled, skipped) = partition_l1_components(&tree, reported_state.as_ref());
     for path in &skipped {
         tracing::info!(
-            channel = %req.channel,
+            target = %target_label(&req.channel, req.vehicle_release_id),
             device = %req.device,
             component = %path,
-            "L1 skip: vehicle already carries this component (agreed by content digest)"
+            "L1 skip: desired administrative/content state requires no update"
         );
     }
 
@@ -644,7 +669,7 @@ pub async fn channel_target_l1(
     for (path, entity) in included.into_iter().chain(disabled) {
         let l2 = if entity.disabled {
             tracing::info!(
-                channel = %req.channel,
+                target = %target_label(&req.channel, req.vehicle_release_id),
                 device = %req.device,
                 component = %path,
                 "L1 disable: emitting a signed disable manifest for this component"
@@ -656,7 +681,7 @@ pub async fn channel_target_l1(
                 })?
         } else {
             tracing::info!(
-                channel = %req.channel,
+                target = %target_label(&req.channel, req.vehicle_release_id),
                 device = %req.device,
                 component = %path,
                 "L1 include: building component into the campaign"
@@ -734,6 +759,13 @@ fn entity_agreed(reported: &Tree, path: &str, resolved: &Entity) -> bool {
         .all(|p| rep.parts.iter().any(|rp| rp.content == p.content))
 }
 
+fn target_label(channel: &Option<String>, vehicle_release_id: Option<i64>) -> String {
+    vehicle_release_id
+        .map(|id| format!("vehicle release {id}"))
+        .or_else(|| channel.clone())
+        .unwrap_or_else(|| "unspecified target".into())
+}
+
 /// A resolved component for L1 assembly: its tree path and entity. The pair
 /// [`partition_l1_components`] hands the build loop to turn into a flash envelope
 /// or a disable manifest.
@@ -742,15 +774,15 @@ type ComponentEntry<'a> = (&'a String, &'a Entity);
 /// Partition a resolved target tree's components for L1 assembly against the
 /// vehicle's self-reported `reported` state: `(included, disabled, skipped)`.
 ///
-/// A DISABLED component (its release marks it deactivated) always goes to the
-/// `disabled` bucket — checked first, so a disable is honored as an explicit flag,
-/// never treated as "empty parts" nor skipped as already-carried; L1 assembly
-/// emits a signed disable manifest for it. Otherwise a component is SKIPPED
+/// A component goes to `disabled` only when desired is disabled and the vehicle
+/// explicitly reports it enabled. Already-disabled components are skipped; absent
+/// administrative state is unknown/non-disableable and is not sent a disable.
+/// Otherwise a component is SKIPPED
 /// (omitted from the L1 — no L2 build, no CEK re-wrap) when the vehicle already
 /// carries it ([`entity_agreed`]); else it is INCLUDED and built as the
 /// authoritative target. Enabled entities with no parts are in none of the sets
-/// (they carry nothing to ship). `reported` `None` ⇒ nothing is skipped: the tower
-/// stays authoritative and builds the full target (exactly the pre-skip behavior).
+/// (they carry nothing to ship). `reported` `None` ⇒ enabled components are built
+/// in full, while desired disables are not sent to an unknown/non-disableable target.
 fn partition_l1_components<'a>(
     tree: &'a Tree,
     reported: Option<&Tree>,
@@ -763,15 +795,24 @@ fn partition_l1_components<'a>(
     let mut disabled = Vec::new();
     let mut skipped = Vec::new();
     for (path, entity) in &tree.entities {
+        let observed_admin = reported
+            .and_then(|rep| rep.entities.get(path))
+            .and_then(|entity| entity.admin_disabled);
         if entity.disabled {
-            disabled.push((path, entity));
+            if observed_admin == Some(false) {
+                disabled.push((path, entity));
+            } else {
+                skipped.push(path);
+            }
             continue;
         }
         if entity.parts.is_empty() {
             continue;
         }
         match reported {
-            Some(rep) if entity_agreed(rep, path, entity) => skipped.push(path),
+            Some(rep) if observed_admin != Some(true) && entity_agreed(rep, path, entity) => {
+                skipped.push(path)
+            }
             _ => included.push((path, entity)),
         }
     }
@@ -877,6 +918,47 @@ async fn resolve_channel_target(
     Ok(Some(resolve_members_to_tree(pool, vehicle_id).await?))
 }
 
+/// Resolve either an immutable vehicle release or the existing mutable channel
+/// selector. A supplied tree hash binds the request to the expected release tree.
+async fn resolve_target(
+    pool: &PgPool,
+    selector: &TargetSelector,
+) -> Result<Option<Tree>, AppError> {
+    let tree = if let Some(id) = selector.vehicle_release_id {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vehicle_releases WHERE id = $1)")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .map_err(db)?;
+        if !exists {
+            return Ok(None);
+        }
+        Some(resolve_members_to_tree(pool, id).await.map_err(db)?)
+    } else if let Some(channel) = selector.channel.as_deref() {
+        resolve_channel_target(
+            pool,
+            channel,
+            selector.device.as_deref(),
+            selector.architecture.as_deref(),
+        )
+        .await
+        .map_err(db)?
+    } else {
+        return Err(AppError::BadRequest(
+            "channel or vehicle_release_id is required".into(),
+        ));
+    };
+    if let (Some(expected), Some(tree)) = (selector.tree_hash.as_deref(), tree.as_ref()) {
+        if tree_hash(tree) != expected {
+            return Err(AppError::BadRequest(
+                "tree_hash does not match release".into(),
+            ));
+        }
+    }
+    Ok(tree)
+}
+
 /// The vehicle release id a (channel, device?, architecture?) points at. With an
 /// explicit device+architecture it's an exact lookup; without, it resolves a
 /// channel that has exactly one target (zero or many -> `None`).
@@ -909,6 +991,23 @@ async fn channel_target_vehicle(
     })
 }
 
+async fn release_matches_target(
+    pool: &PgPool,
+    vehicle_release_id: i64,
+    device: &str,
+    architecture: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM vehicle_release_targets \
+         WHERE vehicle_release_id = $1 AND device = $2 AND architecture = $3)",
+    )
+    .bind(vehicle_release_id)
+    .bind(device)
+    .bind(architecture)
+    .fetch_one(pool)
+    .await
+}
+
 /// A vehicle release id -> its desired [`wire::Tree`] (member component releases
 /// -> their entities + parts).
 async fn resolve_members_to_tree(pool: &PgPool, vehicle_id: i64) -> sqlx::Result<Tree> {
@@ -936,6 +1035,7 @@ async fn resolve_members_to_tree(pool: &PgPool, vehicle_id: i64) -> sqlx::Result
             update_mode: None,
             parts: Vec::new(),
             disabled,
+            admin_disabled: None,
         };
         let parts =
             sqlx::query("SELECT part_id, part_kind, content_hash FROM component_release_parts WHERE release_id = $1")
@@ -1057,6 +1157,7 @@ mod tests {
             update_mode: None,
             parts,
             disabled: false,
+            admin_disabled: None,
         }
     }
 
@@ -1145,6 +1246,37 @@ mod tests {
         assert!(disabled.is_empty(), "no members disabled in this tree");
         let skp: Vec<&str> = skipped.iter().map(|p| p.as_str()).collect();
         assert_eq!(skp, vec!["vm1", "vm2"], "every component skipped");
+    }
+
+    #[test]
+    fn partition_includes_disabled_vehicle_component_to_enable_it() {
+        let tree = wtree(vec![("vm1", wentity(vec![wpart("kernel", b"K")]))]);
+        let mut observed = wentity(vec![wpart("boot.img", b"K")]);
+        observed.admin_disabled = Some(true);
+        let reported = wtree(vec![("vm1", observed)]);
+
+        let (included, disabled, skipped) = partition_l1_components(&tree, Some(&reported));
+        assert_eq!(included[0].0, "vm1");
+        assert!(disabled.is_empty());
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn partition_skips_when_desired_and_observed_are_disabled() {
+        let mut desired = wentity(vec![wpart("kernel", b"K")]);
+        desired.disabled = true;
+        let tree = wtree(vec![("vm1", desired)]);
+        let mut observed = wentity(vec![wpart("boot.img", b"K")]);
+        observed.admin_disabled = Some(true);
+        let reported = wtree(vec![("vm1", observed)]);
+
+        let (included, disabled, skipped) = partition_l1_components(&tree, Some(&reported));
+        assert!(included.is_empty());
+        assert!(disabled.is_empty());
+        assert_eq!(
+            skipped.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+            vec!["vm1"]
+        );
     }
 
     /// Build a signed L1 over `included` + `disabled` (fake CEK/IV/outer — no blob
@@ -1250,8 +1382,11 @@ mod tests {
             ("vm2", vm2),
         ]);
 
-        // No reported state ⇒ vm1 → included, vm2 → disabled bucket, nothing skipped.
-        let (included, disabled, skipped) = partition_l1_components(&tree, None);
+        // The vehicle explicitly reports vm2 enabled, so desired disabled differs.
+        let mut observed_vm2 = wentity(vec![wpart("boot.img", b"K2")]);
+        observed_vm2.admin_disabled = Some(false);
+        let reported = wtree(vec![("vm2", observed_vm2)]);
+        let (included, disabled, skipped) = partition_l1_components(&tree, Some(&reported));
         let inc: Vec<&str> = included.iter().map(|(p, _)| p.as_str()).collect();
         let dis: Vec<&str> = disabled.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(inc, vec!["vm1"], "the enabled member is flashed");
@@ -1485,6 +1620,70 @@ mod tests {
         );
     }
 
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx::test"]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn pinned_vehicle_release_is_unaffected_by_channel_movement(pool: PgPool) {
+        let binding_pool = pool.clone();
+        let app = test_app(pool);
+        let component_id = create_component(&app).await;
+        let enabled = post_json(
+            &app,
+            "/admin/vehicle-releases",
+            serde_json::json!({"tag":"rig","version":"1","members":[component_id]}),
+        )
+        .await["id"]
+            .as_i64()
+            .unwrap();
+        let disabled = post_json(
+            &app,
+            "/admin/vehicle-releases",
+            serde_json::json!({
+                "tag":"rig", "version":"2", "members":[component_id],
+                "disabled_members":[component_id]
+            }),
+        )
+        .await["id"]
+            .as_i64()
+            .unwrap();
+
+        let point_channel = |release| {
+            serde_json::json!({
+                "channel":"bleeding", "device":"rig", "architecture":"arm64",
+                "vehicle_release_id":release
+            })
+        };
+        put_json(&app, "/admin/channel-targets", point_channel(enabled)).await;
+        assert!(
+            release_matches_target(&binding_pool, enabled, "rig", "arm64")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !release_matches_target(&binding_pool, enabled, "rig", "amd64")
+                .await
+                .unwrap()
+        );
+        let pinned_before = get_json(
+            &app,
+            &format!("/channel-targets/tree?vehicle_release_id={enabled}"),
+        )
+        .await;
+        put_json(&app, "/admin/channel-targets", point_channel(disabled)).await;
+        let pinned_after = get_json(
+            &app,
+            &format!("/channel-targets/tree?vehicle_release_id={enabled}"),
+        )
+        .await;
+        let channel = get_json(
+            &app,
+            "/channel-targets/tree?channel=bleeding&device=rig&architecture=arm64",
+        )
+        .await;
+        assert_eq!(pinned_after, pinned_before);
+        assert_eq!(pinned_after["entities"]["ecu-a"]["disabled"], false);
+        assert_eq!(channel["entities"]["ecu-a"]["disabled"], true);
+    }
+
     #[test]
     fn vehicle_identity_ignores_order_and_dupes() {
         assert_eq!(
@@ -1542,6 +1741,7 @@ mod tests {
                 "/admin/channel-targets",
                 put(set_channel_target).get(get_channel_target),
             )
+            .route("/channel-targets/tree", get(channel_target_tree))
             .with_state(state)
     }
 
