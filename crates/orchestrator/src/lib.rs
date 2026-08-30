@@ -889,8 +889,25 @@ fn fanout_l1(l1: &[u8]) -> Result<Vec<L1Component>, Error> {
                 reason: format!("L2 envelope did not decode: {e}"),
             })?,
         };
-        let mut parts = Vec::with_capacity(manifest.component_count());
-        for i in 0..manifest.component_count() {
+        // A **disable-shaped** L2 (`Signer::build_disable_envelope`) carries a
+        // `suit-directive-disable` and no firmware payload: its component id is the
+        // bare `[component]` — no part segment, and nothing to push. Recognized on
+        // the same `disable_target()` directive the flash engine classifies
+        // `UpdateType::Removal` on, narrowed by "carries no image payload" so the
+        // relaxation can never swallow a manifest that does have parts to ship. It
+        // fans out with zero parts, which `l1_jobs` turns into the envelope-only job
+        // the engine's removal path takes. Firmware L2s keep the strict demand below.
+        let part_count = if manifest.disable_target().is_some() && !manifest.has_firmware() {
+            tracing::info!(
+                component = %component,
+                "L1 disable: signed deactivation manifest — fanning out with no parts to push"
+            );
+            0
+        } else {
+            manifest.component_count()
+        };
+        let mut parts = Vec::with_capacity(part_count);
+        for i in 0..part_count {
             // The SUIT component id is `[component, part]`; the part id is segment 1.
             let part = manifest
                 .component_id(i)
@@ -1606,7 +1623,9 @@ fn component_result(s: &EcuStatus) -> ComponentFlashResult {
 mod tests {
     use super::*;
     use sumo_offboard::cose_key::CoseKey;
-    use sumo_offboard::image_builder::{ComponentSpec, MultiComponentBuilder};
+    use sumo_offboard::image_builder::{
+        ComponentSpec, ImageManifestBuilder, MultiComponentBuilder,
+    };
     use sumo_offboard::{keygen, CampaignBuilder};
 
     /// Build one signed L2 image for `component` — a multi-component SUIT envelope
@@ -1627,6 +1646,18 @@ mod tests {
             });
         }
         b.build(key).unwrap()
+    }
+
+    /// Build one signed **disable** L2 for `component` — the same producer call
+    /// `Signer::build_disable_envelope` makes: a no-payload manifest carrying
+    /// `suit-directive-disable`, whose component id is the bare `[component]`.
+    fn build_disable_l2(key: &CoseKey, component: &str) -> Vec<u8> {
+        ImageManifestBuilder::new()
+            .signing_time(1_751_800_000)
+            .sequence_number(1)
+            .component_id(vec![component.to_string()])
+            .build_disable(key)
+            .unwrap()
     }
 
     /// `fanout_l1` decodes the integrated L2s of a signed L1 into per-component
@@ -1679,6 +1710,91 @@ mod tests {
         assert!(matches!(
             fanout_l1(b"not a suit envelope"),
             Err(Error::DecodeL1(_))
+        ));
+    }
+
+    /// A **disable** L2 has no part segment and nothing to push, so the strict
+    /// part-id demand must not apply to it: it fans out as a parts-less component,
+    /// which `l1_jobs` turns into the envelope-only job the engine classifies
+    /// `Removal`. Regression for a converge whose desired tree admin-disables a
+    /// component dying with "the L1 image for component 'rt' is malformed:
+    /// component 0 has no part-id segment".
+    #[test]
+    fn fanout_l1_accepts_a_disable_l2() {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let l2_rt = build_disable_l2(&key, "rt");
+        let l1 = CampaignBuilder::new()
+            .signing_time(1_751_800_000)
+            .sequence_number(1)
+            .add_integrated_image("rt".to_string(), &l2_rt)
+            .build(&key)
+            .unwrap();
+
+        let fanned = fanout_l1(&l1).unwrap();
+        assert_eq!(fanned.len(), 1);
+        assert_eq!(fanned[0].component, "rt");
+        // The signed disable envelope is relayed verbatim — it IS the whole job.
+        assert_eq!(fanned[0].envelope, l2_rt);
+        assert!(fanned[0].parts.is_empty(), "a disable pushes no parts");
+    }
+
+    /// A mixed L1 — one firmware component plus one disable — fans out both, with
+    /// the firmware component's parts read exactly as before.
+    #[test]
+    fn fanout_l1_mixes_firmware_and_disable_components() {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let kernel = ContentHash::of(b"vm1-kernel-ciphertext");
+        let l2_vm1 = build_l2(&key, "vm1", &[("kernel", kernel)]);
+        let l2_rt = build_disable_l2(&key, "rt");
+        let l1 = CampaignBuilder::new()
+            .signing_time(1_751_800_000)
+            .sequence_number(1)
+            .add_integrated_image("vm1".to_string(), &l2_vm1)
+            .add_integrated_image("rt".to_string(), &l2_rt)
+            .build(&key)
+            .unwrap();
+
+        let fanned = fanout_l1(&l1).unwrap();
+        let by: std::collections::BTreeMap<&str, &L1Component> =
+            fanned.iter().map(|c| (c.component.as_str(), c)).collect();
+        assert_eq!(by.len(), 2);
+        assert!(by["rt"].parts.is_empty(), "the disable pushes no parts");
+        assert_eq!(by["vm1"].envelope, l2_vm1);
+        assert_eq!(by["vm1"].parts.len(), 1);
+        assert_eq!(by["vm1"].parts[0].part, "kernel");
+        assert_eq!(by["vm1"].parts[0].outer, kernel);
+    }
+
+    /// The relaxation is NOT a blanket one: a **firmware** L2 (image payload, no
+    /// disable directive) whose component id lost its part segment is malformed and
+    /// still fails — the device pairs pushed payloads to parts by that id.
+    #[test]
+    fn fanout_l1_rejects_a_firmware_l2_without_a_part_id() {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let l2_vm1 = MultiComponentBuilder::new()
+            .signing_time(1_751_800_000)
+            .sequence_number(1)
+            .add_component(ComponentSpec {
+                // Truncated: `[component]` where `[component, part]` is required.
+                id: vec!["vm1".to_string()],
+                digest: vec![0u8; 32],
+                size: 16,
+                uri: ContentHash::of(b"vm1-kernel-ciphertext").to_prefixed(),
+                encryption_info: None,
+            })
+            .build(&key)
+            .unwrap();
+        let l1 = CampaignBuilder::new()
+            .signing_time(1_751_800_000)
+            .sequence_number(1)
+            .add_integrated_image("vm1".to_string(), &l2_vm1)
+            .build(&key)
+            .unwrap();
+
+        assert!(matches!(
+            fanout_l1(&l1),
+            Err(Error::BadL2 { component, reason })
+                if component == "vm1" && reason == "component 0 has no part-id segment"
         ));
     }
 
