@@ -29,9 +29,9 @@ use tokio::sync::Mutex;
 use wire::{ContentHash, Entity, Part, Tree, UpdateMode};
 
 /// SOVD data resource carrying each VM's signed installed inventory.
-const INSTALLED_MANIFEST: &str = "x-sumo-installed-manifest";
+const INSTALLED_MANIFEST: &str = "x-ota-installed-manifest";
 /// SOVD data resource carrying each component's update capability.
-const UPDATE_MODE: &str = "x-sumo-update-mode";
+const UPDATE_MODE: &str = "x-ota-update-mode";
 
 /// Error from the orchestrator.
 #[derive(Debug, thiserror::Error)]
@@ -82,7 +82,7 @@ pub enum Error {
 }
 
 /// The node's update-transaction state, read from the device's
-/// `x-sumo-update-state` vendor resource (`docs/design/node-update-state.md`).
+/// `x-ota-update-state` vendor resource (`docs/design/node-update-state.md`).
 /// The orchestrator polls this to detect an unresolved prior transaction (a node
 /// reboot owed, or a trial awaiting its verdict) before starting a campaign step.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -124,7 +124,7 @@ fn device_http_client(
 }
 
 /// Read the device's node update-transaction state over SOVD
-/// (`GET /vehicle/v1/data/x-sumo-update-state`). A device without the vendor
+/// (`GET /vehicle/v1/data/x-ota-update-state`). A device without the vendor
 /// route (an older image) returns 404 → reported as `Idle`, so a fresh rig just
 /// proceeds.
 pub async fn node_update_state(
@@ -133,7 +133,7 @@ pub async fn node_update_state(
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<NodeUpdateState, Error> {
     let url = format!(
-        "{}/vehicle/v1/data/x-sumo-update-state",
+        "{}/vehicle/v1/data/x-ota-update-state",
         rig_url.trim_end_matches('/')
     );
     let resp = device_http_client(insecure, ca_cert_pem)
@@ -227,14 +227,14 @@ pub async fn read_rig_state(
     Ok(tree)
 }
 
-/// Read flattened `/status` `x-sumo-runtime.admin_state`. Components that omit
+/// Read flattened `/status` `x-runtime.admin_state`. Components that omit
 /// it are non-disableable, represented as unknown rather than implicitly enabled.
 async fn read_admin_disabled(client: &SovdClient, component: &str) -> Result<Option<bool>, Error> {
     let status = client.read_status(component).await?;
     parse_admin_disabled(
         status
             .extensions
-            .get("x-sumo-runtime")
+            .get("x-runtime")
             .and_then(|v| v.get("admin_state")),
     )
 }
@@ -247,10 +247,10 @@ fn parse_admin_disabled(value: Option<&serde_json::Value>) -> Result<Option<bool
         Some("enabled") => Ok(Some(false)),
         Some("disabled") => Ok(Some(true)),
         Some(other) => Err(Error::NodeState(format!(
-            "unknown x-sumo-runtime.admin_state '{other}'"
+            "unknown x-runtime.admin_state '{other}'"
         ))),
         None => Err(Error::NodeState(
-            "x-sumo-runtime.admin_state must be a string".into(),
+            "x-runtime.admin_state must be a string".into(),
         )),
     }
 }
@@ -282,7 +282,7 @@ fn installed_files_to_parts(device: &str, component: &str, files: Vec<InstalledF
     parts
 }
 
-/// Read one component's `x-sumo-update-mode` capability; `None` when the device
+/// Read one component's `x-ota-update-mode` capability; `None` when the device
 /// doesn't serve it (older firmware) or the value doesn't parse. Always-available
 /// on current devices — not gated on a committed manifest.
 async fn read_update_mode(
@@ -371,7 +371,7 @@ pub struct ComponentApply {
     pub version: Option<String>,
     pub ship: Vec<ShipPart>,
     pub reuse: usize,
-    /// The component's rollback capability, from the twin's `x-sumo-update-mode`:
+    /// The component's rollback capability, from the twin's `x-ota-update-mode`:
     /// `Some(true)` = banked (reversible trial), `Some(false)` = singleshot
     /// (irreversible), `None` = not reported. Drives the campaign's step grouping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -658,13 +658,13 @@ pub async fn flash_bundle(
 /// **bound to the device's boot** (`boot_id`, which the boot-bound reset route
 /// verifies), so it is cached **per boot**: a multi-step campaign that reboots
 /// more than once re-mints once the live `boot_id` moves — only a cheap
-/// `x-sumo-boot-id` GET is per-call; the mint itself happens once per boot.
+/// `x-boot-id` GET is per-call; the mint itself happens once per boot.
 pub enum RigToken {
     /// A pre-supplied bearer JWT, used verbatim for every component.
     Static(String),
     /// Mint a per-device JWT, re-minting when the device's boot changes. The
     /// token's audience is the rig's ecu_id — its HSM device-key thumbprint, read
-    /// from `x-sumo-id` — which is what the device verifies, NOT its roster name.
+    /// from `x-ecu-id` — which is what the device verifies, NOT its roster name.
     Mint {
         minter: MinterClient,
         rig_url: String,
@@ -691,7 +691,7 @@ impl RigToken {
 
     /// Mint per-device JWTs from `minter_url` (operator-authenticated to `/mint`).
     /// `rig_url` is the device's SOVD base — the audience is resolved from its
-    /// `x-sumo-id` (the ecu_id) at mint time, never supplied as a name. `insecure`
+    /// `x-ecu-id` (the ecu_id) at mint time, never supplied as a name. `insecure`
     /// (the CLI `--insecure`) skips cert verification on those device reads only;
     /// `ca_cert_pem` (the CLI `--cacert`) instead pins a CA root to verify them.
     /// The minter itself is reached over plain HTTP regardless.
@@ -714,7 +714,7 @@ impl RigToken {
     }
 }
 
-/// GET a small `x-sumo-*` id from the rig, trimmed + unquoted. The `aud` (ecu_id)
+/// GET a small vendor id from the rig, trimmed + unquoted. The `aud` (ecu_id)
 /// and `boot_id` a destructive token must carry are read here — the same ids
 /// `factory-reset.sh` reads, never the roster name and never a stale boot.
 async fn fetch_rig_id(
@@ -758,7 +758,7 @@ async fn fetch_rig_ecu_id(
 ) -> Result<String, EngineError> {
     fetch_rig_id(
         rig_url,
-        "/vehicle/v1/components/hsm/x-sumo-id",
+        "/vehicle/v1/components/hsm/x-ecu-id",
         "ecu id",
         insecure,
         ca_cert_pem,
@@ -775,7 +775,7 @@ async fn fetch_rig_boot_id(
 ) -> Result<String, EngineError> {
     fetch_rig_id(
         rig_url,
-        "/vehicle/v1/status/x-sumo-boot-id",
+        "/vehicle/v1/status/x-boot-id",
         "boot id",
         insecure,
         ca_cert_pem,
@@ -1238,7 +1238,7 @@ pub async fn flash_execute(
     .with_force_ecu_reset(reboot_to_activate);
     // No-mix guard, scoped to this (possibly `only`-filtered) plan: reject a
     // mix of rollbackable + irreversible components, reading each job's
-    // x-sumo-update-mode off the device. The `only` allowlist is how a singleshot
+    // x-ota-update-mode off the device. The `only` allowlist is how a singleshot
     // component (e.g. rt) flashes in its own transaction.
     engine.guard(&plan).await?;
     let mut ecus = engine.stage_all(&plan).await?;
@@ -1761,7 +1761,7 @@ mod tests {
 
     /// A one-component observed tree: the vehicle reports `parts` as `(file-name,
     /// plaintext-sha256)` — the shape `read_rig_state` builds from the device's
-    /// `x-sumo-installed-manifest`.
+    /// `x-ota-installed-manifest`.
     fn observed_of(component: &str, parts: &[(&str, ContentHash)]) -> Tree {
         let mut tree = Tree::default();
         tree.entities.insert(

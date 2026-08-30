@@ -266,7 +266,7 @@ are open strings, so the engine never hardcodes any fleet's component types.
   `vm1/sovd/myapp`); the parent of `a/b/c` is `a/b`.
 - **Part** — an updatable unit on an entity `{ kind, id, content_hash }`. The
   unifying move: *everything* updatable is "a logical id + a content hash" — a
-  bank file → `(vm1, file, "kernel", sha256)` (what `x-sumo-installed-manifest`
+  bank file → `(vm1, file, "kernel", sha256)` (what `x-ota-installed-manifest`
   gives); a container image → `(vm1/sovd/myapp, oci-image, "image", digest)`;
   vehicle parameterization → `(vehicle, param-blob, "params", sha256)`.
 - **Release** — a desired snapshot of the tree (entities + parts), content-
@@ -296,7 +296,7 @@ its keep at Tower 2: when a part *is* shipped, encrypt-once de-dups storage and 
 build step's existence check (`GET /admin/artifacts/{inner}`) skips re-uploads.
 
 **Update mode & the no-mix guard.** The device reports each component's update
-capability (`x-sumo-update-mode`: `banked`/rollbackable vs `singleshot`/
+capability (`x-ota-update-mode`: `banked`/rollbackable vs `singleshot`/
 irreversible — the HSM keystore). `read_rig_state` carries it on the observed
 tree (`Entity.update_mode`, the device is the source of truth), and the guard
 **rejects a campaign that mixes rollbackable with irreversible** components — a

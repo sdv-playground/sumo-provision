@@ -291,7 +291,7 @@ fn device_from_row(r: &sqlx::postgres::PgRow) -> Device {
 
 /// The device's immutable ECU id from its roster pubkey (hex COSE_Key):
 /// lowercase-hex SHA-256 of the key's SPKI DER — the same derivation the
-/// device itself uses for `x-sumo-id`, and the exact string its authorizer
+/// device itself uses for `x-ecu-id`, and the exact string its authorizer
 /// verifies as the token `aud`. `None` when the pubkey is absent/garbled
 /// (an unenrolled or legacy row) rather than an error: the roster read must
 /// not fail over one bad row.

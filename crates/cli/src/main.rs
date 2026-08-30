@@ -125,7 +125,7 @@ enum CaCmd {
         #[arg(long, default_value = "device-decrypt")]
         key_id: String,
         /// CSR file for that slot (DER PKCS#10) — e.g. captured from the rig's
-        /// `…/operations/x-sumo-csr/executions`.
+        /// `…/operations/x-csr/executions`.
         #[arg(long)]
         csr: PathBuf,
         /// Write the issued certificate PEM here (default: stdout). Ignored for

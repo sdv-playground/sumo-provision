@@ -156,7 +156,7 @@ pub struct Device {
     pub pubkey: Option<String>,
     /// The device's immutable ECU id — the lowercase-hex SHA-256 thumbprint of
     /// its device key's SPKI DER, i.e. exactly what the device serves at
-    /// `x-sumo-id` and verifies as the token `aud`. Derived from `pubkey`
+    /// `x-ecu-id` and verifies as the token `aud`. Derived from `pubkey`
     /// (None until enrolled). The roster `id` is a mutable label; THIS is the
     /// crypto identity a minter must put in `aud`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,7 +227,7 @@ pub struct Part {
     pub content: ContentHash,
 }
 
-/// A component's update capability, reported by the device (`x-sumo-update-mode`,
+/// A component's update capability, reported by the device (`x-ota-update-mode`,
 /// the source of truth — the twin only syncs it). `banked` / `supports_rollback`
 /// components are rollbackable; `singleshot` / `!supports_rollback` (the HSM
 /// keystore) is irreversible. Drives the no-mix guard.
@@ -256,7 +256,7 @@ pub struct Entity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     /// The component's update capability, if the device reports it (`None` on
-    /// devices that don't yet serve `x-sumo-update-mode`).
+    /// devices that don't yet serve `x-ota-update-mode`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_mode: Option<UpdateMode>,
     /// The updatable units on this entity.
@@ -269,7 +269,7 @@ pub struct Entity {
     #[serde(default)]
     pub disabled: bool,
     /// Observed administrative state reported by the component. `None` means the
-    /// component omitted `x-sumo-runtime.admin_state` and is unknown/non-disableable.
+    /// component omitted `x-runtime.admin_state` and is unknown/non-disableable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_disabled: Option<bool>,
 }
