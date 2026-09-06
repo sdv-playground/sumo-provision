@@ -234,7 +234,10 @@ enum CfgCmd {
         /// The model's version — NOT this CLI's `--version`.
         #[arg(long)]
         model_version: String,
-        /// JSON file: `{ "<set_id>": { …JSON Schema… }, … }`.
+        /// JSON file: either the bare `{ "<set_id>": { …JSON Schema… }, … }` map
+        /// or a whole `{ "sets": { … } }` body as `GET /schemas/{model}/{version}`
+        /// returns one, so a fetched declaration round-trips. A top level that is
+        /// exactly one key `sets` holding an object is read as the wrapper.
         #[arg(long)]
         sets: PathBuf,
     },
@@ -810,7 +813,7 @@ async fn run_cfg(args: CfgArgs) -> anyhow::Result<()> {
             model_version,
             sets,
         } => {
-            let sets: serde_json::Value = serde_json::from_slice(&std::fs::read(&sets)?)?;
+            let sets = unwrap_sets(serde_json::from_slice(&std::fs::read(&sets)?)?);
             cfg.publish_schema(&model, &model_version, &sets).await?;
             eprintln!("published {model}/{model_version}");
         }
@@ -867,6 +870,23 @@ async fn run_cfg(args: CfgArgs) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The declaration a `--sets` file holds, however it was written.
+///
+/// `GET /schemas/{model}/{version}` answers the whole `{ "sets": { … } }` body,
+/// while a file authored by hand is usually the bare set-id map — so a schema
+/// fetched from one tower can be published to another without an edit. A top
+/// level of exactly one key `sets` whose value is an object is the wrapper; a
+/// declaration whose only set is itself called `sets` is the one shape the two
+/// cannot be told apart in, which is why `--help` says which rule applies.
+fn unwrap_sets(value: serde_json::Value) -> serde_json::Value {
+    match value.as_object() {
+        Some(map) if map.len() == 1 && map.get("sets").is_some_and(|s| s.is_object()) => {
+            map["sets"].clone()
+        }
+        _ => value,
+    }
 }
 
 async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> anyhow::Result<()> {
@@ -1410,4 +1430,28 @@ async fn ping(tower: &TowerClient, url: &str) -> anyhow::Result<()> {
         if healthy { "healthy" } else { "unhealthy" }
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `--sets` file is accepted either way round, and the one shape the rule
+    /// cannot tell apart is the one it is documented to read as the wrapper.
+    #[test]
+    fn a_sets_file_is_read_bare_or_wrapped() {
+        let bare = serde_json::json!({ "vehicle-attributes": { "type": "object" } });
+        assert_eq!(unwrap_sets(bare.clone()), bare);
+
+        let wrapped = serde_json::json!({ "sets": bare.clone() });
+        assert_eq!(unwrap_sets(wrapped), bare);
+
+        // Two keys, one of them `sets`: not the wrapper, so it stands as written.
+        let two = serde_json::json!({ "sets": { "type": "object" }, "other": {} });
+        assert_eq!(unwrap_sets(two.clone()), two);
+
+        // A lone `sets` whose value is NOT an object cannot be the wrapper.
+        let scalar = serde_json::json!({ "sets": true });
+        assert_eq!(unwrap_sets(scalar.clone()), scalar);
+    }
 }

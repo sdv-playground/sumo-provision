@@ -69,6 +69,22 @@ struct L1Req<'a> {
 pub enum ClientError {
     #[error("http transport error: {0}")]
     Http(#[from] reqwest::Error),
+    /// The tower answered with a status and a sentence. `reqwest`'s
+    /// `error_for_status` throws the body away, and a tower's refusal IS the
+    /// body — Tower 3's 400 is the validator naming the key it would not accept
+    /// — so the text is carried instead of discarded.
+    #[error("the tower refused with {status}: {body}")]
+    Refused { status: u16, body: String },
+}
+
+/// A non-success response, read out as the refusal it is.
+async fn refused(resp: reqwest::Response) -> ClientError {
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    ClientError::Refused {
+        status,
+        body: body.trim().to_string(),
+    }
 }
 
 /// A tower's `/version` response.
@@ -592,7 +608,8 @@ impl ConfigClient {
         version: &str,
         sets: &serde_json::Value,
     ) -> Result<(), ClientError> {
-        self.tower
+        let resp = self
+            .tower
             .http
             .put(format!(
                 "{}/admin/schemas/{model}/{version}",
@@ -600,8 +617,10 @@ impl ConfigClient {
             ))
             .json(&SchemaReq { sets })
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        if !resp.status().is_success() {
+            return Err(refused(resp).await);
+        }
         Ok(())
     }
 
@@ -621,20 +640,24 @@ impl ConfigClient {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        Ok(Some(resp.error_for_status()?.json().await?))
+        if !resp.status().is_success() {
+            return Err(refused(resp).await);
+        }
+        Ok(Some(resp.json().await?))
     }
 
     /// `GET /schemas` — every declaration the tower holds, with each one's set ids.
     pub async fn list_schemas(&self) -> Result<Vec<PublishedSchema>, ClientError> {
-        Ok(self
+        let resp = self
             .tower
             .http
             .get(format!("{}/schemas", self.tower.base))
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .await?;
+        if !resp.status().is_success() {
+            return Err(refused(resp).await);
+        }
+        Ok(resp.json().await?)
     }
 
     /// `PUT /admin/vehicles/{vehicle}/assignments/{set}` — assign one vehicle's
@@ -647,7 +670,7 @@ impl ConfigClient {
         version: &str,
         values: &serde_json::Value,
     ) -> Result<Assignment, ClientError> {
-        Ok(self
+        let resp = self
             .tower
             .http
             .put(format!(
@@ -660,10 +683,11 @@ impl ConfigClient {
                 values,
             })
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .await?;
+        if !resp.status().is_success() {
+            return Err(refused(resp).await);
+        }
+        Ok(resp.json().await?)
     }
 
     /// `GET /vehicles/{vehicle}/assignments/{set}` — one assignment, values and
@@ -685,12 +709,15 @@ impl ConfigClient {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        Ok(Some(resp.error_for_status()?.json().await?))
+        if !resp.status().is_success() {
+            return Err(refused(resp).await);
+        }
+        Ok(Some(resp.json().await?))
     }
 
     /// `GET /vehicles/{vehicle}/assignments` — that vehicle's assignments.
     pub async fn list_assignments(&self, vehicle: &str) -> Result<Vec<Assignment>, ClientError> {
-        Ok(self
+        let resp = self
             .tower
             .http
             .get(format!(
@@ -698,10 +725,11 @@ impl ConfigClient {
                 self.tower.base
             ))
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .await?;
+        if !resp.status().is_success() {
+            return Err(refused(resp).await);
+        }
+        Ok(resp.json().await?)
     }
 
     /// `GET /vehicles/{vehicle}/assignments/{set}/blob` — the canonical param-blob
@@ -709,7 +737,7 @@ impl ConfigClient {
     /// them gets the hash the tower reported — and what a Tower 2
     /// `Part { kind: "param-blob" }` references.
     pub async fn get_blob(&self, vehicle: &str, set: &str) -> Result<Vec<u8>, ClientError> {
-        Ok(self
+        let resp = self
             .tower
             .http
             .get(format!(
@@ -717,24 +745,27 @@ impl ConfigClient {
                 self.tower.base
             ))
             .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?
-            .to_vec())
+            .await?;
+        if !resp.status().is_success() {
+            return Err(refused(resp).await);
+        }
+        Ok(resp.bytes().await?.to_vec())
     }
 
     /// `DELETE /admin/vehicles/{vehicle}/assignments/{set}` — withdraw it.
     pub async fn delete_assignment(&self, vehicle: &str, set: &str) -> Result<(), ClientError> {
-        self.tower
+        let resp = self
+            .tower
             .http
             .delete(format!(
                 "{}/admin/vehicles/{vehicle}/assignments/{set}",
                 self.tower.base
             ))
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        if !resp.status().is_success() {
+            return Err(refused(resp).await);
+        }
         Ok(())
     }
 }
