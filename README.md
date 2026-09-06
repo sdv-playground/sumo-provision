@@ -1,8 +1,9 @@
 # sumo-provision
 
 Control plane for provisioning and updating **development / test rigs** that run
-the sumo stack. Two passive "towers" plus an active orchestrator turn rig bring-up
-and software updates into a button-press, instead of hand-run per-rig scripts.
+the sumo stack. Three passive "towers" plus an active orchestrator turn rig
+bring-up and software updates into a button-press, instead of hand-run per-rig
+scripts.
 
 > **⚠ Development / test only.** This is lab infrastructure — not a production
 > OTA or fleet-management system, and not for managing real vehicles. See
@@ -14,10 +15,16 @@ and software updates into a button-press, instead of hand-run per-rig scripts.
   material. Blind to software.
 - **Tower 2 — Software & Signing** (`sumo-hub`): content store, channels, the
   digital twin, and the software signing key.
+- **Tower 3 — Configuration** (`sumo-cfg`): the parameter schema each model
+  version declares (JSON Schema) and what each vehicle was assigned out of it.
+  It signs nothing and delivers nothing: an assignment renders to a canonical
+  blob that Tower 2 carries as a `param-blob` part, content-addressed by hash
+  like everything else. Schema-agnostic — no fleet's parameter grammar is
+  compiled in.
 - **Orchestrator**: the only component that talks to both a tower and a rig —
   reports rig state, asks for an update, and flashes over SOVD.
 
-Neither tower ever connects to a rig; the orchestrator is the single dual-homed
+No tower ever connects to a rig; the orchestrator is the single dual-homed
 component. The full rationale, wire contracts, and crypto model are in
 [`architecture.md`](architecture.md) — the living source of truth for this repo.
 
@@ -47,26 +54,28 @@ Idempotent — safe to re-run.
 ./start.sh
 ```
 
-Builds and starts both towers (`sumo-ca` on `:8080`, `sumo-hub` on `:8081`) plus
-the backing services (postgres, minio), then waits. Press Ctrl-C to shut
-everything down cleanly. Probe a tower with:
+Builds and starts all three towers (`sumo-ca` on `:8080`, `sumo-hub` on `:8081`,
+`sumo-cfg` on `:8082`) plus the backing services (postgres, minio), then waits.
+Press Ctrl-C to shut everything down cleanly. Probe a tower with:
 
 ```sh
 cargo run -p cli -- hub ping            # Tower 2 health/version
 cargo run -p cli -- hub publish FILE    # publish an artifact
+cargo run -p cli -- cfg schemas         # Tower 3 parameter declarations
 ```
 
 ### Container image
 
 `start.sh` runs the towers as host processes (fast dev loop: rebuild with cargo,
 no image rebuild). This repo also ships a **`Dockerfile`** that builds a runtime
-image carrying both binaries (`sumo-ca` + `sumo-hub`) — the packaging seam for
-running the towers in Docker.
+image carrying all three binaries (`sumo-ca` + `sumo-hub` + `sumo-cfg`) — the
+packaging seam for running the towers in Docker.
 
 ```sh
-docker build -t sumo-towers .          # both tower binaries in one image
+docker build -t sumo-towers .          # all three tower binaries in one image
 docker run … sumo-towers sumo-ca       # Tower 1
 docker run … sumo-towers sumo-hub      # Tower 2
+docker run … sumo-towers sumo-cfg      # Tower 3
 ```
 
 The towers are 12-factor (bind / `DATABASE_URL` / key paths are env vars; key

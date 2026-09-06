@@ -1,9 +1,10 @@
 //! `sumo-provision` — tester / operator CLI for the provisioning towers.
 //!
 //! `hub` drives Tower 2 (software): publish artifacts, fetch blobs. `ca` drives
-//! Tower 1 (identity): health today, enrollment as Tower 1 grows. Both build on
-//! the reusable `client` library, so anything embedding the towers shares the
-//! same access layer.
+//! Tower 1 (identity): health today, enrollment as Tower 1 grows. `cfg` drives
+//! Tower 3 (configuration): publish parameter declarations, assign a vehicle's
+//! values. All build on the reusable `client` library, so anything embedding the
+//! towers shares the same access layer.
 
 mod vhsm;
 
@@ -11,7 +12,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use client::{IdentityClient, SoftwareClient, TowerClient};
+use client::{ConfigClient, IdentityClient, SoftwareClient, TowerClient};
 use wire::ContentHash;
 
 #[derive(Parser, Debug)]
@@ -37,6 +38,8 @@ enum Command {
     Hub(HubArgs),
     /// Talk to Tower 1 (identity).
     Ca(CaArgs),
+    /// Talk to Tower 3 (configuration): parameter schemas + vehicle assignments.
+    Cfg(CfgArgs),
     /// Talk to a rig over SOVD.
     Rig(RigArgs),
 }
@@ -207,6 +210,87 @@ enum CaCmd {
         #[arg(long)]
         output: PathBuf,
     },
+}
+
+#[derive(Args, Debug)]
+struct CfgArgs {
+    /// Base URL of Tower 3.
+    #[arg(long, env = "SUMO_CFG_URL", default_value = "http://localhost:8082")]
+    url: String,
+    #[command(subcommand)]
+    cmd: CfgCmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum CfgCmd {
+    /// Publish what a model version declares: a JSON file holding the set id →
+    /// JSON Schema (draft 2020-12) map. Idempotent.
+    PublishSchema {
+        /// Vehicle model (e.g. `managed-cvc`).
+        #[arg(long)]
+        model: String,
+        /// The model's version — NOT this CLI's `--version`.
+        #[arg(long)]
+        model_version: String,
+        /// JSON file: `{ "<set_id>": { …JSON Schema… }, … }`.
+        #[arg(long)]
+        sets: PathBuf,
+    },
+    /// Assign one vehicle's values for one set, validated against the published
+    /// declaration.
+    Assign {
+        /// Vehicle id (e.g. a VIN or rig name).
+        #[arg(long)]
+        vehicle: String,
+        /// Set id, as the declaration names it.
+        #[arg(long)]
+        set: String,
+        /// The model to validate against.
+        #[arg(long)]
+        model: String,
+        /// The model's version to validate against.
+        #[arg(long)]
+        model_version: String,
+        /// JSON file holding the values map.
+        #[arg(long)]
+        values: PathBuf,
+    },
+    /// Show one assignment, values and all.
+    Get {
+        /// Vehicle id.
+        #[arg(long)]
+        vehicle: String,
+        /// Set id.
+        #[arg(long)]
+        set: String,
+    },
+    /// List a vehicle's assignments.
+    List {
+        /// Vehicle id.
+        #[arg(long)]
+        vehicle: String,
+    },
+    /// Print an assignment's canonical param-blob bytes (what `content_hash`
+    /// addresses) to stdout.
+    Blob {
+        /// Vehicle id.
+        #[arg(long)]
+        vehicle: String,
+        /// Set id.
+        #[arg(long)]
+        set: String,
+    },
+    /// Withdraw an assignment.
+    Delete {
+        /// Vehicle id.
+        #[arg(long)]
+        vehicle: String,
+        /// Set id.
+        #[arg(long)]
+        set: String,
+    },
+    /// List the published declarations and their set ids.
+    Schemas,
 }
 
 #[derive(Args, Debug)]
@@ -451,6 +535,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Hub(args) => run_hub(args).await,
         Command::Ca(args) => run_ca(args).await,
+        Command::Cfg(args) => run_cfg(args).await,
         Command::Rig(args) => run_rig(args, cli.insecure, ca_cert_pem.as_deref()).await,
     }
 }
@@ -712,6 +797,70 @@ fn print_device(d: &wire::Device) {
     }
     println!("status  {}", d.status);
     println!("pubkey  {}", d.pubkey.as_deref().unwrap_or("(none)"));
+}
+
+async fn run_cfg(args: CfgArgs) -> anyhow::Result<()> {
+    let cfg = ConfigClient::new(&args.url);
+    match args.cmd {
+        CfgCmd::PublishSchema {
+            model,
+            model_version,
+            sets,
+        } => {
+            let sets: serde_json::Value = serde_json::from_slice(&std::fs::read(&sets)?)?;
+            cfg.publish_schema(&model, &model_version, &sets).await?;
+            eprintln!("published {model}/{model_version}");
+        }
+        CfgCmd::Assign {
+            vehicle,
+            set,
+            model,
+            model_version,
+            values,
+        } => {
+            let values: serde_json::Value = serde_json::from_slice(&std::fs::read(&values)?)?;
+            let a = cfg
+                .assign(&vehicle, &set, &model, &model_version, &values)
+                .await?;
+            println!("set      {}", a.set_id);
+            println!("declared {}/{}", a.model, a.version);
+            println!("revision {}", a.revision);
+            println!("content  {}", a.content_hash);
+        }
+        CfgCmd::Get { vehicle, set } => {
+            let a = cfg.get_assignment(&vehicle, &set).await?;
+            println!("{}", serde_json::to_string_pretty(&a.values)?);
+        }
+        CfgCmd::List { vehicle } => {
+            let assignments = cfg.list_assignments(&vehicle).await?;
+            if assignments.is_empty() {
+                println!("(no assignments for {vehicle})");
+            } else {
+                for a in &assignments {
+                    println!("{:<24} rev {:<5} {}", a.set_id, a.revision, a.content_hash);
+                }
+            }
+        }
+        CfgCmd::Blob { vehicle, set } => {
+            let bytes = cfg.get_blob(&vehicle, &set).await?;
+            std::io::stdout().write_all(&bytes)?;
+        }
+        CfgCmd::Delete { vehicle, set } => {
+            cfg.delete_assignment(&vehicle, &set).await?;
+            eprintln!("withdrew {set} from {vehicle}");
+        }
+        CfgCmd::Schemas => {
+            let schemas = cfg.list_schemas().await?;
+            if schemas.is_empty() {
+                println!("(no declarations published)");
+            } else {
+                for s in &schemas {
+                    println!("{:<20} {:<12} {}", s.model, s.version, s.sets.join(", "));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> anyhow::Result<()> {

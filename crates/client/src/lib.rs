@@ -2,8 +2,9 @@
 //!
 //! Reusable programmatic access for anything that drives the towers — the CLI,
 //! the orchestrator, an onboard reconciler. [`TowerClient`] is the shared base
-//! (health/version, against either tower); [`SoftwareClient`] (Tower 2) and
-//! [`IdentityClient`] (Tower 1) add the per-tower operations, same pattern.
+//! (health/version, against any tower); [`SoftwareClient`] (Tower 2),
+//! [`IdentityClient`] (Tower 1) and [`ConfigClient`] (Tower 3) add the per-tower
+//! operations, same pattern.
 
 use serde::{Deserialize, Serialize};
 use wire::{ArtifactRef, ContentHash, Device, EnrollResponse, RegisterDevice, Tree, TrustBundle};
@@ -28,6 +29,21 @@ struct EnvelopeReq<'a> {
 struct EnvelopePartReq {
     id: String,
     content: ContentHash,
+}
+
+/// `PUT /admin/schemas/{model}/{version}` body (mirrors Tower 3's `SchemaBody`).
+#[derive(Serialize)]
+struct SchemaReq<'a> {
+    sets: &'a serde_json::Value,
+}
+
+/// `PUT /admin/vehicles/{vehicle}/assignments/{set}` body (mirrors Tower 3's
+/// `NewAssignment`).
+#[derive(Serialize)]
+struct AssignReq<'a> {
+    model: &'a str,
+    version: &'a str,
+    values: &'a serde_json::Value,
 }
 
 /// `POST /channel-targets/l1` request body (mirrors Tower 2's `L1Request`).
@@ -516,6 +532,206 @@ impl IdentityClient {
             .error_for_status()?
             .json()
             .await?)
+    }
+}
+
+/// One published declaration, as Tower 3's `GET /schemas` names it.
+#[derive(Debug, Deserialize)]
+pub struct PublishedSchema {
+    pub model: String,
+    pub version: String,
+    /// The set ids the declaration carries.
+    pub sets: Vec<String>,
+}
+
+/// One assignment's identity: which declaration it was validated against, which
+/// write of it this is, and the content address of its canonical blob.
+#[derive(Debug, Deserialize)]
+pub struct Assignment {
+    pub set_id: String,
+    pub model: String,
+    pub version: String,
+    pub revision: i64,
+    pub content_hash: String,
+}
+
+/// An assignment and the values it is a summary of.
+#[derive(Debug, Deserialize)]
+pub struct AssignmentWithValues {
+    #[serde(flatten)]
+    pub assignment: Assignment,
+    pub values: serde_json::Value,
+}
+
+/// Tower 3 (configuration) client: publish declarations, assign a vehicle's
+/// parameter values, read them back — plus the base ops.
+#[derive(Clone)]
+pub struct ConfigClient {
+    tower: TowerClient,
+}
+
+impl ConfigClient {
+    /// Build a Tower 3 client for `base_url` (e.g. `http://localhost:8082`).
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            tower: TowerClient::new(base_url),
+        }
+    }
+
+    /// The shared base client (health / version).
+    pub fn tower(&self) -> &TowerClient {
+        &self.tower
+    }
+
+    /// `PUT /admin/schemas/{model}/{version}` — publish what a model version
+    /// declares: `sets` is a map of set id → JSON Schema (draft 2020-12).
+    /// Idempotent; the tower refuses a set whose schema does not compile.
+    pub async fn publish_schema(
+        &self,
+        model: &str,
+        version: &str,
+        sets: &serde_json::Value,
+    ) -> Result<(), ClientError> {
+        self.tower
+            .http
+            .put(format!(
+                "{}/admin/schemas/{model}/{version}",
+                self.tower.base
+            ))
+            .json(&SchemaReq { sets })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// `GET /schemas/{model}/{version}` — one declaration, as it was published.
+    pub async fn get_schema(
+        &self,
+        model: &str,
+        version: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        Ok(self
+            .tower
+            .http
+            .get(format!("{}/schemas/{model}/{version}", self.tower.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// `GET /schemas` — every declaration the tower holds, with each one's set ids.
+    pub async fn list_schemas(&self) -> Result<Vec<PublishedSchema>, ClientError> {
+        Ok(self
+            .tower
+            .http
+            .get(format!("{}/schemas", self.tower.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// `PUT /admin/vehicles/{vehicle}/assignments/{set}` — assign one vehicle's
+    /// values for one set, validated against `(model, version)`'s declaration.
+    pub async fn assign(
+        &self,
+        vehicle: &str,
+        set: &str,
+        model: &str,
+        version: &str,
+        values: &serde_json::Value,
+    ) -> Result<Assignment, ClientError> {
+        Ok(self
+            .tower
+            .http
+            .put(format!(
+                "{}/admin/vehicles/{vehicle}/assignments/{set}",
+                self.tower.base
+            ))
+            .json(&AssignReq {
+                model,
+                version,
+                values,
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// `GET /vehicles/{vehicle}/assignments/{set}` — one assignment, values and all.
+    pub async fn get_assignment(
+        &self,
+        vehicle: &str,
+        set: &str,
+    ) -> Result<AssignmentWithValues, ClientError> {
+        Ok(self
+            .tower
+            .http
+            .get(format!(
+                "{}/vehicles/{vehicle}/assignments/{set}",
+                self.tower.base
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// `GET /vehicles/{vehicle}/assignments` — that vehicle's assignments.
+    pub async fn list_assignments(&self, vehicle: &str) -> Result<Vec<Assignment>, ClientError> {
+        Ok(self
+            .tower
+            .http
+            .get(format!(
+                "{}/vehicles/{vehicle}/assignments",
+                self.tower.base
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// `GET /vehicles/{vehicle}/assignments/{set}/blob` — the canonical param-blob
+    /// bytes. These are what `content_hash` addresses, so a caller that hashes
+    /// them gets the hash the tower reported — and what a Tower 2
+    /// `Part { kind: "param-blob" }` references.
+    pub async fn get_blob(&self, vehicle: &str, set: &str) -> Result<Vec<u8>, ClientError> {
+        Ok(self
+            .tower
+            .http
+            .get(format!(
+                "{}/vehicles/{vehicle}/assignments/{set}/blob",
+                self.tower.base
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .to_vec())
+    }
+
+    /// `DELETE /admin/vehicles/{vehicle}/assignments/{set}` — withdraw it.
+    pub async fn delete_assignment(&self, vehicle: &str, set: &str) -> Result<(), ClientError> {
+        self.tower
+            .http
+            .delete(format!(
+                "{}/admin/vehicles/{vehicle}/assignments/{set}",
+                self.tower.base
+            ))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 }
 

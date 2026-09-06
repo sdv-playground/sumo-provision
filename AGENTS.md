@@ -1,6 +1,6 @@
 # sumo-provision Index
 
-Rust lab-rig provisioning/update control plane with passive identity/software towers and an active orchestrator.
+Rust lab-rig provisioning/update control plane with passive identity/software/config towers and an active orchestrator.
 
 ## Where to look
 
@@ -9,6 +9,7 @@ Rust lab-rig provisioning/update control plane with passive identity/software to
 - `Cargo.toml` — workspace members.
 - `crates/identity-tower/` — Tower 1 identity/key authority.
 - `crates/software-tower/` — Tower 2 content/channel/signing service.
+- `crates/config-tower/` — Tower 3 parameter-schema/assignment service.
 - `crates/orchestrator/` — dual-homed rig orchestration library.
 - `crates/cli/` — `cargo run -p cli -- ...` command surface.
 - `docker-compose.yml`, `start.sh` — local Postgres/MinIO/soft-HSM tower stack.
@@ -32,7 +33,7 @@ Finding commands:
 
 ```bash
 rg --files -g 'Cargo.toml' -g 'README*' -g 'architecture.md' -g 'docker-compose.yml' -g 'migrations/**'
-rg -n "Tower 1|Tower 2|sumo-ca|sumo-hub|orchestrator|dev-only|production|channel|target release" README.md architecture.md crates docker-compose.yml
+rg -n "Tower 1|Tower 2|Tower 3|sumo-ca|sumo-hub|sumo-cfg|orchestrator|dev-only|production|channel|target release" README.md architecture.md crates docker-compose.yml
 ```
 
 ## Stack
@@ -44,10 +45,11 @@ rg -n "Tower 1|Tower 2|sumo-ca|sumo-hub|orchestrator|dev-only|production|channel
 - Development/test lab infrastructure only; do not position as production OTA/fleet management.
 - Towers are passive; the orchestrator is the only component that talks to both tower and rig.
 - Tower 1 stays identity/key-only; Tower 2 owns software/content/signing.
+- Tower 3 owns configuration assignment; it never signs, never delivers, never dials a rig.
 
 ## Gotchas
 
-- `./start.sh` owns local ports `8080` and `8081` plus backing services.
+- `./start.sh` owns local ports `8080`, `8081` and `8082` plus backing services.
 - Status is early development; architecture may be ahead of code.
 
 ## Missing docs/specs to watch

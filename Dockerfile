@@ -1,16 +1,18 @@
-# Container image for the sumo-provision towers — sumo-ca (Tower 1, identity) and
-# sumo-hub (Tower 2, software). One image carries both binaries; compose runs it
-# twice with a different command. Multi-stage: cargo build on the pinned
-# toolchain, then a slim runtime with just the binaries + a CA bundle.
+# Container image for the sumo-provision towers — sumo-ca (Tower 1, identity),
+# sumo-hub (Tower 2, software) and sumo-cfg (Tower 3, configuration). One image
+# carries all three binaries; compose runs it three times with a different
+# command. Multi-stage: cargo build on the pinned toolchain, then a slim runtime
+# with just the binaries + a CA bundle.
 #
 #   docker build -t sumo-provision/towers .
 #   docker run … sumo-provision/towers sumo-ca      # Tower 1
 #   docker run … sumo-provision/towers sumo-hub     # Tower 2
+#   docker run … sumo-provision/towers sumo-cfg     # Tower 3
 #
 # The towers are 12-factor: bind/DB/paths are env vars (SUMO_CA_BIND,
-# SUMO_HUB_BIND, DATABASE_URL, SUMO_HUB_BLOB_DIR, key paths). Key material
-# auto-generates on first run under the key/data dirs, which compose mounts as
-# named volumes so it persists across restarts. See compose.towers.yml.
+# SUMO_HUB_BIND, SUMO_CFG_BIND, DATABASE_URL, SUMO_HUB_BLOB_DIR, key paths). Key
+# material auto-generates on first run under the key/data dirs, which compose
+# mounts as named volumes so it persists across restarts. See compose.towers.yml.
 
 # ---- builder ---------------------------------------------------------------
 # Pinned to rust-toolchain.toml (1.96.0) so the image build can't drift from a
@@ -26,13 +28,13 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Build only the two tower binaries (not the whole workspace: the cli pulls the
+# Build only the three tower binaries (not the whole workspace: the cli pulls the
 # SOVD flash engine + more, which the towers don't need).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p identity-tower -p software-tower \
+    cargo build --release -p identity-tower -p software-tower -p config-tower \
     && mkdir -p /out \
-    && cp target/release/sumo-ca target/release/sumo-hub /out/
+    && cp target/release/sumo-ca target/release/sumo-hub target/release/sumo-cfg /out/
 
 # ---- runtime ---------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -47,6 +49,7 @@ RUN apt-get update \
 
 COPY --from=builder /out/sumo-ca /usr/local/bin/sumo-ca
 COPY --from=builder /out/sumo-hub /usr/local/bin/sumo-hub
+COPY --from=builder /out/sumo-cfg /usr/local/bin/sumo-cfg
 
 # Non-root. The data/key dirs are volume mount points; compose owns their
 # ownership via the named volumes, and the binaries create files there at runtime.
@@ -57,4 +60,5 @@ USER sumo
 WORKDIR /home/sumo
 
 # No ENTRYPOINT baked in: compose (or `docker run`) passes `sumo-ca` / `sumo-hub`
-# as the command. Both honour their SUMO_*_BIND / DATABASE_URL / key-path envs.
+# / `sumo-cfg` as the command. All honour their SUMO_*_BIND / DATABASE_URL /
+# key-path envs.

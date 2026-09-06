@@ -309,7 +309,64 @@ example — nothing fleet-specific touches the engine.
 
 ---
 
-## 5. The orchestrator
+## 5. Tower 3 — Configuration
+
+Binary: `sumo-cfg`. Owns offboard **configuration**: the parameter schema a model
+version declares, and what each vehicle was assigned out of it.
+
+### Owns / holds / knows / blind-to
+- **Owns** the parameter declarations, keyed by `(model, version)` — a
+  declaration belongs to a *build* of the vehicle, not to any one vehicle — and
+  the per-vehicle assignments, keyed by `(vehicle_id, set_id)`.
+- **Holds** no keys and signs nothing. A configuration that has to be trusted on
+  the wire travels as a `param-blob` part inside a **T2-signed** envelope; the
+  sw-authority key stays where it is.
+- **Knows** JSON Schema (draft 2020-12) and nothing else. A set's declaration is
+  whatever its schema says — compiled at publish time — so no fleet's parameter
+  grammar is compiled into the tower.
+- **Blind to** delivery. T3 does not know whether a vehicle has taken its
+  assignment, and it never dials a rig: the orchestrator carries it, as it
+  carries everything else.
+
+### The `param-blob` bridge to Tower 2
+An assignment renders to a **canonical blob** — compact JSON, five fields in a
+fixed order, `values` keys sorted:
+
+```
+{"set":"vehicle-attributes","model":"managed-cvc","version":"0df1d79","revision":1,"values":{…}}
+```
+
+`content_hash` is `sha256:<hex>` over exactly those bytes, in the same
+`wire::ContentHash` form everything else here is addressed by. So a configuration
+enters the software path as an ordinary part —
+`Part { kind: "param-blob", id: <set_id>, content: <content_hash> }` — and the
+diff, the twin and the signer treat it like any other content. Nothing re-derives
+the bytes: `GET …/blob` serves them, and a client that hashes what it fetched gets
+the hash the tower reported.
+
+Revisions are per `(vehicle, set)` and count from 1: two vehicles given the same
+values are both at revision 1; a vehicle told twice is at 2.
+
+### API (as built — `crates/config-tower`)
+```
+PUT    /admin/schemas/{model}/{version}              publish a declaration (204, idempotent)
+GET    /schemas                                      what is published, and each one's set ids
+GET    /schemas/{model}/{version}                    one declaration, as published
+PUT    /admin/vehicles/{vehicle}/assignments/{set}   assign, validated → the summary
+GET    /vehicles/{vehicle}/assignments               that vehicle's summaries
+GET    /vehicles/{vehicle}/assignments/{set}         one, with its values
+GET    /vehicles/{vehicle}/assignments/{set}/blob    the canonical bytes the hash is over
+DELETE /admin/vehicles/{vehicle}/assignments/{set}   withdraw it (204)
+GET    /healthz   /version
+```
+CLI: `cfg publish-schema / schemas / assign / get / list / blob / delete`.
+
+Its own database (`sumo_cfg`), like T1's and T2's — three towers on one Postgres
+server, three fault domains.
+
+---
+
+## 6. The orchestrator
 
 The campaign loop (`orchestrator::campaign_execute`, driven by
 `rig campaign --channel <name> --device <id> --architecture <arch>`):
@@ -361,7 +418,7 @@ answer is to (a) persist intent durably so the restarted reconciler resumes, and
 
 ---
 
-## 6. Trust & crypto model
+## 7. Trust & crypto model
 
 ### Authorities — where each half lives
 | Authority | Private half | Public half | Signs |
@@ -413,7 +470,7 @@ and deferred.
 
 ---
 
-## 7. Stack & deployment
+## 8. Stack & deployment
 
 - **Language:** Rust across the board (reuses the stack's SUIT/COSE/SOVD tooling).
 - **Deployment:** three rungs. Dev loop: root `docker-compose.yml` brings up the
@@ -444,7 +501,7 @@ as a public crate or integrated at the wire. Track those decisions here.
 
 ---
 
-## 8. Repository layout
+## 9. Repository layout
 
 ```
 sumo-provision/
@@ -459,8 +516,9 @@ sumo-provision/
     │                            diff, flash_plan, hash pair, releases
     ├── identity-tower/       ← T1 service (binary: sumo-ca) + its migrations/
     ├── software-tower/       ← T2 service (binary: sumo-hub) + its migrations/
+    ├── config-tower/         ← T3 service (binary: sumo-cfg) + its migrations/
     ├── orchestrator/         ← the campaign core (embedded by drivers)
-    ├── client/               ← typed T1/T2/minter clients
+    ├── client/               ← typed T1/T2/T3/minter clients
     └── cli/                  ← tester CLI (binary: sumo-provision)
 ```
 
@@ -469,7 +527,7 @@ names.
 
 ---
 
-## 9. Status
+## 10. Status
 
 ### Locked
 - Dev/test only; production stays on the offline signing path.
@@ -505,7 +563,7 @@ names.
 
 ---
 
-## 10. Roadmap
+## 11. Roadmap
 
 ### Built (the load-bearing path)
 1. **T2 content core** — encrypt-once publish (`POST /admin/artifacts`,
@@ -517,7 +575,7 @@ names.
 3. **Per-device signing** — sw-authority ES256 key; `POST /channel-targets/l1`
    returns the delta L1 campaign signed per device (CEK re-wrapped via ECDH, no
    re-encryption); `POST /admin/envelope` + `GET /admin/signer/pubkey`.
-4. **The campaign loop** — `orchestrator::campaign_execute` (§5): observe over
+4. **The campaign loop** — `orchestrator::campaign_execute` (§6): observe over
    SOVD → signed L1 → fan out L2s → shared flash-engine lifecycle
    (stage → reset → health-gate → commit/rollback), no-mix guard, manifest-only
    push for unchanged components, boot-aware JWT re-mint. Verdict commands
@@ -540,7 +598,7 @@ names.
 
 ---
 
-## 11. Going public (later)
+## 12. Going public (later)
 Before this repo is published: add a LICENSE, a CONTRIBUTING guide, CI, and a
 security policy; scrub any internal references; confirm every dependency is a
-public crate or wire-level integration (§7).
+public crate or wire-level integration (§8).

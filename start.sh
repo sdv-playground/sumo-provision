@@ -2,9 +2,9 @@
 #
 # start.sh — run the sumo-provision stack locally, tear it down on Ctrl-C.
 #
-# Builds and starts both towers (sumo-ca on :8080, sumo-hub on :8081) plus the
-# backing services (postgres, minio) via docker compose, then waits. Press
-# Ctrl-C to shut everything down cleanly.
+# Builds and starts all three towers (sumo-ca on :8080, sumo-hub on :8081,
+# sumo-cfg on :8082) plus the backing services (postgres, minio) via docker
+# compose, then waits. Press Ctrl-C to shut everything down cleanly.
 set -euo pipefail
 
 cd "$(dirname "$0")" || exit 1
@@ -75,7 +75,7 @@ if [ "${#COMPOSE[@]}" -gt 0 ]; then
         # Each tower uses its OWN database (separate fault domains). createdb is
         # the idempotent step: it creates the db, or reports it already exists.
         # Either branch continues — a re-run never aborts the stack.
-        for db in sumo_hub sumo_ca; do
+        for db in sumo_hub sumo_ca sumo_cfg; do
             if "${COMPOSE[@]}" exec -T postgres createdb -U sumo "$db" 2>/dev/null; then
                 echo "    created $db"
             else
@@ -91,10 +91,12 @@ else
 fi
 
 # 3. Towers.
-echo "==> Starting sumo-ca (Tower 1, :8080) and sumo-hub (Tower 2, :8081)..."
+echo "==> Starting sumo-ca (Tower 1, :8080), sumo-hub (Tower 2, :8081) and sumo-cfg (Tower 3, :8082)..."
 ./target/debug/sumo-ca &
 TOWER_PIDS+=("$!")
 ./target/debug/sumo-hub &
+TOWER_PIDS+=("$!")
+./target/debug/sumo-cfg &
 TOWER_PIDS+=("$!")
 
 echo "==> Stack is up. Press Ctrl-C to stop."

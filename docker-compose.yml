@@ -1,12 +1,12 @@
 # Local development backing services for sumo-provision.
 #
 # Brings up the infrastructure the towers depend on:
-#   - postgres : metadata / index for both towers
+#   - postgres : metadata / index / config store for the towers
 #   - minio    : S3-compatible object store for Tower 2 content blobs
 #
-# Tower 1 and Tower 2 use SEPARATE Postgres databases (created with the
-# persistence step) so they stay in separate fault domains — a Tower 2
-# compromise must not read Tower 1's identity data.
+# Each tower uses its OWN Postgres database (created with the persistence step)
+# so they stay in separate fault domains — a Tower 2 compromise must not read
+# Tower 1's identity data.
 #
 # Data is bind-mounted under ./data so it's visible/editable on the host. The
 # containers run as the invoking user's UID:GID (DOCKER_UID / DOCKER_GID, which
