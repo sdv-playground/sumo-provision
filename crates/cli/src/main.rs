@@ -223,6 +223,8 @@ struct CfgArgs {
 
 #[derive(Subcommand, Debug)]
 enum CfgCmd {
+    /// Probe health + version.
+    Ping,
     /// Publish what a model version declares: a JSON file holding the set id →
     /// JSON Schema (draft 2020-12) map. Idempotent.
     PublishSchema {
@@ -802,6 +804,7 @@ fn print_device(d: &wire::Device) {
 async fn run_cfg(args: CfgArgs) -> anyhow::Result<()> {
     let cfg = ConfigClient::new(&args.url);
     match args.cmd {
+        CfgCmd::Ping => ping(cfg.tower(), &args.url).await?,
         CfgCmd::PublishSchema {
             model,
             model_version,
@@ -828,7 +831,10 @@ async fn run_cfg(args: CfgArgs) -> anyhow::Result<()> {
             println!("content  {}", a.content_hash);
         }
         CfgCmd::Get { vehicle, set } => {
-            let a = cfg.get_assignment(&vehicle, &set).await?;
+            let a = cfg
+                .get_assignment(&vehicle, &set)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("{vehicle} has no assignment of '{set}'"))?;
             println!("{}", serde_json::to_string_pretty(&a.values)?);
         }
         CfgCmd::List { vehicle } => {

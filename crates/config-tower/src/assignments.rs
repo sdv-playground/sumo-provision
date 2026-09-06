@@ -56,6 +56,14 @@ pub struct Detail {
 /// The revision is the previous one plus one and is per `(vehicle, set)`: it
 /// counts what this vehicle was told about this set, so two vehicles given the
 /// same values are both at revision 1 and a vehicle told twice is at 2.
+///
+/// READ AND WRITE ARE ONE TRANSACTION, and the read takes `FOR UPDATE`. The
+/// revision is not a column the database increments — it is read, put into the
+/// blob and hashed, then written — so two concurrent writes of the same pair
+/// that both read revision N would both render a blob claiming N+1, and the one
+/// the upsert did not keep would have handed its caller a `content_hash` over
+/// bytes the tower no longer holds. The row lock serialises the pair; writes of
+/// different pairs never meet.
 pub async fn put_assignment(
     State(pool): State<PgPool>,
     Path((vehicle_id, set_id)): Path<(String, String)>,
@@ -79,12 +87,13 @@ pub async fn put_assignment(
         return Err(AppError::BadRequest(refusal(&e)));
     }
 
+    let mut tx = pool.begin().await?;
     let previous: Option<i64> = sqlx::query_scalar(
-        "SELECT revision FROM assignments WHERE vehicle_id = $1 AND set_id = $2",
+        "SELECT revision FROM assignments WHERE vehicle_id = $1 AND set_id = $2 FOR UPDATE",
     )
     .bind(&vehicle_id)
     .bind(&set_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let revision = previous.unwrap_or(0) + 1;
     let content_hash = blob::hash(&blob::render(&Blob {
@@ -111,8 +120,9 @@ pub async fn put_assignment(
     .bind(revision)
     .bind(&content_hash)
     .bind(&instance)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     Ok(Json(Summary {
         set_id,

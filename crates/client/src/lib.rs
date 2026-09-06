@@ -605,21 +605,23 @@ impl ConfigClient {
         Ok(())
     }
 
-    /// `GET /schemas/{model}/{version}` — one declaration, as it was published.
+    /// `GET /schemas/{model}/{version}` — one declaration, as it was published;
+    /// `None` if that model version has published nothing.
     pub async fn get_schema(
         &self,
         model: &str,
         version: &str,
-    ) -> Result<serde_json::Value, ClientError> {
-        Ok(self
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        let resp = self
             .tower
             .http
             .get(format!("{}/schemas/{model}/{version}", self.tower.base))
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(resp.error_for_status()?.json().await?))
     }
 
     /// `GET /schemas` — every declaration the tower holds, with each one's set ids.
@@ -664,13 +666,14 @@ impl ConfigClient {
             .await?)
     }
 
-    /// `GET /vehicles/{vehicle}/assignments/{set}` — one assignment, values and all.
+    /// `GET /vehicles/{vehicle}/assignments/{set}` — one assignment, values and
+    /// all; `None` if that vehicle has no assignment of that set.
     pub async fn get_assignment(
         &self,
         vehicle: &str,
         set: &str,
-    ) -> Result<AssignmentWithValues, ClientError> {
-        Ok(self
+    ) -> Result<Option<AssignmentWithValues>, ClientError> {
+        let resp = self
             .tower
             .http
             .get(format!(
@@ -678,10 +681,11 @@ impl ConfigClient {
                 self.tower.base
             ))
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(resp.error_for_status()?.json().await?))
     }
 
     /// `GET /vehicles/{vehicle}/assignments` — that vehicle's assignments.
