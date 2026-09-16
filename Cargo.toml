@@ -21,7 +21,7 @@ client = { path = "crates/client" }
 orchestrator = { path = "crates/orchestrator" }
 
 # external — SOVD client lib (open-source; git-pinned now, published dep later)
-sovd-client = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+sovd-client = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.0" }
 # external — shared SOVD flash execution engine (FlashPlan → guard → stage →
 # reset → verdict). rig is a thin adapter over it; campaign + onboard share it.
 sumo-sovd-flash-engine = { git = "https://github.com/sdv-playground/sumo-sovd.git", branch = "main" }
