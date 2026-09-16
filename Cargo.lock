@@ -2790,7 +2790,7 @@ dependencies = [
 [[package]]
 name = "sumo-offboard"
 version = "0.1.0"
-source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.3#80466c06ac870b0887ce2b56b2b39747c57b0482"
+source = "git+https://github.com/tr-sdv-sandbox/sumo-rs.git?tag=v0.1.3#ef1afa4fed917b230b194c2fb213698c55fa558c"
 dependencies = [
  "ciborium",
  "coset",
