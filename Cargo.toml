@@ -28,11 +28,11 @@ sumo-sovd-flash-engine = { git = "https://github.com/sdv-playground/sumo-sovd.gi
 # external — HSM keystore schema (HsmKeystore / KeySlot / payload::encode + the
 # factory signing keys + KeyRole). default-features=false → schema + enums only
 # (no suit/crypto, no sumo-rs pull). Tower 1 mints the keystore against this.
-hsm = { git = "https://github.com/sdv-playground/sumo-machine-manager.git", tag = "v0.1.2", default-features = false }
+hsm = { git = "https://github.com/sdv-playground/sumo-machine-manager.git", tag = "v0.1.3", default-features = false }
 # external — the vHSM wire/contract crate. The CLI's off-box CWT minter imports
 # the CWT claim labels + audience from vhsm_proto::cwt — the same definitions
 # the on-device daemon validates against, so the two ends cannot drift.
-vhsm-proto = { git = "https://github.com/sdv-playground/sumo-machine-manager.git", tag = "v0.1.2" }
+vhsm-proto = { git = "https://github.com/sdv-playground/sumo-machine-manager.git", tag = "v0.1.3" }
 # external — sumo-rs SUIT toolkit (open-source): encrypt-once + per-device CEK
 # rewrap, manifest signing. Tower 2 reuses it so we don't fork the envelope format.
 sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
