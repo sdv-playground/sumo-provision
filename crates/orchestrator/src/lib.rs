@@ -396,6 +396,7 @@ impl ComponentApply {
 pub struct ApplyPlan {
     pub channel: String,
     pub components: Vec<ComponentApply>,
+    pub assessment: wire::ConvergenceAssessment,
 }
 
 impl ApplyPlan {
@@ -520,6 +521,7 @@ pub async fn apply_plan(
         channel: target.label(),
     })?;
     let plan = wire::flash_plan(&observed, &desired);
+    let assessment = wire::assess_tree(&observed, &desired);
 
     let mut components = Vec::new();
     for (path, entity) in &desired.entities {
@@ -564,6 +566,7 @@ pub async fn apply_plan(
     Ok(ApplyPlan {
         channel: target.channel.clone(),
         components,
+        assessment,
     })
 }
 

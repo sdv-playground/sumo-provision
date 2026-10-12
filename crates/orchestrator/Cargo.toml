@@ -27,3 +27,5 @@ tracing = { workspace = true }
 [dev-dependencies]
 # build a signed L1 (campaign of L2 images) in-test to exercise the fan-out decode.
 sumo-offboard = { workspace = true }
+axum = { workspace = true }
+sovd-client = { workspace = true, features = ["test-util"] }

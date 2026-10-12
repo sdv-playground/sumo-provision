@@ -320,6 +320,85 @@ impl TreeDiff {
     }
 }
 
+/// Typed convergence decision for one observed/desired snapshot. Trial and reboot
+/// phases are separate node observations; this type never implies commitment.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssessmentOutcome {
+    #[default]
+    Converged,
+    ConvergedIgnoringDeviceOnly,
+    Deferred,
+    Actionable,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvergenceAssessment {
+    pub outcome: AssessmentOutcome,
+    pub components: Vec<String>,
+    pub ignored_device_only_entities: Vec<String>,
+}
+
+impl ConvergenceAssessment {
+    pub fn is_converged(&self) -> bool {
+        matches!(
+            self.outcome,
+            AssessmentOutcome::Converged | AssessmentOutcome::ConvergedIgnoringDeviceOnly
+        )
+    }
+}
+
+/// Assess desired membership, content, and administrative state together.
+/// Components only on the device are explicitly ignored; an advertised component
+/// retaining installed content while disabled is converged once admin state agrees.
+pub fn assess_tree(observed: &Tree, desired: &Tree) -> ConvergenceAssessment {
+    let delta = diff(observed, desired);
+    let mut actionable = BTreeSet::new();
+    for id in &delta.entities_added {
+        if desired.entities.get(id).is_some_and(|e| !e.disabled) {
+            actionable.insert(id.clone());
+        }
+    }
+    for part in &delta.parts {
+        let Some(want) = desired.entities.get(&part.entity) else {
+            continue;
+        };
+        let admin = observed
+            .entities
+            .get(&part.entity)
+            .and_then(|e| e.admin_disabled);
+        if !want.disabled || admin == Some(false) {
+            actionable.insert(part.entity.clone());
+        }
+    }
+    for (id, want) in &desired.entities {
+        let admin = observed.entities.get(id).and_then(|e| e.admin_disabled);
+        if (want.disabled && admin == Some(false)) || (!want.disabled && admin == Some(true)) {
+            actionable.insert(id.clone());
+        }
+    }
+    let components: Vec<String> = actionable.into_iter().collect();
+    let outcome = if components.is_empty() {
+        if delta.entities_removed.is_empty() {
+            AssessmentOutcome::Converged
+        } else {
+            AssessmentOutcome::ConvergedIgnoringDeviceOnly
+        }
+    } else if components
+        .iter()
+        .all(|id| !observed.entities.contains_key(id))
+    {
+        AssessmentOutcome::Deferred
+    } else {
+        AssessmentOutcome::Actionable
+    };
+    ConvergenceAssessment {
+        outcome,
+        components,
+        ignored_device_only_entities: delta.entities_removed,
+    }
+}
+
 /// Diff `observed` against `desired`: the changes that would bring `observed`
 /// up to `desired`. Pure and schema-agnostic — entities compared by path, parts
 /// by `(id, content hash)`.

@@ -829,17 +829,31 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
             let plan =
                 orchestrator::apply_plan(&args.url, &hub_url, &target, None, insecure, ca_cert_pem)
                     .await?;
+            if plan.assessment.outcome == wire::AssessmentOutcome::Deferred
+                && only
+                    .as_deref()
+                    .is_none_or(|id| plan.assessment.components.iter().any(|c| c == id))
+            {
+                anyhow::bail!(
+                    "campaign deferred: desired component(s) {:?} are not advertised by the device",
+                    plan.assessment.components
+                );
+            }
             let shipping: Vec<&orchestrator::ComponentApply> = plan
                 .components
                 .iter()
-                .filter(|c| !c.ship.is_empty())
+                .filter(|c| !c.ship.is_empty() && only.as_deref().is_none_or(|id| id == c.entity))
                 .collect();
-            if shipping.is_empty() {
+            if !campaign_has_work(&plan, only.as_deref()) {
                 println!(
                     "up to date — nothing to flash for channel '{}'",
                     sel.channel
                 );
                 return Ok(());
+            }
+            let admin_only = shipping.is_empty();
+            if admin_only {
+                println!("administrative-only or removal drift — signed campaign still required");
             }
             // Singleshot (irreversible) components each flash in their own
             // transaction; banked (reversible trial) ones flash together. Singleshot
@@ -847,7 +861,14 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
             let (singleshot, banked): (Vec<&orchestrator::ComponentApply>, Vec<_>) = shipping
                 .into_iter()
                 .partition(|c| c.supports_rollback == Some(false));
-            print_campaign(&sel.channel, &auth.device_id, &singleshot, &banked);
+            if admin_only {
+                println!(
+                    "Campaign — apply administrative/removal change(s) to {:?}",
+                    plan.assessment.components
+                );
+            } else {
+                print_campaign(&sel.channel, &auth.device_id, &singleshot, &banked);
+            }
             if !execute {
                 println!("\n(plan only — re-run with --execute to run the campaign)");
                 return Ok(());
@@ -1193,6 +1214,55 @@ fn print_flash_result(r: &orchestrator::FlashResult, trial_hint: bool) {
         println!(
             "\nin trial — the rig rebooted into the staged bank. When healthy, finalize:\n  ./commit.sh   (or `rig rollback …` to revert)"
         );
+    }
+}
+
+fn campaign_has_work(plan: &orchestrator::ApplyPlan, only: Option<&str>) -> bool {
+    plan.components
+        .iter()
+        .any(|c| !c.ship.is_empty() && only.is_none_or(|id| id == c.entity))
+        || plan
+            .assessment
+            .components
+            .iter()
+            .any(|c| only.is_none_or(|id| id == c))
+}
+
+#[cfg(test)]
+mod campaign_gate_tests {
+    use super::*;
+
+    #[test]
+    fn administrative_only_drift_reaches_campaign_without_byte_transfer() {
+        let mut observed = wire::Tree::default();
+        observed.entities.insert(
+            "vm1".into(),
+            wire::Entity {
+                admin_disabled: Some(false),
+                ..Default::default()
+            },
+        );
+        let mut desired = wire::Tree::default();
+        desired.entities.insert(
+            "vm1".into(),
+            wire::Entity {
+                disabled: true,
+                ..Default::default()
+            },
+        );
+        let plan = orchestrator::ApplyPlan {
+            assessment: wire::assess_tree(&observed, &desired),
+            ..Default::default()
+        };
+        assert!(campaign_has_work(&plan, None));
+        assert!(campaign_has_work(&plan, Some("vm1")));
+        assert!(!campaign_has_work(&plan, Some("vm2")));
+        desired.entities.get_mut("vm1").unwrap().disabled = false;
+        let converged = orchestrator::ApplyPlan {
+            assessment: wire::assess_tree(&observed, &desired),
+            ..Default::default()
+        };
+        assert!(!campaign_has_work(&converged, None));
     }
 }
 
