@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
-# license: TBD before this repository is made public (see README.md).
+license = "Apache-2.0"
 
 [workspace.dependencies]
 # internal

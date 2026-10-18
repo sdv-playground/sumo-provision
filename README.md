@@ -81,4 +81,4 @@ the stack `sumo-autoloader` supervises for its pull-and-run delivery.
 
 ## License
 
-To be decided before this repository is made public.
+Apache-2.0. See [LICENSE](LICENSE).
