@@ -82,7 +82,7 @@ pub enum Error {
 }
 
 /// The node's update-transaction state, read from the device's
-/// `x-ota-update-state` vendor resource (`docs/design/node-update-state.md`).
+/// `x-update-state` vendor resource.
 /// The orchestrator polls this to detect an unresolved prior transaction (a node
 /// reboot owed, or a trial awaiting its verdict) before starting a campaign step.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -90,6 +90,10 @@ pub struct NodeUpdateState {
     pub phase: String,
     #[serde(default)]
     pub components: Vec<String>,
+    /// The node's current boot id, when the device reports one. Lets the
+    /// orchestrator tell a fresh boot from a stale poll; not acted on yet.
+    #[serde(default)]
+    pub node_boot_id: Option<String>,
 }
 
 impl NodeUpdateState {
@@ -124,7 +128,7 @@ fn device_http_client(
 }
 
 /// Read the device's node update-transaction state over SOVD
-/// (`GET /vehicle/v1/data/x-ota-update-state`). A device without the vendor
+/// (`GET /vehicle/v1/data/x-update-state`). A device without the vendor
 /// route (an older image) returns 404 → reported as `Idle`, so a fresh rig just
 /// proceeds.
 pub async fn node_update_state(
@@ -133,7 +137,7 @@ pub async fn node_update_state(
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<NodeUpdateState, Error> {
     let url = format!(
-        "{}/vehicle/v1/data/x-ota-update-state",
+        "{}/vehicle/v1/data/x-update-state",
         rig_url.trim_end_matches('/')
     );
     let resp = device_http_client(insecure, ca_cert_pem)
@@ -146,6 +150,7 @@ pub async fn node_update_state(
         return Ok(NodeUpdateState {
             phase: "Idle".to_string(),
             components: Vec::new(),
+            node_boot_id: None,
         });
     }
     resp.error_for_status()
