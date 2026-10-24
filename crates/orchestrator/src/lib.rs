@@ -128,24 +128,31 @@ fn device_http_client(
 }
 
 /// Read the device's node update-transaction state over SOVD
-/// (`GET /vehicle/v1/data/x-update-state`). A device without the vendor
-/// route (an older image) returns 404 → reported as `Idle`, so a fresh rig just
-/// proceeds.
+/// (`GET /vehicle/v1/data/x-update-state`). Transitional: a device from before
+/// the x-update aliases answers 404 there and is asked at the legacy
+/// `x-ota-update-state` instead (remove with the x-ota retirement). A device
+/// with neither route (an older image still) returns 404 → reported as `Idle`,
+/// so a fresh rig just proceeds.
 pub async fn node_update_state(
     rig_url: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<NodeUpdateState, Error> {
-    let url = format!(
-        "{}/vehicle/v1/data/x-update-state",
-        rig_url.trim_end_matches('/')
-    );
-    let resp = device_http_client(insecure, ca_cert_pem)
-        .map_err(|e| Error::NodeState(e.to_string()))?
-        .get(&url)
+    let client =
+        device_http_client(insecure, ca_cert_pem).map_err(|e| Error::NodeState(e.to_string()))?;
+    let base = rig_url.trim_end_matches('/');
+    let mut resp = client
+        .get(format!("{base}/vehicle/v1/data/x-update-state"))
         .send()
         .await
         .map_err(|e| Error::NodeState(e.to_string()))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        resp = client
+            .get(format!("{base}/vehicle/v1/data/x-ota-update-state"))
+            .send()
+            .await
+            .map_err(|e| Error::NodeState(e.to_string()))?;
+    }
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(NodeUpdateState {
             phase: "Idle".to_string(),
