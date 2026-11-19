@@ -185,11 +185,17 @@ impl NodeTopology {
     /// The path of component `id`'s entity: `/vehicle/v1/components/{id}` (root,
     /// flat) or `/vehicle/v1/components/{node}/subcomponents/{id}` (node form).
     pub fn component_path(&self, id: &str) -> String {
+        format!("/vehicle/v1/components/{}", self.component_id(id))
+    }
+
+    /// Component `id` as a [`SovdClient`] component id — its path below
+    /// `/vehicle/v1/components/`: `{id}` (root) or `{node}/subcomponents/{id}`
+    /// (node form). sovd-client splices the id into its URLs verbatim
+    /// (`read_data`, `read_status`, …), so this addresses the subcomponent.
+    pub fn component_id(&self, id: &str) -> String {
         match self {
-            NodeTopology::Root => format!("/vehicle/v1/components/{id}"),
-            NodeTopology::Node(node) => {
-                format!("/vehicle/v1/components/{node}/subcomponents/{id}")
-            }
+            NodeTopology::Root => id.to_string(),
+            NodeTopology::Node(node) => format!("{node}/subcomponents/{id}"),
         }
     }
 
@@ -377,29 +383,66 @@ async fn connect_sovd(
 /// Read a rig's observed state over SOVD as a [`wire::Tree`]: each component is
 /// an entity, and the files in its signed installed manifest are its parts
 /// (`kind = "file"`, `id = path`, `content = sha256`). Components with no signed
-/// manifest come back as entities with no parts.
+/// manifest come back as entities with no parts. On a node-topology device (see
+/// [`NodeTopology`]) the components are the node's subcomponents, listed at
+/// `components/{node}/subcomponents` and read there; the tree keys them by their
+/// plain id either way.
 pub async fn read_rig_state(
     sovd_url: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<Tree, Error> {
-    let (client, components) = connect_sovd(sovd_url, insecure, ca_cert_pem).await?;
+    let (client, mut components) = connect_sovd(sovd_url, insecure, ca_cert_pem).await?;
+    // The scheme-probed base the client connected on, for the raw discovery GETs.
+    let base = client.base_url().as_str().trim_end_matches('/').to_string();
+    let topology = discover_node_topology(client.http_client(), &base)
+        .await
+        .unwrap_or(NodeTopology::Root);
+    if let NodeTopology::Node(node) = &topology {
+        components = list_subcomponents(client.http_client(), &base, node).await?;
+    }
     let mut tree = Tree::default();
     for c in components {
         let mut entity = Entity {
             kind: c.component_type.unwrap_or_default(),
             ..Default::default()
         };
-        if let Some(m) = read_installed(&client, &c.id).await? {
+        let at = topology.component_id(&c.id);
+        if let Some(m) = read_installed(&client, &at).await? {
             let label = format!("{} {}", m.identity.name, m.identity.version);
             entity.version = Some(label.trim().to_string());
             entity.parts = installed_files_to_parts(sovd_url, &c.id, m.files);
         }
-        entity.update_mode = read_update_mode(&client, &c.id).await?;
-        entity.admin_disabled = read_admin_disabled(&client, &c.id).await?;
+        entity.update_mode = read_update_mode(&client, &at).await?;
+        entity.admin_disabled = read_admin_disabled(&client, &at).await?;
         tree.entities.insert(c.id, entity);
     }
     Ok(tree)
+}
+
+/// `GET {base}/vehicle/v1/components/{node}/subcomponents` — a node's components,
+/// in the same collection shape as `GET /components`.
+async fn list_subcomponents(
+    client: &reqwest::Client,
+    base: &str,
+    node: &str,
+) -> Result<Vec<sovd_client::Component>, Error> {
+    #[derive(Deserialize)]
+    struct Collection {
+        #[serde(default)]
+        items: Vec<sovd_client::Component>,
+    }
+    let url = format!("{base}/vehicle/v1/components/{node}/subcomponents");
+    let fail = |e: String| Error::NodeState(format!("list {url}: {e}"));
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| fail(e.to_string()))?
+        .error_for_status()
+        .map_err(|e| fail(e.to_string()))?;
+    let body: Collection = resp.json().await.map_err(|e| fail(e.to_string()))?;
+    Ok(body.items)
 }
 
 /// Read flattened `/status` `x-runtime.admin_state`. Components that omit

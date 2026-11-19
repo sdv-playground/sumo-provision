@@ -98,6 +98,70 @@ async fn server_with_fixture(fixture: Fixture) -> TestServer {
     TestServer::start(router).await.expect("SOVD test server")
 }
 
+/// The same components served by a node-topology device: `/components` lists only
+/// the node `cvc` (its document links its subcomponents), the components are its
+/// subcomponents, and the flat `components/{id}/…` paths are not served (404).
+async fn node_server_with_fixture(fixture: Fixture) -> TestServer {
+    let sub = "/vehicle/v1/components/cvc/subcomponents";
+    let router = Router::new()
+        .route(
+            "/vehicle/v1/components",
+            get(|| async { Json(json!({"items": [{"id": "cvc", "name": "CVC"}]})) }),
+        )
+        .route(
+            "/vehicle/v1/components/cvc",
+            get(|| async {
+                Json(json!({
+                    "id": "cvc",
+                    "name": "CVC",
+                    "subcomponents": "/vehicle/v1/components/cvc/subcomponents",
+                }))
+            }),
+        )
+        .route(sub, get(components))
+        .route(&format!("{sub}/{{component}}/data/{{param}}"), get(data))
+        .route(&format!("{sub}/{{component}}/status"), get(status))
+        .with_state(fixture);
+    TestServer::start(router).await.expect("SOVD test server")
+}
+
+#[tokio::test]
+async fn rig_state_reads_the_subcomponents_of_a_node() {
+    let server = node_server_with_fixture(Fixture {
+        admin: AdminObservation::Disabled,
+        include_vm2: true,
+    })
+    .await;
+    let tree = read_rig_state(&server.base_url(), false, None)
+        .await
+        .expect("read the node's subcomponents");
+    let ids: Vec<&str> = tree.entities.keys().map(String::as_str).collect();
+    assert_eq!(ids, ["vm1", "vm2"], "the node itself is not an entity");
+    let vm1 = &tree.entities["vm1"];
+    assert_eq!(vm1.kind, "vm");
+    assert_eq!(vm1.version.as_deref(), Some("guest 1.2"));
+    assert_eq!(vm1.admin_disabled, Some(true));
+    assert_eq!(vm1.parts.len(), 1);
+    let mode = tree.entities["vm2"]
+        .update_mode
+        .as_ref()
+        .expect("vm2's capability, read off its subcomponent");
+    assert_eq!(mode.mode, "banked");
+}
+
+#[tokio::test]
+async fn rig_state_on_a_single_component_flat_device_reads_it_flat() {
+    // One component, no `subcomponents` link: a flat device, not a node — vm1 is
+    // read at `components/vm1/…` and is the tree's entity.
+    let server = server(AdminObservation::Enabled).await;
+    let tree = read_rig_state(&server.base_url(), false, None)
+        .await
+        .expect("read the lone flat component");
+    let ids: Vec<&str> = tree.entities.keys().map(String::as_str).collect();
+    assert_eq!(ids, ["vm1"]);
+    assert_eq!(tree.entities["vm1"].parts.len(), 1);
+}
+
 #[tokio::test]
 async fn rig_state_keeps_advertised_component_without_installed_manifest() {
     let server = server_with_fixture(Fixture {

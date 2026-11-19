@@ -265,6 +265,8 @@ fn discovery_takes_one_component_as_the_node_candidate() {
         node.component_path("hsm"),
         "/vehicle/v1/components/cvc/subcomponents/hsm"
     );
+    assert_eq!(node.component_id("vm1"), "cvc/subcomponents/vm1");
+    assert_eq!(NodeTopology::Root.component_id("vm1"), "vm1");
     assert_eq!(NodeTopology::Root.node_path(), "/vehicle/v1");
     assert_eq!(
         NodeTopology::Root.component_path("hsm"),
