@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sovd_client::{SovdClient, SovdClientError};
 use sumo_codec::decode::decode_envelope;
 use sumo_onboard::Manifest;
+pub use sumo_sovd_flash_engine::TopologyChoice;
 use sumo_sovd_flash_engine::{
     CameUp, CampaignStep, EcuState, EcuStatus, EngineError, EngineTimeouts, FlashEngine, FlashJob,
     FlashPlan, Payload, PayloadSource, TokenSource, UpdateType,
@@ -233,10 +234,18 @@ impl NodeTopology {
 /// form. `None` when a read could not decide (transport failure, an unexpected
 /// HTTP status, or an unparseable listing) — callers then use the root paths and
 /// do not cache the guess.
+///
+/// `choice` overrides the detection: [`TopologyChoice::Flat`] is the root form
+/// without a request, [`TopologyChoice::Node`] takes the one listed component as
+/// the node without asking it (several or none listed is undecided).
 pub async fn discover_node_topology(
     client: &reqwest::Client,
     rig_url: &str,
+    choice: TopologyChoice,
 ) -> Option<NodeTopology> {
+    if choice == TopologyChoice::Flat {
+        return Some(NodeTopology::Root);
+    }
     let base = format!("{}/vehicle/v1/components", rig_url.trim_end_matches('/'));
     let resp = match client.get(&base).send().await {
         Ok(r) => r,
@@ -257,8 +266,15 @@ pub async fn discover_node_topology(
         }
     };
     let Some(candidate) = NodeTopology::node_candidate(&listing) else {
+        if choice == TopologyChoice::Node {
+            tracing::warn!(url = %base, "node topology chosen, but the device does not list exactly one component");
+            return None;
+        }
         return Some(NodeTopology::Root);
     };
+    if choice == TopologyChoice::Node {
+        return Some(NodeTopology::Node(candidate));
+    }
     // One component: a node only when it says so (a flat single-component device
     // lists one item too). The document's `subcomponents` link decides; a document
     // without it, or a 404, falls to probing the collection itself. A failed read
@@ -313,13 +329,14 @@ pub async fn node_update_state(
     rig_url: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
+    topology: TopologyChoice,
 ) -> Result<NodeUpdateState, Error> {
     let client =
         device_http_client(insecure, ca_cert_pem).map_err(|e| Error::NodeState(e.to_string()))?;
     let base = rig_url.trim_end_matches('/');
     // Fail closed: on a node the root paths answer 404, which reads as Idle, so an
     // undecided topology must not fall back to them.
-    let node = discover_node_topology(&client, base)
+    let node = discover_node_topology(&client, base, topology)
         .await
         .ok_or_else(|| {
             Error::NodeState(format!(
@@ -408,13 +425,14 @@ pub async fn read_rig_state(
     sovd_url: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
+    topology: TopologyChoice,
 ) -> Result<Tree, Error> {
     let (client, mut components) = connect_sovd(sovd_url, insecure, ca_cert_pem).await?;
     // The scheme-probed base the client connected on, for the raw discovery GETs.
     let base = client.base_url().as_str().trim_end_matches('/').to_string();
     // Fail closed: on a node the root components are gone, and reading the node as
     // one flat component would make every real component look removed.
-    let topology = discover_node_topology(client.http_client(), &base)
+    let topology = discover_node_topology(client.http_client(), &base, topology)
         .await
         .ok_or_else(|| {
             Error::NodeState(format!(
@@ -742,8 +760,9 @@ pub async fn apply_plan(
     only: Option<&[&str]>,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
+    topology: TopologyChoice,
 ) -> Result<ApplyPlan, Error> {
-    let observed = read_rig_state(rig_url, insecure, ca_cert_pem).await?;
+    let observed = read_rig_state(rig_url, insecure, ca_cert_pem, topology).await?;
     let hub = SoftwareClient::new(hub_url);
     let desired = match target.vehicle_release_id {
         Some(id) => {
@@ -855,8 +874,18 @@ pub async fn flash_bundle(
     only: Option<&[&str]>,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
+    topology: TopologyChoice,
 ) -> Result<FlashBundle, Error> {
-    let plan = apply_plan(rig_url, hub_url, target, only, insecure, ca_cert_pem).await?;
+    let plan = apply_plan(
+        rig_url,
+        hub_url,
+        target,
+        only,
+        insecure,
+        ca_cert_pem,
+        topology,
+    )
+    .await?;
     let pubkey = device_pubkey(ca_url, device_id).await?;
 
     let hub = SoftwareClient::new(hub_url);
@@ -906,7 +935,11 @@ pub async fn flash_bundle(
 /// `x-boot-id` GET is per-call; the mint itself happens once per boot.
 pub enum RigToken {
     /// A pre-supplied bearer JWT, used verbatim for every component.
-    Static(String),
+    Static {
+        jwt: String,
+        /// The SOVD topology the rig is addressed in.
+        topology: TopologyChoice,
+    },
     /// Mint a per-device JWT, re-minting when the device's boot changes. The
     /// token's audience is the rig's ecu_id — its HSM device-key thumbprint, read
     /// from `x-ecu-id` — which is what the device verifies, NOT its roster name.
@@ -928,13 +961,44 @@ pub enum RigToken {
         /// The device's [`NodeTopology`] (where `x-boot-id` / `x-ecu-id` live),
         /// discovered once on first use; a failed discovery is retried next call.
         topology: Arc<OnceLock<NodeTopology>>,
+        /// The SOVD topology the rig is addressed in.
+        choice: TopologyChoice,
     },
 }
 
 impl RigToken {
     /// Use a fixed operator-supplied bearer token.
     pub fn fixed(jwt: impl Into<String>) -> Self {
-        RigToken::Static(jwt.into())
+        RigToken::Static {
+            jwt: jwt.into(),
+            topology: TopologyChoice::Auto,
+        }
+    }
+
+    /// Address the rig in the chosen SOVD topology instead of detecting it (see
+    /// [`TopologyChoice`]): for the token's own `x-boot-id` / `x-ecu-id` reads and
+    /// for every engine an orchestrator entry point builds with this token.
+    pub fn with_topology(mut self, choice: TopologyChoice) -> Self {
+        match &mut self {
+            RigToken::Static { topology, .. } => *topology = choice,
+            RigToken::Mint {
+                topology,
+                choice: c,
+                ..
+            } => {
+                *c = choice;
+                *topology = Arc::new(OnceLock::new());
+            }
+        }
+        self
+    }
+
+    /// The SOVD topology the rig is addressed in.
+    pub fn topology(&self) -> TopologyChoice {
+        match self {
+            RigToken::Static { topology, .. } => *topology,
+            RigToken::Mint { choice, .. } => *choice,
+        }
     }
 
     /// Mint per-device JWTs from `minter_url` (operator-authenticated to `/mint`).
@@ -959,6 +1023,7 @@ impl RigToken {
             ca_cert_pem,
             cached: Mutex::new(None),
             topology: Arc::new(OnceLock::new()),
+            choice: TopologyChoice::Auto,
         }
     }
 }
@@ -1035,7 +1100,7 @@ async fn fetch_rig_boot_id(
 impl TokenSource for RigToken {
     async fn token(&self, _component_id: &str) -> Result<String, EngineError> {
         match self {
-            RigToken::Static(jwt) => Ok(jwt.clone()),
+            RigToken::Static { jwt, .. } => Ok(jwt.clone()),
             RigToken::Mint {
                 minter,
                 rig_url,
@@ -1044,6 +1109,7 @@ impl TokenSource for RigToken {
                 ca_cert_pem,
                 cached,
                 topology,
+                choice,
             } => {
                 let client = device_http_client(*insecure, ca_cert_pem.as_deref())
                     .map_err(|e| EngineError::Internal(format!("build http client: {e}")))?;
@@ -1051,7 +1117,7 @@ impl TokenSource for RigToken {
                 // listing uses the root paths for this call and is retried next time.
                 let topology = match topology.get() {
                     Some(t) => t.clone(),
-                    None => match discover_node_topology(&client, rig_url).await {
+                    None => match discover_node_topology(&client, rig_url, *choice).await {
                         Some(t) => topology.get_or_init(|| t).clone(),
                         None => NodeTopology::Root,
                     },
@@ -1375,8 +1441,9 @@ async fn l1_flash_plan(
     only: Option<&[&str]>,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
+    topology: TopologyChoice,
 ) -> Result<(Vec<FlashJob>, Vec<u8>, Tree), Error> {
-    let observed = read_rig_state(rig_url, insecure, ca_cert_pem).await?;
+    let observed = read_rig_state(rig_url, insecure, ca_cert_pem, topology).await?;
     // The vehicle's self-report flows up as the source of truth (the tower records
     // it; reconciliation stays on the vehicle).
     let current_state =
@@ -1445,6 +1512,7 @@ pub async fn build_flash_plan(
     only: Option<&[&str]>,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
+    topology: TopologyChoice,
 ) -> Result<(FlashPlan, Vec<u8>), Error> {
     let (jobs, trust_anchor, _observed) = l1_flash_plan(
         rig_url,
@@ -1455,6 +1523,7 @@ pub async fn build_flash_plan(
         only,
         insecure,
         ca_cert_pem,
+        topology,
     )
     .await?;
     Ok((FlashPlan { jobs }, trust_anchor))
@@ -1489,6 +1558,7 @@ pub async fn flash_execute(
         only,
         insecure,
         ca_cert_pem,
+        token.topology(),
     )
     .await?;
     // Nothing to flash — the vehicle is already at target (Tower 2 skipped every
@@ -1504,15 +1574,8 @@ pub async fn flash_execute(
     // node reboot — both banks boot their new images together, no racy per-VM
     // relaunch. The onboard/field path leaves it false (no orchestrator reboot;
     // activation waits for the next power cycle).
-    let engine = FlashEngine::new(
-        rig_url,
-        Arc::new(token),
-        trust_anchor,
-        EngineTimeouts::default(),
-        insecure,
-        ca_cert_pem.map(|c| c.to_vec()),
-    )
-    .with_force_ecu_reset(reboot_to_activate);
+    let engine = rig_engine(rig_url, token, trust_anchor, insecure, ca_cert_pem)
+        .with_force_ecu_reset(reboot_to_activate);
     // No-mix guard, scoped to this (possibly `only`-filtered) plan: reject a
     // mix of rollbackable + irreversible components, reading each job's
     // x-ota-update-mode off the device. The `only` allowlist is how a singleshot
@@ -1568,6 +1631,7 @@ pub async fn campaign_execute(
         only,
         insecure,
         ca_cert_pem,
+        token.topology(),
     )
     .await?;
     if jobs.is_empty() {
@@ -1641,14 +1705,7 @@ pub async fn campaign_execute(
     // `force_ecu_reset` per step internally, and the token re-mints across the
     // reboots. `CameUp` is the shared default health gate — the rig's former
     // `step_came_up`, now in the engine.
-    let engine = FlashEngine::new(
-        rig_url,
-        Arc::new(token),
-        trust_anchor,
-        EngineTimeouts::default(),
-        insecure,
-        ca_cert_pem.map(|c| c.to_vec()),
-    );
+    let engine = rig_engine(rig_url, token, trust_anchor, insecure, ca_cert_pem);
     let report = engine.run_campaign(steps, &CameUp, no_commit).await?;
     Ok(report.ecus.iter().map(component_result).collect())
 }
@@ -1680,14 +1737,7 @@ pub async fn flash_keystore(
             payloads: Vec::new(),
         }],
     };
-    let engine = FlashEngine::new(
-        rig_url,
-        Arc::new(token),
-        trust_anchor,
-        EngineTimeouts::default(),
-        insecure,
-        ca_cert_pem.map(|c| c.to_vec()),
-    );
+    let engine = rig_engine(rig_url, token, trust_anchor, insecure, ca_cert_pem);
     let ecus = engine.stage_all(&plan).await?;
     Ok(FlashResult {
         channel: "(keystore)".to_string(),
@@ -1833,6 +1883,26 @@ async fn device_pubkey(ca_url: &str, device_id: &str) -> Result<String, Error> {
     })
 }
 
+/// The engine for `rig_url`, addressing it in the token's SOVD topology.
+fn rig_engine(
+    rig_url: &str,
+    token: RigToken,
+    trust_anchor: Vec<u8>,
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+) -> FlashEngine {
+    let topology = token.topology();
+    FlashEngine::new(
+        rig_url,
+        Arc::new(token),
+        trust_anchor,
+        EngineTimeouts::default(),
+        insecure,
+        ca_cert_pem.map(|c| c.to_vec()),
+    )
+    .with_topology(topology)
+}
+
 /// An engine for the verdict verbs (reset/commit/rollback). These never classify
 /// a manifest, so the trust anchor is unused — an empty one is correct.
 /// `force_ecu_reset` selects the node-level verdict (one verdict for the whole
@@ -1845,15 +1915,8 @@ fn verdict_engine(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> FlashEngine {
-    FlashEngine::new(
-        rig_url,
-        Arc::new(token),
-        Vec::new(),
-        EngineTimeouts::default(),
-        insecure,
-        ca_cert_pem.map(|c| c.to_vec()),
-    )
-    .with_force_ecu_reset(force_ecu_reset)
+    rig_engine(rig_url, token, Vec::new(), insecure, ca_cert_pem)
+        .with_force_ecu_reset(force_ecu_reset)
 }
 
 /// A single-component [`EcuStatus`] reconstructed from CLI args, so the verdict
