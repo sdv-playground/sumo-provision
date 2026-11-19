@@ -149,6 +149,44 @@ async fn rig_state_reads_the_subcomponents_of_a_node() {
     assert_eq!(mode.mode, "banked");
 }
 
+/// A device listing one component `cvc` whose document answers `doc` and whose
+/// subcomponents collection answers `subs` with `body`.
+async fn lone_component_server(doc: StatusCode, subs: StatusCode, body: Value) -> TestServer {
+    let router = Router::new()
+        .route(
+            "/vehicle/v1/components",
+            get(|| async { Json(json!({"items": [{"id": "cvc", "name": "CVC"}]})) }),
+        )
+        .route(
+            "/vehicle/v1/components/cvc",
+            get(move || async move { (doc, Json(json!({"id": "cvc"}))) }),
+        )
+        .route(
+            "/vehicle/v1/components/cvc/subcomponents",
+            get(move || {
+                let body = body.clone();
+                async move { (subs, Json(body)) }
+            }),
+        );
+    TestServer::start(router).await.expect("SOVD test server")
+}
+
+#[tokio::test]
+async fn rig_state_fails_when_the_topology_is_undecided() {
+    // The node's document fails (500) and its collection answers 404: that decides
+    // nothing, so the read fails instead of reading the node as one flat component.
+    let server = lone_component_server(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::NOT_FOUND,
+        json!({}),
+    )
+    .await;
+    let err = read_rig_state(&server.base_url(), false, None)
+        .await
+        .expect_err("an undecided topology is not a flat device");
+    assert!(err.to_string().contains("SOVD node"), "{err}");
+}
+
 #[tokio::test]
 async fn rig_state_on_a_single_component_flat_device_reads_it_flat() {
     // One component, no `subcomponents` link: a flat device, not a node — vm1 is

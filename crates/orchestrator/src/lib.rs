@@ -261,14 +261,25 @@ pub async fn discover_node_topology(
     };
     // One component: a node only when it says so (a flat single-component device
     // lists one item too). The document's `subcomponents` link decides; a document
-    // without it (or unreadable) falls to probing the collection itself.
-    if let Ok(resp) = client.get(format!("{base}/{candidate}")).send().await {
-        if resp.status().is_success() {
+    // without it, or a 404, falls to probing the collection itself. A failed read
+    // decides nothing: the collection's 404 must not then take a node for flat.
+    let doc_url = format!("{base}/{candidate}");
+    match client.get(&doc_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
             if let Ok(doc) = resp.json::<serde_json::Value>().await {
                 if NodeTopology::is_node_document(&doc) {
                     return Some(NodeTopology::Node(candidate));
                 }
             }
+        }
+        Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {}
+        Ok(resp) => {
+            tracing::warn!(url = %doc_url, status = %resp.status(), "node discovery failed — using the root paths");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(url = %doc_url, error = %e, "node discovery failed — using the root paths");
+            return None;
         }
     }
     let url = format!("{base}/{candidate}/subcomponents");
@@ -306,9 +317,15 @@ pub async fn node_update_state(
     let client =
         device_http_client(insecure, ca_cert_pem).map_err(|e| Error::NodeState(e.to_string()))?;
     let base = rig_url.trim_end_matches('/');
+    // Fail closed: on a node the root paths answer 404, which reads as Idle, so an
+    // undecided topology must not fall back to them.
     let node = discover_node_topology(&client, base)
         .await
-        .unwrap_or(NodeTopology::Root)
+        .ok_or_else(|| {
+            Error::NodeState(format!(
+                "{base}: could not tell whether the device is a SOVD node; not reading its update state"
+            ))
+        })?
         .node_path();
     let mut resp = client
         .get(format!("{base}{node}/data/x-update-state"))
@@ -395,9 +412,15 @@ pub async fn read_rig_state(
     let (client, mut components) = connect_sovd(sovd_url, insecure, ca_cert_pem).await?;
     // The scheme-probed base the client connected on, for the raw discovery GETs.
     let base = client.base_url().as_str().trim_end_matches('/').to_string();
+    // Fail closed: on a node the root components are gone, and reading the node as
+    // one flat component would make every real component look removed.
     let topology = discover_node_topology(client.http_client(), &base)
         .await
-        .unwrap_or(NodeTopology::Root);
+        .ok_or_else(|| {
+            Error::NodeState(format!(
+                "{base}: could not tell whether the device is a SOVD node; not reading its state"
+            ))
+        })?;
     if let NodeTopology::Node(node) = &topology {
         components = list_subcomponents(client.http_client(), &base, node).await?;
     }

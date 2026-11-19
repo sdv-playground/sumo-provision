@@ -273,3 +273,46 @@ fn discovery_takes_one_component_as_the_node_candidate() {
         "/vehicle/v1/components/hsm"
     );
 }
+
+#[tokio::test]
+async fn node_update_state_fails_closed_when_the_topology_is_undecided() {
+    // /components fails: the root x-update-state, which a node answers 404 (read as
+    // Idle), must not be asked instead.
+    let server = TestServer::start(
+        Router::new()
+            .route(
+                "/vehicle/v1/components",
+                get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .merge(update_state("/vehicle/v1", "x-update-state")),
+    )
+    .await
+    .unwrap();
+    node_update_state(&server.base_url(), false, None)
+        .await
+        .expect_err("an undecided topology is not read as the root");
+}
+
+#[tokio::test]
+async fn a_failed_node_document_read_decides_nothing() {
+    // A 500 on the lone component's document, then a 404 on its collection, must
+    // not take a node for a flat device.
+    let server = TestServer::start(
+        Router::new()
+            .route(
+                "/vehicle/v1/components",
+                get(|| async { Json(json!({ "items": [{ "id": "cvc" }] })) }),
+            )
+            .route(
+                "/vehicle/v1/components/cvc",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            ),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    assert_eq!(
+        discover_node_topology(&client, &server.base_url()).await,
+        None
+    );
+}
