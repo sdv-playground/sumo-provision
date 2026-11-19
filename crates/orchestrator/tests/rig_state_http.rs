@@ -188,6 +188,16 @@ async fn rig_state_fails_when_the_topology_is_undecided() {
 }
 
 #[tokio::test]
+async fn rig_state_fails_on_a_subcomponents_collection_without_items() {
+    // A 2xx collection without `items` is malformed, not a node without components.
+    let server =
+        lone_component_server(StatusCode::NOT_FOUND, StatusCode::OK, json!({"links": []})).await;
+    read_rig_state(&server.base_url(), false, None)
+        .await
+        .expect_err("a collection without items");
+}
+
+#[tokio::test]
 async fn rig_state_on_a_single_component_flat_device_reads_it_flat() {
     // One component, no `subcomponents` link: a flat device, not a node — vm1 is
     // read at `components/vm1/…` and is the tree's entity.

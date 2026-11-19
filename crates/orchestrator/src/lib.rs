@@ -452,7 +452,8 @@ async fn list_subcomponents(
 ) -> Result<Vec<sovd_client::Component>, Error> {
     #[derive(Deserialize)]
     struct Collection {
-        #[serde(default)]
+        // Required, as in SovdClient::list_components: a malformed collection must
+        // fail, not read as a node without components.
         items: Vec<sovd_client::Component>,
     }
     let url = format!("{base}/vehicle/v1/components/{node}/subcomponents");
