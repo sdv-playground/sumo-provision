@@ -131,11 +131,13 @@ fn device_http_client(
 /// `x-boot-id`, the node operations) and its components.
 ///
 /// A node-topology device (supernova with `sovd_node`) lists exactly ONE component
-/// at `/vehicle/v1/components` — the node — serves the node resources on it
+/// at `/vehicle/v1/components` — the node, whose document links its
+/// `subcomponents` — serves the node resources on it
 /// (`/vehicle/v1/components/{node}/...`) and its components as the node's
-/// subcomponents. Every other device (several components or none: mmgr-cvc, the
-/// tower devices and older supernova builds on sumo-machine-manager ≤ v0.1.21)
-/// serves them at the entity root, its components flat.
+/// subcomponents. Every other device (several components, none, or a single
+/// component that is not a node: mmgr-cvc, the tower devices and older supernova
+/// builds on sumo-machine-manager ≤ v0.1.21) serves them at the entity root, its
+/// components flat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeTopology {
     /// Node resources at the entity root; components flat under `/components`.
@@ -145,20 +147,30 @@ pub enum NodeTopology {
 }
 
 impl NodeTopology {
-    /// Classify a `GET /vehicle/v1/components` body: exactly one `items` entry with
-    /// an `id` is the node; anything else (several, none, unparseable) is `Root`.
-    pub fn from_components_body(body: &serde_json::Value) -> Self {
+    /// The node candidate of a `GET /vehicle/v1/components` body: the id of its ONE
+    /// `items` entry. Several, none, an id-less entry or an unparseable body ⇒
+    /// `None` (the root form). A candidate is only the node once its document
+    /// confirms it ([`is_node_document`](Self::is_node_document)): a flat device
+    /// with a single component lists one item too.
+    pub fn node_candidate(body: &serde_json::Value) -> Option<String> {
         match body
             .get("items")
             .and_then(|v| v.as_array())
             .map(Vec::as_slice)
         {
             Some([only]) => match only.get("id").and_then(|v| v.as_str()) {
-                Some(id) if !id.is_empty() => NodeTopology::Node(id.to_string()),
-                _ => NodeTopology::Root,
+                Some(id) if !id.is_empty() => Some(id.to_string()),
+                _ => None,
             },
-            _ => NodeTopology::Root,
+            _ => None,
         }
+    }
+
+    /// Does a `GET /vehicle/v1/components/{id}` document describe a node — i.e.
+    /// link a `subcomponents` collection (sovd-api's node document carries
+    /// `"subcomponents": "{base}/components/{node}/subcomponents"`)?
+    pub fn is_node_document(doc: &serde_json::Value) -> bool {
+        doc.get("subcomponents").is_some_and(|v| !v.is_null())
     }
 
     /// The path a node resource hangs off: `/vehicle/v1` (root) or
@@ -207,29 +219,67 @@ impl NodeTopology {
     }
 }
 
-/// Discover the device's [`NodeTopology`] off `GET /vehicle/v1/components`.
-/// `None` when the listing could not be read (transport failure, non-2xx, or an
-/// unparseable body) — callers then use the root paths and do not cache the guess.
+/// Discover the device's [`NodeTopology`]: `GET /vehicle/v1/components`, and when
+/// that lists exactly one component, confirm it is a node — its document
+/// (`GET /vehicle/v1/components/{id}`) links `subcomponents`, or
+/// `GET /vehicle/v1/components/{id}/subcomponents` answers 2xx. A lone component
+/// without either (its subcomponents answer 404/405) is a flat device: the root
+/// form. `None` when a read could not decide (transport failure, an unexpected
+/// HTTP status, or an unparseable listing) — callers then use the root paths and
+/// do not cache the guess.
 pub async fn discover_node_topology(
     client: &reqwest::Client,
     rig_url: &str,
 ) -> Option<NodeTopology> {
-    let url = format!("{}/vehicle/v1/components", rig_url.trim_end_matches('/'));
-    let resp = match client.get(&url).send().await {
+    let base = format!("{}/vehicle/v1/components", rig_url.trim_end_matches('/'));
+    let resp = match client.get(&base).send().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(%url, error = %e, "node discovery failed — using the root paths");
+            tracing::warn!(url = %base, error = %e, "node discovery failed — using the root paths");
             return None;
         }
     };
     if !resp.status().is_success() {
-        tracing::warn!(%url, status = %resp.status(), "node discovery failed — using the root paths");
+        tracing::warn!(url = %base, status = %resp.status(), "node discovery failed — using the root paths");
         return None;
     }
-    match resp.json::<serde_json::Value>().await {
-        Ok(body) => Some(NodeTopology::from_components_body(&body)),
+    let listing = match resp.json::<serde_json::Value>().await {
+        Ok(body) => body,
         Err(e) => {
-            tracing::warn!(%url, error = %e, "node discovery: unparseable body — using the root paths");
+            tracing::warn!(url = %base, error = %e, "node discovery: unparseable body — using the root paths");
+            return None;
+        }
+    };
+    let Some(candidate) = NodeTopology::node_candidate(&listing) else {
+        return Some(NodeTopology::Root);
+    };
+    // One component: a node only when it says so (a flat single-component device
+    // lists one item too). The document's `subcomponents` link decides; a document
+    // without it (or unreadable) falls to probing the collection itself.
+    if let Ok(resp) = client.get(format!("{base}/{candidate}")).send().await {
+        if resp.status().is_success() {
+            if let Ok(doc) = resp.json::<serde_json::Value>().await {
+                if NodeTopology::is_node_document(&doc) {
+                    return Some(NodeTopology::Node(candidate));
+                }
+            }
+        }
+    }
+    let url = format!("{base}/{candidate}/subcomponents");
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => Some(NodeTopology::Node(candidate)),
+        Ok(resp)
+            if resp.status() == reqwest::StatusCode::NOT_FOUND
+                || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED =>
+        {
+            Some(NodeTopology::Root)
+        }
+        Ok(resp) => {
+            tracing::warn!(%url, status = %resp.status(), "node discovery failed — using the root paths");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(%url, error = %e, "node discovery failed — using the root paths");
             None
         }
     }
