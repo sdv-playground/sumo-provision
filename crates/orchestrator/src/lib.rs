@@ -202,7 +202,7 @@ impl NodeTopology {
 
     /// The boot id path: root `GET /vehicle/v1/status/x-boot-id` (plain-text body)
     /// or the node's `GET …/components/{node}/data/x-boot-id` (a JSON data value).
-    fn boot_id_path(&self) -> String {
+    pub fn boot_id_path(&self) -> String {
         match self {
             NodeTopology::Root => "/vehicle/v1/status/x-boot-id".to_string(),
             NodeTopology::Node(_) => format!("{}/data/x-boot-id", self.node_path()),
@@ -212,7 +212,7 @@ impl NodeTopology {
     /// The boot id in a [`boot_id_path`](Self::boot_id_path) response body: the
     /// trimmed, unquoted plain text (root) or the JSON `data` string (node form).
     /// `None` when the body carries no id.
-    fn parse_boot_id(&self, body: &str) -> Option<String> {
+    pub fn parse_boot_id(&self, body: &str) -> Option<String> {
         let id = match self {
             NodeTopology::Root => body.trim().trim_matches('"').to_string(),
             NodeTopology::Node(_) => serde_json::from_str::<serde_json::Value>(body)
