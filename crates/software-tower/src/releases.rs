@@ -25,7 +25,7 @@ use sumo_offboard::cose_key::CoseKey;
 use wire::{ArtifactRef, ContentHash, Entity, Part, Tree};
 
 use crate::content::{AppError, AppState};
-use crate::signer::{release_label, EnvelopePart};
+use crate::signer::EnvelopePart;
 
 // --- request / response bodies ---------------------------------------------
 
@@ -194,17 +194,8 @@ pub async fn create_component_release(
     State(s): State<AppState>,
     Json(req): Json<NewComponentRelease>,
 ) -> Result<Json<ReleaseRef>, AppError> {
-    // The label is signed into the device's SUIT text and reported as its
-    // fw_version, which the device stores in 32 bytes — reject rather than let
-    // the device truncate it silently.
-    if req.version.len() > MAX_VERSION_LABEL {
-        return Err(AppError::BadRequest(format!(
-            "version label is {} bytes; at most {MAX_VERSION_LABEL} (the device's version field)",
-            req.version.len()
-        )));
-    }
     let pool = s.pool()?;
-    let identity = component_identity(&req.entity_kind, &req.version, &req.parts);
+    let identity = component_identity(&req.entity_kind, &req.parts);
 
     if let Some(row) = sqlx::query(
         "SELECT id, version, created_at::text AS created_at FROM component_releases \
@@ -848,33 +839,16 @@ pub async fn artifact_exists(
 
 // --- identity --------------------------------------------------------------
 
-/// Longest `version` label a component release may carry, in bytes: the device
-/// reports it as fw_version from a 32-byte field.
-const MAX_VERSION_LABEL: usize = 32;
-
-/// A component release's identity: a hash over its entity kind, its real version
-/// label (see [`release_label`]) and its parts (sorted by id, so order doesn't
-/// matter). Two releases with the same identity have byte-identical content.
-///
-/// The label is folded in because it is signed into the device's envelope: the
-/// same bytes under a new label mint a new release row (parts stay content-deduped,
-/// nothing is re-uploaded), so the device can show the new name. A relabel never
-/// reflashes — [`entity_agreed`] compares content only, so a vehicle already
-/// carrying the bytes skips the component. Synthetic `-dev.N` placeholders are
-/// left out, so their releases keep deduping on content alone (and keep the
-/// identity they had before labels were signed).
-fn component_identity(entity_kind: &str, version: &str, parts: &[NewPart]) -> String {
+/// A component release's content identity: a hash over its entity kind and its
+/// parts (sorted by id, so order doesn't matter). Two releases with the same
+/// identity have byte-identical content.
+fn component_identity(entity_kind: &str, parts: &[NewPart]) -> String {
     let mut sorted: Vec<&NewPart> = parts.iter().collect();
     sorted.sort_by(|a, b| a.id.cmp(&b.id));
 
     let mut buf = String::new();
     buf.push_str(entity_kind);
     buf.push('\n');
-    if let Some(label) = release_label(version) {
-        buf.push_str("version\0");
-        buf.push_str(label);
-        buf.push('\n');
-    }
     for p in sorted {
         buf.push_str(&p.id);
         buf.push('\0');
@@ -1508,8 +1482,8 @@ mod tests {
         let a = vec![part("kernel", "bank", "k"), part("rootfs", "bank", "r")];
         let b = vec![part("rootfs", "bank", "r"), part("kernel", "bank", "k")];
         assert_eq!(
-            component_identity("bank", "1.0", &a),
-            component_identity("bank", "1.0", &b)
+            component_identity("bank", &a),
+            component_identity("bank", &b)
         );
     }
 
@@ -1518,85 +1492,22 @@ mod tests {
         let base = vec![part("kernel", "bank", "k1")];
         // content change
         assert_ne!(
-            component_identity("bank", "1.0", &base),
-            component_identity("bank", "1.0", &[part("kernel", "bank", "k2")])
+            component_identity("bank", &base),
+            component_identity("bank", &[part("kernel", "bank", "k2")])
         );
         // added part
         assert_ne!(
-            component_identity("bank", "1.0", &base),
+            component_identity("bank", &base),
             component_identity(
                 "bank",
-                "1.0",
                 &[part("kernel", "bank", "k1"), part("rootfs", "bank", "r")]
             )
         );
         // entity kind change
         assert_ne!(
-            component_identity("bank", "1.0", &base),
-            component_identity("rt", "1.0", &base)
+            component_identity("bank", &base),
+            component_identity("rt", &base)
         );
-    }
-
-    /// Same parts under a new label ⇒ a new release (so the device can show the
-    /// new name); synthetic `-dev.N` placeholders don't count, so those releases
-    /// still dedupe on content alone exactly as before labels were signed.
-    #[test]
-    fn component_identity_tracks_real_label_not_synthetic() {
-        let base = vec![part("kernel", "bank", "k1")];
-        assert_ne!(
-            component_identity("bank", "main-48e1e7dc", &base),
-            component_identity("bank", "main-0badc0de", &base),
-            "same parts, different version → different identity"
-        );
-        assert_ne!(
-            component_identity("bank", "main-48e1e7dc", &base),
-            component_identity("bank", "1.0.0-dev.3", &base)
-        );
-        assert_eq!(
-            component_identity("bank", "1.0.0-dev.3", &base),
-            component_identity("bank", "1.0.0-dev.4", &base),
-            "synthetic labels dedupe on content"
-        );
-        assert_eq!(
-            component_identity("bank", "1.0.0-dev.3", &base),
-            component_identity("bank", "", &base)
-        );
-    }
-
-    /// A label longer than the device's 32-byte version field is refused at the
-    /// tower edge — before any database access, so no pool is needed.
-    #[tokio::test]
-    async fn component_release_rejects_label_over_32_bytes() {
-        let state = AppState {
-            blobs: Arc::new(FsBlobStore::new(tempfile::tempdir().unwrap().keep())),
-            index: Arc::new(crate::store::MemIndex::default()),
-            pool: None,
-            signer: Arc::new(Signer::generate().unwrap()),
-        };
-        let app = Router::new()
-            .route("/admin/component-releases", post(create_component_release))
-            .with_state(state);
-        let body = serde_json::json!({
-            "entity_path": "vm1",
-            "entity_kind": "vm",
-            "version": "x".repeat(33),
-            "parts": [],
-        });
-        let response = app
-            .oneshot(
-                Request::post("/admin/component-releases")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let msg = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(msg.contains("33 bytes"), "{msg}");
     }
 
     #[test]

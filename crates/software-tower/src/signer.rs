@@ -78,10 +78,11 @@ impl Signer {
     /// ciphertext is untouched — the device fetches it by `#<part>` and decrypts
     /// with the re-wrapped CEK.
     ///
-    /// `label` is the release's human version label; when it is a real label (see
-    /// [`release_label`]) it is signed into the SUIT text as `text_version`, which
-    /// the device reports as the component's installed version (instead of
-    /// falling back to `seq-N`). The component path rides as `text_model_name`.
+    /// `label` is the release's version label, an opaque string passed through
+    /// unchanged: when non-blank it is signed into the SUIT text as
+    /// `text_version`, which the device reports as the component's installed
+    /// version (instead of falling back to `seq-N`). The component path rides as
+    /// `text_model_name`.
     pub fn build_envelope(
         &self,
         device_pubkey: &[u8],
@@ -106,7 +107,7 @@ impl Signer {
             .signing_time(now)
             .sequence_number(seq)
             .text_model_name(component);
-        if let Some(l) = label.and_then(release_label) {
+        if let Some(l) = label.filter(|l| !l.trim().is_empty()) {
             builder = builder.text_version(l);
         }
         for p in parts {
@@ -181,18 +182,6 @@ impl Signer {
             .component_id(vec![component.to_string()])
             .build_disable(&self.key)
     }
-}
-
-/// `version` as a label worth showing on the device, or `None` for a blank or
-/// synthetic one. Synthetic = the reconciler's placeholder `<maj>.<min>.<patch>-dev.<n>`
-/// (every pre-label release row and every content-identical reuse carries one) —
-/// signing it would surface a fake semver on the device, so it is never signed.
-pub fn release_label(version: &str) -> Option<&str> {
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    let synthetic = version.split_once("-dev.").is_some_and(|(base, n)| {
-        digits(n) && base.split('.').count() == 3 && base.split('.').all(digits)
-    });
-    (!synthetic && !version.trim().is_empty()).then_some(version)
 }
 
 // --- handlers --------------------------------------------------------------
@@ -346,9 +335,9 @@ mod tests {
         total += decryptor.finalize(&mut out[total..]).unwrap();
         assert_eq!(&out[..total], pt);
 
-        // No / blank / synthetic label ⇒ no `text_version` (the device falls
-        // back to `seq-N`); the component path is still the model name.
-        for label in [None, Some(""), Some("  "), Some("1.0.0-dev.7")] {
+        // No / blank label ⇒ no `text_version` (the device falls back to
+        // `seq-N`); the component path is still the model name.
+        for label in [None, Some(""), Some("  ")] {
             let unlabelled = signer
                 .build_envelope(
                     &device.public_key_bytes(),
@@ -364,24 +353,6 @@ mod tests {
                 .unwrap();
             assert_eq!(manifest.text_version(0), None, "label {label:?}");
             assert_eq!(manifest.text_model_name(0), Some("vm1"));
-        }
-    }
-
-    #[test]
-    fn release_label_drops_blank_and_synthetic_versions() {
-        for synthetic in ["", "   ", "1.0.0-dev.0", "1.0.0-dev.48", "12.3.40-dev.7"] {
-            assert_eq!(release_label(synthetic), None, "{synthetic:?}");
-        }
-        for real in [
-            "main-48e1e7dc",
-            "1.0.0",
-            "1.0.0-dev",
-            "1.0.0-dev.",
-            "1.0-dev.3",
-            "1.0.0-dev.3a",
-            "v1.0.0-dev.3",
-        ] {
-            assert_eq!(release_label(real), Some(real), "{real:?}");
         }
     }
 
