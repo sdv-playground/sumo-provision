@@ -13,7 +13,7 @@
 //! (diffed against its self-report): that one pushes the manifest alone and the
 //! device copy-forwards the content from its own active bank, digest-verified.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use client::{ClientError, IdentityClient, MinterClient, SoftwareClient};
@@ -127,9 +127,185 @@ fn device_http_client(
     builder.build()
 }
 
+/// Where a device serves its node-level vendor resources (`x-update-state`,
+/// `x-boot-id`, the node operations) and its components.
+///
+/// A node-topology device (supernova with `sovd_node`) lists exactly ONE component
+/// at `/vehicle/v1/components` — the node, whose document links its
+/// `subcomponents` — serves the node resources on it
+/// (`/vehicle/v1/components/{node}/...`) and its components as the node's
+/// subcomponents. Every other device (several components, none, or a single
+/// component that is not a node: mmgr-cvc, the tower devices and older supernova
+/// builds on sumo-machine-manager ≤ v0.1.21) serves them at the entity root, its
+/// components flat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeTopology {
+    /// Node resources at the entity root; components flat under `/components`.
+    Root,
+    /// Node resources on the node component with this id.
+    Node(String),
+}
+
+impl NodeTopology {
+    /// The node candidate of a `GET /vehicle/v1/components` body: the id of its ONE
+    /// `items` entry. Several, none, an id-less entry or an unparseable body ⇒
+    /// `None` (the root form). A candidate is only the node once its document
+    /// confirms it ([`is_node_document`](Self::is_node_document)): a flat device
+    /// with a single component lists one item too.
+    pub fn node_candidate(body: &serde_json::Value) -> Option<String> {
+        match body
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+        {
+            Some([only]) => match only.get("id").and_then(|v| v.as_str()) {
+                Some(id) if !id.is_empty() => Some(id.to_string()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Does a `GET /vehicle/v1/components/{id}` document describe a node — i.e.
+    /// link a `subcomponents` collection (sovd-api's node document carries
+    /// `"subcomponents": "{base}/components/{node}/subcomponents"`)?
+    pub fn is_node_document(doc: &serde_json::Value) -> bool {
+        doc.get("subcomponents").is_some_and(|v| !v.is_null())
+    }
+
+    /// The path a node resource hangs off: `/vehicle/v1` (root) or
+    /// `/vehicle/v1/components/{node}` (node form).
+    pub fn node_path(&self) -> String {
+        match self {
+            NodeTopology::Root => "/vehicle/v1".to_string(),
+            NodeTopology::Node(node) => format!("/vehicle/v1/components/{node}"),
+        }
+    }
+
+    /// The path of component `id`'s entity: `/vehicle/v1/components/{id}` (root,
+    /// flat) or `/vehicle/v1/components/{node}/subcomponents/{id}` (node form).
+    pub fn component_path(&self, id: &str) -> String {
+        format!("/vehicle/v1/components/{}", self.component_id(id))
+    }
+
+    /// Component `id` as a [`SovdClient`] component id — its path below
+    /// `/vehicle/v1/components/`: `{id}` (root) or `{node}/subcomponents/{id}`
+    /// (node form). sovd-client splices the id into its URLs verbatim
+    /// (`read_data`, `read_status`, …), so this addresses the subcomponent.
+    pub fn component_id(&self, id: &str) -> String {
+        match self {
+            NodeTopology::Root => id.to_string(),
+            NodeTopology::Node(node) => format!("{node}/subcomponents/{id}"),
+        }
+    }
+
+    /// The boot id path: root `GET /vehicle/v1/status/x-boot-id` (plain-text body)
+    /// or the node's `GET …/components/{node}/data/x-boot-id` (a JSON data value).
+    fn boot_id_path(&self) -> String {
+        match self {
+            NodeTopology::Root => "/vehicle/v1/status/x-boot-id".to_string(),
+            NodeTopology::Node(_) => format!("{}/data/x-boot-id", self.node_path()),
+        }
+    }
+
+    /// The boot id in a [`boot_id_path`](Self::boot_id_path) response body: the
+    /// trimmed, unquoted plain text (root) or the JSON `data` string (node form).
+    /// `None` when the body carries no id.
+    fn parse_boot_id(&self, body: &str) -> Option<String> {
+        let id = match self {
+            NodeTopology::Root => body.trim().trim_matches('"').to_string(),
+            NodeTopology::Node(_) => serde_json::from_str::<serde_json::Value>(body)
+                .ok()?
+                .get("data")?
+                .as_str()?
+                .trim()
+                .to_string(),
+        };
+        (!id.is_empty()).then_some(id)
+    }
+}
+
+/// Discover the device's [`NodeTopology`]: `GET /vehicle/v1/components`, and when
+/// that lists exactly one component, confirm it is a node — its document
+/// (`GET /vehicle/v1/components/{id}`) links `subcomponents`, or
+/// `GET /vehicle/v1/components/{id}/subcomponents` answers 2xx. A lone component
+/// without either (its subcomponents answer 404/405) is a flat device: the root
+/// form. `None` when a read could not decide (transport failure, an unexpected
+/// HTTP status, or an unparseable listing) — callers then use the root paths and
+/// do not cache the guess.
+pub async fn discover_node_topology(
+    client: &reqwest::Client,
+    rig_url: &str,
+) -> Option<NodeTopology> {
+    let base = format!("{}/vehicle/v1/components", rig_url.trim_end_matches('/'));
+    let resp = match client.get(&base).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(url = %base, error = %e, "node discovery failed — using the root paths");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(url = %base, status = %resp.status(), "node discovery failed — using the root paths");
+        return None;
+    }
+    let listing = match resp.json::<serde_json::Value>().await {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!(url = %base, error = %e, "node discovery: unparseable body — using the root paths");
+            return None;
+        }
+    };
+    let Some(candidate) = NodeTopology::node_candidate(&listing) else {
+        return Some(NodeTopology::Root);
+    };
+    // One component: a node only when it says so (a flat single-component device
+    // lists one item too). The document's `subcomponents` link decides; a document
+    // without it, or a 404, falls to probing the collection itself. A failed read
+    // decides nothing: the collection's 404 must not then take a node for flat.
+    let doc_url = format!("{base}/{candidate}");
+    match client.get(&doc_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(doc) = resp.json::<serde_json::Value>().await {
+                if NodeTopology::is_node_document(&doc) {
+                    return Some(NodeTopology::Node(candidate));
+                }
+            }
+        }
+        Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {}
+        Ok(resp) => {
+            tracing::warn!(url = %doc_url, status = %resp.status(), "node discovery failed — using the root paths");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(url = %doc_url, error = %e, "node discovery failed — using the root paths");
+            return None;
+        }
+    }
+    let url = format!("{base}/{candidate}/subcomponents");
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => Some(NodeTopology::Node(candidate)),
+        Ok(resp)
+            if resp.status() == reqwest::StatusCode::NOT_FOUND
+                || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED =>
+        {
+            Some(NodeTopology::Root)
+        }
+        Ok(resp) => {
+            tracing::warn!(%url, status = %resp.status(), "node discovery failed — using the root paths");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(%url, error = %e, "node discovery failed — using the root paths");
+            None
+        }
+    }
+}
+
 /// Read the device's node update-transaction state over SOVD
-/// (`GET /vehicle/v1/data/x-update-state`). Transitional: a device from before
-/// the x-update aliases answers 404 there and is asked at the legacy
+/// (`GET {node}/data/x-update-state`: the entity root, or the node component on a
+/// node-topology device — see [`NodeTopology`]). Transitional: a device from
+/// before the x-update aliases answers 404 there and is asked at the legacy
 /// `x-ota-update-state` instead (remove with the x-ota retirement). A device
 /// with neither route (an older image still) returns 404 → reported as `Idle`,
 /// so a fresh rig just proceeds.
@@ -141,14 +317,24 @@ pub async fn node_update_state(
     let client =
         device_http_client(insecure, ca_cert_pem).map_err(|e| Error::NodeState(e.to_string()))?;
     let base = rig_url.trim_end_matches('/');
+    // Fail closed: on a node the root paths answer 404, which reads as Idle, so an
+    // undecided topology must not fall back to them.
+    let node = discover_node_topology(&client, base)
+        .await
+        .ok_or_else(|| {
+            Error::NodeState(format!(
+                "{base}: could not tell whether the device is a SOVD node; not reading its update state"
+            ))
+        })?
+        .node_path();
     let mut resp = client
-        .get(format!("{base}/vehicle/v1/data/x-update-state"))
+        .get(format!("{base}{node}/data/x-update-state"))
         .send()
         .await
         .map_err(|e| Error::NodeState(e.to_string()))?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         resp = client
-            .get(format!("{base}/vehicle/v1/data/x-ota-update-state"))
+            .get(format!("{base}{node}/data/x-ota-update-state"))
             .send()
             .await
             .map_err(|e| Error::NodeState(e.to_string()))?;
@@ -214,29 +400,73 @@ async fn connect_sovd(
 /// Read a rig's observed state over SOVD as a [`wire::Tree`]: each component is
 /// an entity, and the files in its signed installed manifest are its parts
 /// (`kind = "file"`, `id = path`, `content = sha256`). Components with no signed
-/// manifest come back as entities with no parts.
+/// manifest come back as entities with no parts. On a node-topology device (see
+/// [`NodeTopology`]) the components are the node's subcomponents, listed at
+/// `components/{node}/subcomponents` and read there; the tree keys them by their
+/// plain id either way.
 pub async fn read_rig_state(
     sovd_url: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<Tree, Error> {
-    let (client, components) = connect_sovd(sovd_url, insecure, ca_cert_pem).await?;
+    let (client, mut components) = connect_sovd(sovd_url, insecure, ca_cert_pem).await?;
+    // The scheme-probed base the client connected on, for the raw discovery GETs.
+    let base = client.base_url().as_str().trim_end_matches('/').to_string();
+    // Fail closed: on a node the root components are gone, and reading the node as
+    // one flat component would make every real component look removed.
+    let topology = discover_node_topology(client.http_client(), &base)
+        .await
+        .ok_or_else(|| {
+            Error::NodeState(format!(
+                "{base}: could not tell whether the device is a SOVD node; not reading its state"
+            ))
+        })?;
+    if let NodeTopology::Node(node) = &topology {
+        components = list_subcomponents(client.http_client(), &base, node).await?;
+    }
     let mut tree = Tree::default();
     for c in components {
         let mut entity = Entity {
             kind: c.component_type.unwrap_or_default(),
             ..Default::default()
         };
-        if let Some(m) = read_installed(&client, &c.id).await? {
+        let at = topology.component_id(&c.id);
+        if let Some(m) = read_installed(&client, &at).await? {
             let label = format!("{} {}", m.identity.name, m.identity.version);
             entity.version = Some(label.trim().to_string());
             entity.parts = installed_files_to_parts(sovd_url, &c.id, m.files);
         }
-        entity.update_mode = read_update_mode(&client, &c.id).await?;
-        entity.admin_disabled = read_admin_disabled(&client, &c.id).await?;
+        entity.update_mode = read_update_mode(&client, &at).await?;
+        entity.admin_disabled = read_admin_disabled(&client, &at).await?;
         tree.entities.insert(c.id, entity);
     }
     Ok(tree)
+}
+
+/// `GET {base}/vehicle/v1/components/{node}/subcomponents` — a node's components,
+/// in the same collection shape as `GET /components`.
+async fn list_subcomponents(
+    client: &reqwest::Client,
+    base: &str,
+    node: &str,
+) -> Result<Vec<sovd_client::Component>, Error> {
+    #[derive(Deserialize)]
+    struct Collection {
+        // Required, as in SovdClient::list_components: a malformed collection must
+        // fail, not read as a node without components.
+        items: Vec<sovd_client::Component>,
+    }
+    let url = format!("{base}/vehicle/v1/components/{node}/subcomponents");
+    let fail = |e: String| Error::NodeState(format!("list {url}: {e}"));
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| fail(e.to_string()))?
+        .error_for_status()
+        .map_err(|e| fail(e.to_string()))?;
+    let body: Collection = resp.json().await.map_err(|e| fail(e.to_string()))?;
+    Ok(body.items)
 }
 
 /// Read flattened `/status` `x-runtime.admin_state`. Components that omit
@@ -695,6 +925,9 @@ pub enum RigToken {
         /// `(boot_id, token)` — the token minted for that boot. Re-minted when the
         /// live boot_id differs (a reboot rotated it).
         cached: Mutex<Option<(String, String)>>,
+        /// The device's [`NodeTopology`] (where `x-boot-id` / `x-ecu-id` live),
+        /// discovered once on first use; a failed discovery is retried next call.
+        topology: Arc<OnceLock<NodeTopology>>,
     },
 }
 
@@ -725,23 +958,24 @@ impl RigToken {
             insecure,
             ca_cert_pem,
             cached: Mutex::new(None),
+            topology: Arc::new(OnceLock::new()),
         }
     }
 }
 
-/// GET a small vendor id from the rig, trimmed + unquoted. The `aud` (ecu_id)
-/// and `boot_id` a destructive token must carry are read here — the same ids
-/// `factory-reset.sh` reads, never the roster name and never a stale boot.
+/// GET a small vendor id from the rig and extract it with `parse` (`None` = no
+/// id in the body). The `aud` (ecu_id) and `boot_id` a destructive token must
+/// carry are read here — the same ids `factory-reset.sh` reads, never the roster
+/// name and never a stale boot.
 async fn fetch_rig_id(
+    client: &reqwest::Client,
     rig_url: &str,
     path: &str,
     what: &str,
-    insecure: bool,
-    ca_cert_pem: Option<&[u8]>,
+    parse: impl FnOnce(&str) -> Option<String>,
 ) -> Result<String, EngineError> {
     let url = format!("{}{path}", rig_url.trim_end_matches('/'));
-    let resp = device_http_client(insecure, ca_cert_pem)
-        .map_err(|e| EngineError::Internal(format!("build http client: {e}")))?
+    let resp = client
         .get(&url)
         .send()
         .await
@@ -752,48 +986,47 @@ async fn fetch_rig_id(
             resp.status()
         )));
     }
-    let id = resp
+    let body = resp
         .text()
         .await
         .map_err(|e| EngineError::Internal(format!("read {what} body: {e}")))?;
-    let id = id.trim().trim_matches('"').to_string();
-    if id.is_empty() {
-        return Err(EngineError::Internal(format!(
-            "{url} returned an empty {what}"
-        )));
-    }
-    Ok(id)
+    parse(&body).ok_or_else(|| EngineError::Internal(format!("{url} returned an empty {what}")))
 }
 
-/// The rig's ecu_id (its HSM device-key thumbprint) — the token `aud`.
+/// The rig's ecu_id (its HSM device-key thumbprint) — the token `aud`. Plain text
+/// at the `hsm` component's `x-ecu-id` (flat, or the node's `hsm` subcomponent).
 async fn fetch_rig_ecu_id(
+    client: &reqwest::Client,
     rig_url: &str,
-    insecure: bool,
-    ca_cert_pem: Option<&[u8]>,
+    topology: &NodeTopology,
 ) -> Result<String, EngineError> {
     fetch_rig_id(
+        client,
         rig_url,
-        "/vehicle/v1/components/hsm/x-ecu-id",
+        &format!("{}/x-ecu-id", topology.component_path("hsm")),
         "ecu id",
-        insecure,
-        ca_cert_pem,
+        |body| {
+            let id = body.trim().trim_matches('"');
+            (!id.is_empty()).then(|| id.to_string())
+        },
     )
     .await
 }
 
 /// The rig's live boot nonce — the §7.1 freshness `boot_id` a destructive token
-/// binds to (read fresh, right before minting).
+/// binds to (read fresh, right before minting): the root `status/x-boot-id`
+/// (plain text) or the node's `data/x-boot-id` (JSON `data`).
 async fn fetch_rig_boot_id(
+    client: &reqwest::Client,
     rig_url: &str,
-    insecure: bool,
-    ca_cert_pem: Option<&[u8]>,
+    topology: &NodeTopology,
 ) -> Result<String, EngineError> {
     fetch_rig_id(
+        client,
         rig_url,
-        "/vehicle/v1/status/x-boot-id",
+        &topology.boot_id_path(),
         "boot id",
-        insecure,
-        ca_cert_pem,
+        |body| topology.parse_boot_id(body),
     )
     .await
 }
@@ -810,14 +1043,26 @@ impl TokenSource for RigToken {
                 insecure,
                 ca_cert_pem,
                 cached,
+                topology,
             } => {
+                let client = device_http_client(*insecure, ca_cert_pem.as_deref())
+                    .map_err(|e| EngineError::Internal(format!("build http client: {e}")))?;
+                // Discover where the node resources live once; an unreadable
+                // listing uses the root paths for this call and is retried next time.
+                let topology = match topology.get() {
+                    Some(t) => t.clone(),
+                    None => match discover_node_topology(&client, rig_url).await {
+                        Some(t) => topology.get_or_init(|| t).clone(),
+                        None => NodeTopology::Root,
+                    },
+                };
                 // The minted token's `boot_id` is bound at the device by the
                 // boot-bound reset route, so it is only valid for the current boot.
                 // Read the live boot_id first; reuse the cached token only while the
                 // boot hasn't moved, and re-mint when it has (a campaign step that
                 // rebooted). This makes a multi-reboot campaign work with one
                 // `RigToken` — only this GET is per-call, the mint is once per boot.
-                let boot_id = fetch_rig_boot_id(rig_url, *insecure, ca_cert_pem.as_deref()).await?;
+                let boot_id = fetch_rig_boot_id(&client, rig_url, &topology).await?;
                 let mut guard = cached.lock().await;
                 if let Some((cached_boot, tok)) = guard.as_ref() {
                     if cached_boot == &boot_id {
@@ -827,7 +1072,7 @@ impl TokenSource for RigToken {
                 // The token's `aud` is the rig's ecu_id (its HSM device-key
                 // thumbprint), resolved from the device (NOT the roster name), and
                 // its `boot_id` is the live boot just read above.
-                let ecu_id = fetch_rig_ecu_id(rig_url, *insecure, ca_cert_pem.as_deref()).await?;
+                let ecu_id = fetch_rig_ecu_id(&client, rig_url, &topology).await?;
                 let minted = minter
                     .mint(&ecu_id, &["*".to_string()], Some(&boot_id), *ttl_secs)
                     .await
@@ -1642,6 +1887,31 @@ mod tests {
         ComponentSpec, ImageManifestBuilder, MultiComponentBuilder,
     };
     use sumo_offboard::{keygen, CampaignBuilder};
+
+    #[test]
+    fn boot_id_is_plain_text_at_the_root_and_json_data_on_the_node() {
+        let root = NodeTopology::Root;
+        assert_eq!(root.boot_id_path(), "/vehicle/v1/status/x-boot-id");
+        assert_eq!(root.parse_boot_id(" \"abc\"\n").as_deref(), Some("abc"));
+        assert_eq!(root.parse_boot_id("  "), None);
+
+        let node = NodeTopology::Node("cvc".into());
+        assert_eq!(
+            node.boot_id_path(),
+            "/vehicle/v1/components/cvc/data/x-boot-id"
+        );
+        assert_eq!(
+            node.parse_boot_id(r#"{"id":"x-boot-id","data":"abc"}"#)
+                .as_deref(),
+            Some("abc")
+        );
+        assert_eq!(node.parse_boot_id(r#"{"id":"x-boot-id","data":""}"#), None);
+        assert_eq!(
+            node.parse_boot_id("abc"),
+            None,
+            "plain text is not the node form"
+        );
+    }
 
     /// Build one signed L2 image for `component` — a multi-component SUIT envelope
     /// whose parts carry a content-address `sha256:<outer>` payload uri, exactly
