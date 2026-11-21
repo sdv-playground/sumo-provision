@@ -11,7 +11,8 @@
 //! release is therefore idempotent — the same content reuses the existing
 //! release (whatever its version), so a reconcile only cuts a new version when
 //! the content actually changed. The `version` is just a human label (a build
-//! number); `created_at` is the build time (when this content was first cut).
+//! number) — a reused component release takes the latest non-blank label handed
+//! in; `created_at` is the build time (when this content was first cut).
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
@@ -85,7 +86,8 @@ pub struct TargetSelector {
 }
 
 /// A resolved release. `reused` is true when the content already had a release
-/// (so the proposed version was ignored and the existing one returned).
+/// (so the existing one was returned — for a component release, carrying the
+/// proposed version as its label unless that was blank).
 #[derive(Serialize)]
 pub struct ReleaseRef {
     pub id: i64,
@@ -189,7 +191,8 @@ pub struct VehicleReleaseRow {
 
 /// `POST /admin/component-releases` — mint an L2 component release, idempotent on
 /// content. Same parts as an existing release for this entity → that release is
-/// returned (`reused`); otherwise a new one is cut with the proposed `version`.
+/// returned (`reused`), relabelled with the proposed `version` (verbatim; a blank
+/// one keeps the stored label); otherwise a new one is cut with it.
 pub async fn create_component_release(
     State(s): State<AppState>,
     Json(req): Json<NewComponentRelease>,
@@ -207,6 +210,27 @@ pub async fn create_component_release(
     .await
     .map_err(db)?
     {
+        // The latest label handed in wins: same content keeps its row (id,
+        // created_at), but the label is replaced verbatim so envelopes signed from
+        // now on carry it. A blank label never overwrites the stored one.
+        let old: String = row.get("version");
+        if req.version.trim().is_empty() || req.version == old {
+            return Ok(Json(ReleaseRef::from_row(&row, true)));
+        }
+        let row = sqlx::query(
+            "UPDATE component_releases SET version = $2 WHERE id = $1 \
+             RETURNING id, version, created_at::text AS created_at",
+        )
+        .bind(row.get::<i64, _>("id"))
+        .bind(&req.version)
+        .fetch_one(pool)
+        .await
+        .map_err(db)?;
+        let id: i64 = row.get("id");
+        tracing::info!(
+            "component release {id} label {old} -> {} (content identical)",
+            req.version
+        );
         return Ok(Json(ReleaseRef::from_row(&row, true)));
     }
 
@@ -1696,6 +1720,107 @@ mod tests {
         assert_eq!(channel["entities"]["ecu-a"]["disabled"], true);
     }
 
+    /// Same content reuses the row (id kept) but takes the label handed in NOW,
+    /// verbatim; a blank label keeps the stored one; new content cuts a new row.
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx::test"]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reused_component_release_takes_the_latest_label(pool: PgPool) {
+        let app = test_app(pool.clone());
+        let post = |version: &str, content: &[u8]| {
+            post_json(
+                &app,
+                "/admin/component-releases",
+                component_body(version, content),
+            )
+        };
+        let stored = |id: i64| {
+            sqlx::query_scalar::<_, String>("SELECT version FROM component_releases WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+        };
+
+        let first = post("1.0.0-dev.1", b"app").await;
+        assert_eq!(first["reused"], false);
+        let id = first["id"].as_i64().unwrap();
+
+        // (a) same content, new label → same row, label replaced verbatim.
+        let relabelled = post("os@main-48e1e7dc", b"app").await;
+        assert_eq!(relabelled["id"], id);
+        assert_eq!(relabelled["reused"], true);
+        assert_eq!(relabelled["version"], "os@main-48e1e7dc");
+        assert_eq!(relabelled["created_at"], first["created_at"]);
+        assert_eq!(stored(id).await.unwrap(), "os@main-48e1e7dc");
+
+        // (b) same content, blank label → stored label kept.
+        for blank in ["", "  "] {
+            let kept = post(blank, b"app").await;
+            assert_eq!(kept["id"], id);
+            assert_eq!(kept["version"], "os@main-48e1e7dc");
+            assert_eq!(stored(id).await.unwrap(), "os@main-48e1e7dc");
+        }
+
+        // (c) different content → a new row as before; the old row is untouched.
+        let other = post("os@main-48e1e7dc", b"app-v2").await;
+        assert_eq!(other["reused"], false);
+        assert_ne!(other["id"], id);
+        assert_eq!(stored(id).await.unwrap(), "os@main-48e1e7dc");
+    }
+
+    /// (d) A device whose target references a relabelled release gets an L2 whose
+    /// `text_version` is the new label — the label is read from the row at signing.
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx::test"]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn relabelled_release_signs_the_new_label(pool: PgPool) {
+        let app = test_app(pool);
+        let component_id = create_component(&app).await;
+        let release_id = post_json(
+            &app,
+            "/admin/vehicle-releases",
+            serde_json::json!({"tag":"rig","version":"1","members":[component_id]}),
+        )
+        .await["id"]
+            .as_i64()
+            .unwrap();
+        put_json(
+            &app,
+            "/admin/channel-targets",
+            serde_json::json!({
+                "channel":"bleeding", "device":"rig", "architecture":"arm64",
+                "vehicle_release_id":release_id
+            }),
+        )
+        .await;
+
+        let relabelled = post_json(
+            &app,
+            "/admin/component-releases",
+            component_body("1.0.1", b"app"),
+        )
+        .await;
+        assert_eq!(relabelled["id"], component_id);
+
+        let tree: Tree = serde_json::from_value(
+            get_json(
+                &app,
+                "/channel-targets/tree?channel=bleeding&device=rig&architecture=arm64",
+            )
+            .await,
+        )
+        .unwrap();
+        let signer = Signer::generate().unwrap();
+        let device = keygen::generate_device_key(keygen::ES256).unwrap();
+        let (included, disabled, _) = partition_l1_components(&tree, None);
+        let l1 = build_l1(&signer, &device.public_key_bytes(), &included, &disabled);
+        let l2 = Validator::new(&signer.public_key_cbor(), None)
+            .validate_envelope(
+                l1.integrated_payload("#ecu-a").unwrap(),
+                &RustCryptoBackend::new(),
+                0,
+            )
+            .unwrap();
+        assert_eq!(l2.text_version(0), Some("1.0.1"));
+    }
+
     #[test]
     fn vehicle_identity_ignores_order_and_dupes() {
         assert_eq!(
@@ -1757,20 +1882,24 @@ mod tests {
             .with_state(state)
     }
 
+    fn component_body(version: &str, content: &[u8]) -> Value {
+        serde_json::json!({
+            "entity_path": "ecu-a",
+            "entity_kind": "adaptive-app",
+            "version": version,
+            "parts": [{
+                "id": "app",
+                "kind": "binary",
+                "content": ContentHash::of(content).to_prefixed(),
+            }],
+        })
+    }
+
     async fn create_component(app: &Router) -> i64 {
         let response = post_json(
             app,
             "/admin/component-releases",
-            serde_json::json!({
-                "entity_path": "ecu-a",
-                "entity_kind": "adaptive-app",
-                "version": "1.0.0",
-                "parts": [{
-                    "id": "app",
-                    "kind": "binary",
-                    "content": ContentHash::of(b"app").to_prefixed(),
-                }],
-            }),
+            component_body("1.0.0", b"app"),
         )
         .await;
         response["id"].as_i64().unwrap()
