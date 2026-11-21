@@ -77,6 +77,12 @@ impl Signer {
     /// CEK re-wrapped to `device_pubkey` (the device's COSE_Key CBOR). The
     /// ciphertext is untouched — the device fetches it by `#<part>` and decrypts
     /// with the re-wrapped CEK.
+    ///
+    /// `label` is the release's version label, an opaque string passed through
+    /// unchanged: when non-blank it is signed into the SUIT text as
+    /// `text_version`, which the device reports as the component's installed
+    /// version (instead of falling back to `seq-N`). The component path rides as
+    /// `text_model_name`.
     pub fn build_envelope(
         &self,
         device_pubkey: &[u8],
@@ -84,6 +90,7 @@ impl Signer {
         component: &str,
         parts: &[EnvelopePart],
         seq: u64,
+        label: Option<&str>,
     ) -> Result<Vec<u8>, OffboardError> {
         let recipient = Recipient {
             public_key: CoseKey::from_cose_key_bytes(device_pubkey)?,
@@ -98,7 +105,11 @@ impl Signer {
             .unwrap_or(0);
         let mut builder = MultiComponentBuilder::new()
             .signing_time(now)
-            .sequence_number(seq);
+            .sequence_number(seq)
+            .text_model_name(component);
+        if let Some(l) = label.filter(|l| !l.trim().is_empty()) {
+            builder = builder.text_version(l);
+        }
         for p in parts {
             let enc_info = encryptor::rewrap_cek_ecdh(&p.cek, &p.iv, &recipient)?;
             // Content-address URI => ciphertext lives in the blob store (fetched
@@ -244,6 +255,7 @@ pub async fn create_envelope(
             &req.component,
             &parts,
             req.seq,
+            None,
         )
         .map_err(|e| AppError::Internal(anyhow::anyhow!("envelope build failed: {e}")))?;
     Ok(([(header::CONTENT_TYPE, "application/cbor")], envelope).into_response())
@@ -283,7 +295,7 @@ mod tests {
         }
         ciphertext.extend_from_slice(&enc.finish().unwrap());
 
-        let part = EnvelopePart {
+        let part = || EnvelopePart {
             id: "kernel".into(),
             inner: encryptor::sha256(pt),
             size: pt.len() as u64,
@@ -298,8 +310,9 @@ mod tests {
                 &device.public_key_bytes(),
                 b"managed-cvc",
                 "vm1",
-                &[part],
+                &[part()],
                 1,
+                Some("os@main-48e1e7dc"),
             )
             .unwrap();
 
@@ -309,6 +322,9 @@ mod tests {
             .add_device_key(&device.to_cose_key_bytes())
             .unwrap();
         let manifest = validator.validate_envelope(&envelope, &crypto, 0).unwrap();
+        // The release label rides in the signed SUIT text as `text_version`.
+        assert_eq!(manifest.text_version(0), Some("os@main-48e1e7dc"));
+        assert_eq!(manifest.text_model_name(0), Some("vm1"));
 
         let device_coset = coset::CoseKey::from_slice(&device.to_cose_key_bytes()).unwrap();
         let unwrap = InMemoryKeyUnwrap::new(&device_coset, &crypto);
@@ -318,6 +334,26 @@ mod tests {
         total += decryptor.update(&ciphertext, &mut out[total..]).unwrap();
         total += decryptor.finalize(&mut out[total..]).unwrap();
         assert_eq!(&out[..total], pt);
+
+        // No / blank label ⇒ no `text_version` (the device falls back to
+        // `seq-N`); the component path is still the model name.
+        for label in [None, Some(""), Some("  ")] {
+            let unlabelled = signer
+                .build_envelope(
+                    &device.public_key_bytes(),
+                    b"managed-cvc",
+                    "vm1",
+                    &[part()],
+                    1,
+                    label,
+                )
+                .unwrap();
+            let manifest = validator
+                .validate_envelope(&unlabelled, &crypto, 0)
+                .unwrap();
+            assert_eq!(manifest.text_version(0), None, "label {label:?}");
+            assert_eq!(manifest.text_model_name(0), Some("vm1"));
+        }
     }
 
     /// `build_campaign` wraps the per-device L2s into a signed L1 that validates
@@ -340,7 +376,14 @@ mod tests {
                 outer: Some(ContentHash::of(id.as_bytes())),
             };
             signer
-                .build_envelope(&device.public_key_bytes(), b"dev-1", component, &[part], 1)
+                .build_envelope(
+                    &device.public_key_bytes(),
+                    b"dev-1",
+                    component,
+                    &[part],
+                    1,
+                    None,
+                )
                 .unwrap()
         };
         let l2a = mk_l2("vm1", "kernel");

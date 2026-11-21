@@ -705,6 +705,7 @@ pub async fn channel_target_l1(
                     path,
                     &parts,
                     req.seq,
+                    entity.version.as_deref(),
                 )
                 .map_err(|e| {
                     AppError::Internal(anyhow::anyhow!("L2 build failed for {path}: {e}"))
@@ -1308,7 +1309,14 @@ mod tests {
                     })
                     .collect();
                 signer
-                    .build_envelope(device_pubkey, b"dev-1", path, &parts, 1)
+                    .build_envelope(
+                        device_pubkey,
+                        b"dev-1",
+                        path,
+                        &parts,
+                        1,
+                        entity.version.as_deref(),
+                    )
                     .unwrap()
             };
             l2s.push((path.clone(), l2));
@@ -1375,12 +1383,11 @@ mod tests {
         let pubkey = device.public_key_bytes();
 
         // vm1 enabled (flash), vm2 disabled (deactivate).
+        let mut vm1 = wentity(vec![wpart("kernel", b"K")]);
+        vm1.version = Some("x".into());
         let mut vm2 = wentity(vec![wpart("kernel", b"K2")]);
         vm2.disabled = true;
-        let tree = wtree(vec![
-            ("vm1", wentity(vec![wpart("kernel", b"K")])),
-            ("vm2", vm2),
-        ]);
+        let tree = wtree(vec![("vm1", vm1), ("vm2", vm2)]);
 
         // The vehicle explicitly reports vm2 enabled, so desired disabled differs.
         let mut observed_vm2 = wentity(vec![wpart("boot.img", b"K2")]);
@@ -1406,6 +1413,11 @@ mod tests {
         assert!(
             vm1_m.has_firmware(),
             "the enabled member is flashed (carries firmware)"
+        );
+        assert_eq!(
+            vm1_m.text_version(0),
+            Some("x"),
+            "the release label rides in the L2 as text_version"
         );
 
         // vm2: a disable manifest — no firmware, carries suit-directive-disable.
