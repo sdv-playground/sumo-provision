@@ -8,7 +8,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use orchestrator::{discover_node_topology, node_update_state, NodeTopology, RigToken};
+use orchestrator::{
+    discover_node_topology, node_update_state, NodeTopology, RigToken, TopologyChoice,
+};
 use serde_json::{json, Value};
 use sovd_client::testing::TestServer;
 use sumo_sovd_flash_engine::TokenSource;
@@ -116,7 +118,7 @@ async fn a_single_component_flat_device_is_not_a_node() {
         .unwrap();
     let client = reqwest::Client::new();
     assert_eq!(
-        discover_node_topology(&client, &server.base_url()).await,
+        discover_node_topology(&client, &server.base_url(), TopologyChoice::Auto).await,
         Some(NodeTopology::Root)
     );
 }
@@ -139,7 +141,7 @@ async fn a_lone_component_whose_subcomponents_answer_is_the_node() {
     .unwrap();
     let client = reqwest::Client::new();
     assert_eq!(
-        discover_node_topology(&client, &server.base_url()).await,
+        discover_node_topology(&client, &server.base_url(), TopologyChoice::Auto).await,
         Some(NodeTopology::Node("cvc".into()))
     );
 }
@@ -151,7 +153,7 @@ async fn node_update_state_on_a_single_component_flat_device_stays_at_the_root()
     )
     .await
     .unwrap();
-    let state = node_update_state(&server.base_url(), false, None)
+    let state = node_update_state(&server.base_url(), false, None, TopologyChoice::Auto)
         .await
         .unwrap();
     assert_eq!(state.phase, "Trial");
@@ -173,7 +175,7 @@ async fn update_state_is_read_at_the_root_on_a_root_form_device() {
         TestServer::start(root_device().merge(update_state("/vehicle/v1", "x-update-state")))
             .await
             .unwrap();
-    let state = node_update_state(&server.base_url(), false, None)
+    let state = node_update_state(&server.base_url(), false, None, TopologyChoice::Auto)
         .await
         .unwrap();
     assert_eq!(state.phase, "Trial");
@@ -186,7 +188,7 @@ async fn update_state_is_read_off_the_node_on_a_node_topology_device() {
     )
     .await
     .unwrap();
-    let state = node_update_state(&server.base_url(), false, None)
+    let state = node_update_state(&server.base_url(), false, None, TopologyChoice::Auto)
         .await
         .unwrap();
     assert_eq!(state.phase, "Trial");
@@ -201,7 +203,7 @@ async fn update_state_falls_back_to_x_ota_update_state_on_the_node() {
     )))
     .await
     .unwrap();
-    let state = node_update_state(&server.base_url(), false, None)
+    let state = node_update_state(&server.base_url(), false, None, TopologyChoice::Auto)
         .await
         .unwrap();
     assert_eq!(state.phase, "Trial");
@@ -210,7 +212,7 @@ async fn update_state_falls_back_to_x_ota_update_state_on_the_node() {
 #[tokio::test]
 async fn update_state_absent_on_the_node_is_idle() {
     let server = TestServer::start(node_device()).await.unwrap();
-    let state = node_update_state(&server.base_url(), false, None)
+    let state = node_update_state(&server.base_url(), false, None, TopologyChoice::Auto)
         .await
         .unwrap();
     assert_eq!(state.phase, "Idle");
@@ -288,7 +290,7 @@ async fn node_update_state_fails_closed_when_the_topology_is_undecided() {
     )
     .await
     .unwrap();
-    node_update_state(&server.base_url(), false, None)
+    node_update_state(&server.base_url(), false, None, TopologyChoice::Auto)
         .await
         .expect_err("an undecided topology is not read as the root");
 }
@@ -312,7 +314,70 @@ async fn a_failed_node_document_read_decides_nothing() {
     .unwrap();
     let client = reqwest::Client::new();
     assert_eq!(
-        discover_node_topology(&client, &server.base_url()).await,
+        discover_node_topology(&client, &server.base_url(), TopologyChoice::Auto).await,
         None
     );
+}
+
+#[tokio::test]
+async fn a_chosen_node_is_the_lone_component_without_asking_it() {
+    // The lone `hsm` has no subcomponents: detection says flat, the choice says node.
+    let server = TestServer::start(single_component_flat_device())
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    assert_eq!(
+        discover_node_topology(&client, &server.base_url(), TopologyChoice::Node).await,
+        Some(NodeTopology::Node("hsm".into()))
+    );
+    // Several components are no node to choose.
+    let server = TestServer::start(root_device()).await.unwrap();
+    assert_eq!(
+        discover_node_topology(&client, &server.base_url(), TopologyChoice::Node).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_chosen_flat_form_reads_the_root_even_on_a_node() {
+    // A node device read as flat: the root forms, which this one no longer serves.
+    let server = TestServer::start(node_device()).await.unwrap();
+    let client = reqwest::Client::new();
+    assert_eq!(
+        discover_node_topology(&client, &server.base_url(), TopologyChoice::Flat).await,
+        Some(NodeTopology::Root)
+    );
+    let url = server.base_url();
+    let token =
+        RigToken::minting(&url, "op", &url, None, false, None).with_topology(TopologyChoice::Flat);
+    assert_eq!(token.topology(), TopologyChoice::Flat);
+    token
+        .token("hsm")
+        .await
+        .expect_err("the root x-boot-id is gone on a node");
+}
+
+#[tokio::test]
+async fn a_minting_token_reads_the_ids_off_a_chosen_node() {
+    let server = TestServer::start(node_device().merge(minter()))
+        .await
+        .unwrap();
+    let url = server.base_url();
+    let token =
+        RigToken::minting(&url, "op", &url, None, false, None).with_topology(TopologyChoice::Node);
+    assert_eq!(token.token("vm1").await.unwrap(), "node-ecu|node-boot");
+}
+
+#[test]
+fn a_topology_choice_parses_as_the_cli_spells_it() {
+    for (s, c) in [
+        ("auto", TopologyChoice::Auto),
+        ("node", TopologyChoice::Node),
+        ("flat", TopologyChoice::Flat),
+    ] {
+        assert_eq!(s.parse::<TopologyChoice>().unwrap(), c);
+        assert_eq!(c.to_string(), s);
+    }
+    assert!("Node".parse::<TopologyChoice>().is_err());
+    assert_eq!(TopologyChoice::default(), TopologyChoice::Auto);
 }

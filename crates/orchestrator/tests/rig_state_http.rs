@@ -6,7 +6,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use orchestrator::read_rig_state;
+use orchestrator::{read_rig_state, TopologyChoice};
 use serde_json::{json, Value};
 use sovd_client::testing::TestServer;
 
@@ -132,7 +132,7 @@ async fn rig_state_reads_the_subcomponents_of_a_node() {
         include_vm2: true,
     })
     .await;
-    let tree = read_rig_state(&server.base_url(), false, None)
+    let tree = read_rig_state(&server.base_url(), false, None, TopologyChoice::Auto)
         .await
         .expect("read the node's subcomponents");
     let ids: Vec<&str> = tree.entities.keys().map(String::as_str).collect();
@@ -181,7 +181,7 @@ async fn rig_state_fails_when_the_topology_is_undecided() {
         json!({}),
     )
     .await;
-    let err = read_rig_state(&server.base_url(), false, None)
+    let err = read_rig_state(&server.base_url(), false, None, TopologyChoice::Auto)
         .await
         .expect_err("an undecided topology is not a flat device");
     assert!(err.to_string().contains("SOVD node"), "{err}");
@@ -192,7 +192,7 @@ async fn rig_state_fails_on_a_subcomponents_collection_without_items() {
     // A 2xx collection without `items` is malformed, not a node without components.
     let server =
         lone_component_server(StatusCode::NOT_FOUND, StatusCode::OK, json!({"links": []})).await;
-    read_rig_state(&server.base_url(), false, None)
+    read_rig_state(&server.base_url(), false, None, TopologyChoice::Auto)
         .await
         .expect_err("a collection without items");
 }
@@ -202,7 +202,7 @@ async fn rig_state_on_a_single_component_flat_device_reads_it_flat() {
     // One component, no `subcomponents` link: a flat device, not a node — vm1 is
     // read at `components/vm1/…` and is the tree's entity.
     let server = server(AdminObservation::Enabled).await;
-    let tree = read_rig_state(&server.base_url(), false, None)
+    let tree = read_rig_state(&server.base_url(), false, None, TopologyChoice::Auto)
         .await
         .expect("read the lone flat component");
     let ids: Vec<&str> = tree.entities.keys().map(String::as_str).collect();
@@ -217,7 +217,7 @@ async fn rig_state_keeps_advertised_component_without_installed_manifest() {
         include_vm2: true,
     })
     .await;
-    let tree = read_rig_state(&server.base_url(), false, None)
+    let tree = read_rig_state(&server.base_url(), false, None, TopologyChoice::Auto)
         .await
         .expect("read both components");
     assert_eq!(tree.entities.len(), 2);
@@ -240,7 +240,7 @@ async fn rig_state_preserves_installed_content_and_admin_state() {
         (AdminObservation::Missing, None),
     ] {
         let server = server(observation).await;
-        let tree = read_rig_state(&server.base_url(), false, None)
+        let tree = read_rig_state(&server.base_url(), false, None, TopologyChoice::Auto)
             .await
             .expect("read rig state");
         let vm = &tree.entities["vm1"];
@@ -261,7 +261,7 @@ async fn rig_state_preserves_installed_content_and_admin_state() {
 async fn malformed_or_failed_admin_observation_is_not_a_successful_read() {
     for observation in [AdminObservation::Malformed, AdminObservation::Failure] {
         let server = server(observation).await;
-        let error = read_rig_state(&server.base_url(), false, None)
+        let error = read_rig_state(&server.base_url(), false, None, TopologyChoice::Auto)
             .await
             .expect_err("invalid administrative observation must fail");
         let message = error.to_string();
@@ -276,7 +276,7 @@ async fn malformed_or_failed_admin_observation_is_not_a_successful_read() {
 async fn rig_state_probes_http_after_https_transport_failure() {
     let server = server(AdminObservation::Disabled).await;
     let https_url = server.base_url().replacen("http://", "https://", 1);
-    let tree = read_rig_state(&https_url, false, None)
+    let tree = read_rig_state(&https_url, false, None, TopologyChoice::Auto)
         .await
         .expect("fall back to the live HTTP scheme");
     assert_eq!(tree.entities["vm1"].admin_disabled, Some(true));

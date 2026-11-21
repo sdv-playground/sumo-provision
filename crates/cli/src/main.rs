@@ -27,6 +27,12 @@ struct Cli {
     /// when `--insecure`, else system roots.
     #[arg(long, env = "SUMO_CACERT", global = true, value_name = "PATH")]
     cacert: Option<PathBuf>,
+    /// The SOVD topology the device is addressed in: `auto` detects it (a node
+    /// when /components lists one component that has subcomponents), `node` takes
+    /// the one listed component as the node, `flat` addresses the components at
+    /// the top level.
+    #[arg(long, env = "SUMO_TOPOLOGY", global = true, default_value = "auto")]
+    topology: orchestrator::TopologyChoice,
     #[command(subcommand)]
     command: Command,
 }
@@ -451,7 +457,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Hub(args) => run_hub(args).await,
         Command::Ca(args) => run_ca(args).await,
-        Command::Rig(args) => run_rig(args, cli.insecure, ca_cert_pem.as_deref()).await,
+        Command::Rig(args) => {
+            run_rig(args, cli.insecure, ca_cert_pem.as_deref(), cli.topology).await
+        }
     }
 }
 
@@ -714,10 +722,16 @@ fn print_device(d: &wire::Device) {
     println!("pubkey  {}", d.pubkey.as_deref().unwrap_or("(none)"));
 }
 
-async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> anyhow::Result<()> {
+async fn run_rig(
+    args: RigArgs,
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+    topology: orchestrator::TopologyChoice,
+) -> anyhow::Result<()> {
     match args.cmd {
         RigCmd::State { json } => {
-            let observed = orchestrator::read_rig_state(&args.url, insecure, ca_cert_pem).await?;
+            let observed =
+                orchestrator::read_rig_state(&args.url, insecure, ca_cert_pem, topology).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&observed)?);
             } else {
@@ -732,7 +746,8 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
             hub_url,
             plan,
         } => {
-            let observed = orchestrator::read_rig_state(&args.url, insecure, ca_cert_pem).await?;
+            let observed =
+                orchestrator::read_rig_state(&args.url, insecure, ca_cert_pem, topology).await?;
             let desired = match (release, channel) {
                 (Some(path), _) => serde_json::from_reader(std::fs::File::open(&path)?)?,
                 (None, Some(name)) => SoftwareClient::new(&hub_url)
@@ -755,6 +770,7 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
                 None,
                 insecure,
                 ca_cert_pem,
+                topology,
             )
             .await?;
             if json {
@@ -778,7 +794,8 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
             let only_vec: Option<Vec<&str>> = only.as_deref().map(|o| vec![o]);
             let only_slice = only_vec.as_deref();
             if execute {
-                let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
+                let token =
+                    rig_token(&auth, &args.url, insecure, ca_cert_pem)?.with_topology(topology);
                 let result = orchestrator::flash_execute(
                     &args.url,
                     &hub_url,
@@ -807,6 +824,7 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
                     only_slice,
                     insecure,
                     ca_cert_pem,
+                    topology,
                 )
                 .await?;
                 if json {
@@ -826,9 +844,16 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
             only,
         } => {
             let target = sel.target();
-            let plan =
-                orchestrator::apply_plan(&args.url, &hub_url, &target, None, insecure, ca_cert_pem)
-                    .await?;
+            let plan = orchestrator::apply_plan(
+                &args.url,
+                &hub_url,
+                &target,
+                None,
+                insecure,
+                ca_cert_pem,
+                topology,
+            )
+            .await?;
             if plan.assessment.outcome == wire::AssessmentOutcome::Deferred
                 && only
                     .as_deref()
@@ -878,7 +903,7 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
             // a trial awaiting its verdict — instead of compounding it (the bug).
             // Names the components so the operator can resolve it first.
             let node_state =
-                orchestrator::node_update_state(&args.url, insecure, ca_cert_pem).await?;
+                orchestrator::node_update_state(&args.url, insecure, ca_cert_pem, topology).await?;
             if node_state.is_unresolved() {
                 anyhow::bail!(
                     "rig has an unresolved update transaction (phase {}, components {:?}) — \
@@ -905,7 +930,7 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
                 &target,
                 &auth.device_id,
                 no_commit,
-                rig_token(&auth, &args.url, insecure, ca_cert_pem)?,
+                rig_token(&auth, &args.url, insecure, ca_cert_pem)?.with_topology(topology),
                 insecure,
                 ca_cert_pem,
                 only_vec.as_deref(),
@@ -928,7 +953,7 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
             update,
             auth,
         } => {
-            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
+            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?.with_topology(topology);
             let status = orchestrator::flash_commit(
                 &args.url,
                 &component,
@@ -945,7 +970,7 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
             update,
             auth,
         } => {
-            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
+            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?.with_topology(topology);
             let status = orchestrator::flash_rollback(
                 &args.url,
                 &component,
@@ -958,12 +983,12 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
             println!("{component} rolled back → {status}");
         }
         RigCmd::CommitTrials { auth } => {
-            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
+            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?.with_topology(topology);
             orchestrator::flash_commit_trials(&args.url, token, insecure, ca_cert_pem).await?;
             println!("node trials committed (the update session is the commit unit)");
         }
         RigCmd::RollbackTrials { auth } => {
-            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
+            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?.with_topology(topology);
             orchestrator::flash_rollback_trials(&args.url, token, insecure, ca_cert_pem).await?;
             println!("node trials rolled back");
         }
@@ -972,7 +997,7 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
             update,
             auth,
         } => {
-            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
+            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?.with_topology(topology);
             let status = orchestrator::flash_reset(
                 &args.url,
                 &component,
@@ -989,7 +1014,7 @@ async fn run_rig(args: RigArgs, insecure: bool, ca_cert_pem: Option<&[u8]>) -> a
             hub_url,
             auth,
         } => {
-            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?;
+            let token = rig_token(&auth, &args.url, insecure, ca_cert_pem)?.with_topology(topology);
             let suit_bytes = std::fs::read(&suit)?;
             let trust_anchor = SoftwareClient::new(&hub_url).signer_pubkey().await?;
             let result = orchestrator::flash_keystore(
