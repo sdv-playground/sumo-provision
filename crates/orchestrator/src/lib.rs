@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sovd_client::{SovdClient, SovdClientError};
 use sumo_codec::decode::decode_envelope;
 use sumo_onboard::Manifest;
+pub use sumo_sovd_flash_engine::BaseResolver;
 use sumo_sovd_flash_engine::{
     CameUp, CampaignStep, EcuState, EcuStatus, EngineError, EngineTimeouts, FlashEngine, FlashJob,
     FlashPlan, Payload, PayloadSource, TokenSource, UpdateType,
@@ -185,16 +186,8 @@ async fn connect_sovd(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(SovdClient, Vec<sovd_client::Component>), Error> {
-    let base = sovd_url.trim_end_matches('/');
-    let candidates: Vec<String> = match base.split_once("://") {
-        Some(("https", rest)) => vec![base.to_string(), format!("http://{rest}")],
-        Some(("http", rest)) => vec![base.to_string(), format!("https://{rest}")],
-        // No recognizable scheme → nothing to swap; use as-is.
-        _ => vec![base.to_string()],
-    };
-
     let mut last_err: Option<SovdClientError> = None;
-    for url in &candidates {
+    for url in &scheme_candidates(sovd_url) {
         let client = SovdClient::new_verifying(url, insecure, ca_cert_pem)?;
         match client.list_components().await {
             // Reached the device on this scheme — hand back the components too.
@@ -209,6 +202,62 @@ async fn connect_sovd(
     Err(last_err
         .map(Error::Sovd)
         .unwrap_or_else(|| Error::NodeState(format!("no reachable SOVD scheme for {sovd_url}"))))
+}
+
+/// The bases a device configured at `sovd_url` may answer on: the URL as given,
+/// then the same host with the scheme swapped (http while unprovisioned, https
+/// once provisioned — see [`connect_sovd`]).
+fn scheme_candidates(sovd_url: &str) -> Vec<String> {
+    let base = sovd_url.trim_end_matches('/');
+    match base.split_once("://") {
+        Some(("https", rest)) => vec![base.to_string(), format!("http://{rest}")],
+        Some(("http", rest)) => vec![base.to_string(), format!("https://{rest}")],
+        // No recognizable scheme → nothing to swap; use as-is.
+        _ => vec![base.to_string()],
+    }
+}
+
+/// The default [`BaseResolver`]: where a device configured at one URL answers
+/// SOVD right now — the configured URL, then the same host with the scheme
+/// swapped ([`scheme_candidates`], the candidates [`connect_sovd`] tries). The
+/// first candidate that gives ANY HTTP response on `GET /vehicle/v1/components`
+/// wins (a 4xx/5xx still proves the scheme is live); none answering → `None`.
+/// Honours `insecure` / `ca_cert_pem` like every other device read, so an https
+/// candidate the TLS config rejects does not count as answering.
+pub struct ProbingBaseResolver {
+    candidates: Vec<String>,
+    insecure: bool,
+    ca_cert_pem: Option<Vec<u8>>,
+}
+
+impl ProbingBaseResolver {
+    pub fn new(sovd_url: &str, insecure: bool, ca_cert_pem: Option<&[u8]>) -> Self {
+        Self {
+            candidates: scheme_candidates(sovd_url),
+            insecure,
+            ca_cert_pem: ca_cert_pem.map(|c| c.to_vec()),
+        }
+    }
+}
+
+#[async_trait]
+impl BaseResolver for ProbingBaseResolver {
+    async fn resolve(&self) -> Option<String> {
+        let client = device_http_client(self.insecure, self.ca_cert_pem.as_deref()).ok()?;
+        for url in &self.candidates {
+            // Bounded: a rebooting host can black-hole the connect, and the
+            // engine's witness wait calls this between polls.
+            let probe = client
+                .get(format!("{url}/vehicle/v1/components"))
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await;
+            if probe.is_ok() {
+                return Some(url.clone());
+            }
+        }
+        None
+    }
 }
 
 /// Read a rig's observed state over SOVD as a [`wire::Tree`]: each component is
@@ -674,6 +723,7 @@ pub async fn flash_bundle(
 /// verifies), so it is cached **per boot**: a multi-step campaign that reboots
 /// more than once re-mints once the live `boot_id` moves — only a cheap
 /// `x-boot-id` GET is per-call; the mint itself happens once per boot.
+#[allow(clippy::large_enum_variant)] // one per flash, never in a collection — size is moot
 pub enum RigToken {
     /// A pre-supplied bearer JWT, used verbatim for every component.
     Static(String),
@@ -682,7 +732,12 @@ pub enum RigToken {
     /// from `x-ecu-id` — which is what the device verifies, NOT its roster name.
     Mint {
         minter: MinterClient,
-        rig_url: String,
+        /// The device's SOVD base the `boot_id`/`aud` reads go to. Moves when it
+        /// stops answering and `resolver` places the device elsewhere (e.g. http →
+        /// https after the restart that applies provisioning).
+        rig_url: std::sync::RwLock<String>,
+        /// Asked where the device answers once `rig_url` fails at the connect level.
+        resolver: Arc<dyn BaseResolver>,
         ttl_secs: Option<u64>,
         /// Skip TLS cert verification when reading the device's `boot_id`/`aud`
         /// to mint against (the `curl -k` equivalent; mirrors the CLI `--insecure`).
@@ -709,7 +764,9 @@ impl RigToken {
     /// `x-ecu-id` (the ecu_id) at mint time, never supplied as a name. `insecure`
     /// (the CLI `--insecure`) skips cert verification on those device reads only;
     /// `ca_cert_pem` (the CLI `--cacert`) instead pins a CA root to verify them.
-    /// The minter itself is reached over plain HTTP regardless.
+    /// The minter itself is reached over plain HTTP regardless. Follows the device
+    /// across a base change via a [`ProbingBaseResolver`] over `rig_url`; swap it
+    /// with [`with_base_resolver`](Self::with_base_resolver).
     pub fn minting(
         minter_url: impl Into<String>,
         operator_token: impl Into<String>,
@@ -718,13 +775,44 @@ impl RigToken {
         insecure: bool,
         ca_cert_pem: Option<Vec<u8>>,
     ) -> Self {
+        let rig_url = rig_url.into();
         RigToken::Mint {
             minter: MinterClient::new(minter_url, operator_token),
-            rig_url: rig_url.into(),
+            resolver: Arc::new(ProbingBaseResolver::new(
+                &rig_url,
+                insecure,
+                ca_cert_pem.as_deref(),
+            )),
+            rig_url: std::sync::RwLock::new(rig_url),
             ttl_secs,
             insecure,
             ca_cert_pem,
             cached: Mutex::new(None),
+        }
+    }
+
+    /// Re-resolve a minting token's device base with `resolver` instead of the
+    /// default [`ProbingBaseResolver`]. No-op for [`fixed`](Self::fixed).
+    pub fn with_base_resolver(mut self, resolver: Arc<dyn BaseResolver>) -> Self {
+        if let RigToken::Mint { resolver: r, .. } = &mut self {
+            *r = resolver;
+        }
+        self
+    }
+}
+
+/// Why a [`fetch_rig_id`] read failed. `Unreachable`: no HTTP response at all
+/// (connect-level — the base is down or speaks the other scheme), the one failure
+/// re-resolving the base can fix. `Failed`: anything the device answered.
+enum RigIdError {
+    Unreachable(EngineError),
+    Failed(EngineError),
+}
+
+impl From<RigIdError> for EngineError {
+    fn from(e: RigIdError) -> Self {
+        match e {
+            RigIdError::Unreachable(e) | RigIdError::Failed(e) => e,
         }
     }
 }
@@ -738,16 +826,21 @@ async fn fetch_rig_id(
     what: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
-) -> Result<String, EngineError> {
+) -> Result<String, RigIdError> {
+    let failed = |m: String| RigIdError::Failed(EngineError::Internal(m));
     let url = format!("{}{path}", rig_url.trim_end_matches('/'));
     let resp = device_http_client(insecure, ca_cert_pem)
-        .map_err(|e| EngineError::Internal(format!("build http client: {e}")))?
+        .map_err(|e| failed(format!("build http client: {e}")))?
         .get(&url)
         .send()
         .await
-        .map_err(|e| EngineError::Internal(format!("read {what} from {url}: {e}")))?;
+        .map_err(|e| {
+            RigIdError::Unreachable(EngineError::Internal(format!(
+                "read {what} from {url}: {e}"
+            )))
+        })?;
     if !resp.status().is_success() {
-        return Err(EngineError::Internal(format!(
+        return Err(failed(format!(
             "read {what}: {url} returned HTTP {}",
             resp.status()
         )));
@@ -755,12 +848,10 @@ async fn fetch_rig_id(
     let id = resp
         .text()
         .await
-        .map_err(|e| EngineError::Internal(format!("read {what} body: {e}")))?;
+        .map_err(|e| failed(format!("read {what} body: {e}")))?;
     let id = id.trim().trim_matches('"').to_string();
     if id.is_empty() {
-        return Err(EngineError::Internal(format!(
-            "{url} returned an empty {what}"
-        )));
+        return Err(failed(format!("{url} returned an empty {what}")));
     }
     Ok(id)
 }
@@ -770,7 +861,7 @@ async fn fetch_rig_ecu_id(
     rig_url: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
-) -> Result<String, EngineError> {
+) -> Result<String, RigIdError> {
     fetch_rig_id(
         rig_url,
         "/vehicle/v1/components/hsm/x-ecu-id",
@@ -787,7 +878,7 @@ async fn fetch_rig_boot_id(
     rig_url: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
-) -> Result<String, EngineError> {
+) -> Result<String, RigIdError> {
     fetch_rig_id(
         rig_url,
         "/vehicle/v1/status/x-boot-id",
@@ -806,6 +897,7 @@ impl TokenSource for RigToken {
             RigToken::Mint {
                 minter,
                 rig_url,
+                resolver,
                 ttl_secs,
                 insecure,
                 ca_cert_pem,
@@ -817,7 +909,31 @@ impl TokenSource for RigToken {
                 // boot hasn't moved, and re-mint when it has (a campaign step that
                 // rebooted). This makes a multi-reboot campaign work with one
                 // `RigToken` — only this GET is per-call, the mint is once per boot.
-                let boot_id = fetch_rig_boot_id(rig_url, *insecure, ca_cert_pem.as_deref()).await?;
+                //
+                // A base that died at the connect level (the device moved, e.g. to
+                // https after a restart) is re-resolved once and the read retried
+                // there; the new base is remembered for every later call.
+                let base = rig_url.read().unwrap().clone();
+                let (base, boot_id) = match fetch_rig_boot_id(
+                    &base,
+                    *insecure,
+                    ca_cert_pem.as_deref(),
+                )
+                .await
+                {
+                    Ok(id) => (base, id),
+                    Err(RigIdError::Unreachable(e)) => match resolver.resolve().await {
+                        Some(new) if new != base => {
+                            tracing::info!(old = %base, new = %new, "rig base changed — following it");
+                            *rig_url.write().unwrap() = new.clone();
+                            let id =
+                                fetch_rig_boot_id(&new, *insecure, ca_cert_pem.as_deref()).await?;
+                            (new, id)
+                        }
+                        _ => return Err(e),
+                    },
+                    Err(e) => return Err(e.into()),
+                };
                 let mut guard = cached.lock().await;
                 if let Some((cached_boot, tok)) = guard.as_ref() {
                     if cached_boot == &boot_id {
@@ -827,7 +943,7 @@ impl TokenSource for RigToken {
                 // The token's `aud` is the rig's ecu_id (its HSM device-key
                 // thumbprint), resolved from the device (NOT the roster name), and
                 // its `boot_id` is the live boot just read above.
-                let ecu_id = fetch_rig_ecu_id(rig_url, *insecure, ca_cert_pem.as_deref()).await?;
+                let ecu_id = fetch_rig_ecu_id(&base, *insecure, ca_cert_pem.as_deref()).await?;
                 let minted = minter
                     .mint(&ecu_id, &["*".to_string()], Some(&boot_id), *ttl_secs)
                     .await
@@ -854,6 +970,11 @@ pub struct FlashResult {
     pub channel: String,
     pub device: String,
     pub components: Vec<ComponentFlashResult>,
+    /// The device base the flash ended on — the rig URL it started on, or where a
+    /// [`BaseResolver`] followed the device after a node restart (e.g. http →
+    /// https once the keystore install applied provisioning). Address the device
+    /// here from now on.
+    pub base_url: String,
 }
 
 // --- L1 fan-out (the signed plan source) -----------------------------------
@@ -1253,6 +1374,7 @@ pub async fn flash_execute(
             channel: target.channel.clone(),
             device: device_id.to_string(),
             components: Vec::new(),
+            base_url: rig_url.to_string(),
         });
     }
     // `reboot_to_activate` (the workshop campaign) activates the whole step via one
@@ -1267,7 +1389,12 @@ pub async fn flash_execute(
         insecure,
         ca_cert_pem.map(|c| c.to_vec()),
     )
-    .with_force_ecu_reset(reboot_to_activate);
+    .with_force_ecu_reset(reboot_to_activate)
+    .with_base_resolver(Arc::new(ProbingBaseResolver::new(
+        rig_url,
+        insecure,
+        ca_cert_pem,
+    )));
     // No-mix guard, scoped to this (possibly `only`-filtered) plan: reject a
     // mix of rollbackable + irreversible components, reading each job's
     // x-ota-update-mode off the device. The `only` allowlist is how a singleshot
@@ -1279,6 +1406,7 @@ pub async fn flash_execute(
         channel: target.channel.clone(),
         device: device_id.to_string(),
         components: ecus.iter().map(component_result).collect(),
+        base_url: engine.server_url(),
     })
 }
 
@@ -1310,6 +1438,38 @@ pub async fn campaign_execute(
     // in the same invocation as a banked flash. `None` = flash the whole L1.
     // See tasks/two-tier-mm-recovery.md.
     only: Option<&[&str]>,
+) -> Result<Vec<ComponentFlashResult>, Error> {
+    campaign_execute_with_resolver(
+        rig_url,
+        hub_url,
+        ca_url,
+        target,
+        device_id,
+        no_commit,
+        token,
+        insecure,
+        ca_cert_pem,
+        only,
+        Arc::new(ProbingBaseResolver::new(rig_url, insecure, ca_cert_pem)),
+    )
+    .await
+}
+
+/// [`campaign_execute`], following the device across a node restart with
+/// `base_resolver` instead of the default [`ProbingBaseResolver`] over `rig_url`.
+#[allow(clippy::too_many_arguments)] // campaign_execute's arguments + the resolver
+pub async fn campaign_execute_with_resolver(
+    rig_url: &str,
+    hub_url: &str,
+    ca_url: &str,
+    target: &ChannelTarget,
+    device_id: &str,
+    no_commit: bool,
+    token: RigToken,
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+    only: Option<&[&str]>,
+    base_resolver: Arc<dyn BaseResolver>,
 ) -> Result<Vec<ComponentFlashResult>, Error> {
     // The signed L1 IS the plan: fan it out into per-component jobs once. The
     // observed tree carries each component's update mode — the same source the
@@ -1403,7 +1563,8 @@ pub async fn campaign_execute(
         EngineTimeouts::default(),
         insecure,
         ca_cert_pem.map(|c| c.to_vec()),
-    );
+    )
+    .with_base_resolver(base_resolver);
     let report = engine.run_campaign(steps, &CameUp, no_commit).await?;
     Ok(report.ecus.iter().map(component_result).collect())
 }
@@ -1417,8 +1578,16 @@ pub async fn campaign_execute(
 /// uploading the manifest only — the device re-validates against the well-known
 /// factory key (mirrors `sumo-campaign flash hsm --trust-anchor`). The anchor
 /// must be a valid COSE_Key (an empty one panics the validator). `hsm` is
-/// singleshot, so staging completes it; no reset/trial. Flash this ALONE — never
-/// mixed with banked components. **Destructive: mutates the rig.**
+/// singleshot, so staging commits it (no trial); then the engine's `reset_all`
+/// applies the component's declared `reset_kind`: `requires_ecu_reset` issues
+/// the node restart that activates the keystore (e.g. the device switching to
+/// https) and waits for the reboot witness, following the device to its new base
+/// via a [`ProbingBaseResolver`] over `rig_url` — reported as
+/// [`FlashResult::base_url`]; `local` restarts `hsm` alone; none declared → no
+/// restart; `x-ota-update-mode` unreadable → the node restart (the engine fails
+/// closed on a committed singleshot). Flash this ALONE — never mixed with banked
+/// components.
+/// **Destructive: mutates the rig.**
 pub async fn flash_keystore(
     rig_url: &str,
     hsm_suit: Vec<u8>,
@@ -1426,6 +1595,29 @@ pub async fn flash_keystore(
     token: RigToken,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
+) -> Result<FlashResult, Error> {
+    flash_keystore_with_resolver(
+        rig_url,
+        hsm_suit,
+        trust_anchor,
+        token,
+        insecure,
+        ca_cert_pem,
+        Arc::new(ProbingBaseResolver::new(rig_url, insecure, ca_cert_pem)),
+    )
+    .await
+}
+
+/// [`flash_keystore`], following the device across the node restart with
+/// `base_resolver` instead of the default [`ProbingBaseResolver`] over `rig_url`.
+pub async fn flash_keystore_with_resolver(
+    rig_url: &str,
+    hsm_suit: Vec<u8>,
+    trust_anchor: Vec<u8>,
+    token: RigToken,
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+    base_resolver: Arc<dyn BaseResolver>,
 ) -> Result<FlashResult, Error> {
     let plan = FlashPlan {
         jobs: vec![FlashJob {
@@ -1442,12 +1634,15 @@ pub async fn flash_keystore(
         EngineTimeouts::default(),
         insecure,
         ca_cert_pem.map(|c| c.to_vec()),
-    );
-    let ecus = engine.stage_all(&plan).await?;
+    )
+    .with_base_resolver(base_resolver);
+    let mut ecus = engine.stage_all(&plan).await?;
+    engine.reset_all(&mut ecus).await?;
     Ok(FlashResult {
         channel: "(keystore)".to_string(),
         device: String::new(),
         components: ecus.iter().map(component_result).collect(),
+        base_url: engine.server_url(),
     })
 }
 
@@ -1609,6 +1804,11 @@ fn verdict_engine(
         ca_cert_pem.map(|c| c.to_vec()),
     )
     .with_force_ecu_reset(force_ecu_reset)
+    .with_base_resolver(Arc::new(ProbingBaseResolver::new(
+        rig_url,
+        insecure,
+        ca_cert_pem,
+    )))
 }
 
 /// A single-component [`EcuStatus`] reconstructed from CLI args, so the verdict
