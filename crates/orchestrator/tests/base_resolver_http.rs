@@ -8,14 +8,15 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use axum::{
     extract::{Path, Request, State},
-    http::StatusCode,
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
 };
 use orchestrator::{
-    flash_keystore, flash_keystore_with_resolver, BaseResolver, ProbingBaseResolver, RigToken,
+    flash_keystore, flash_keystore_activated, flash_keystore_with_resolver, BaseResolver,
+    ProbingBaseResolver, RigToken,
 };
 use serde_json::{json, Value};
 use sovd_client::testing::TestServer;
@@ -36,6 +37,11 @@ struct Device {
     seen: Arc<Mutex<Vec<String>>>,
     /// The `/updates` phase the last lifecycle verb reached.
     phase: Arc<Mutex<&'static str>>,
+    /// The bearer the node restart demands (`None` = unauthenticated). Models
+    /// the keystore's trust anchor making the device require one once installed;
+    /// only the restart PUT is gated — whether supernova also gates status reads
+    /// after the install is not knowable here, so the fake doesn't.
+    restart_bearer: Option<&'static str>,
 }
 
 impl Device {
@@ -48,6 +54,7 @@ impl Device {
             goes_away: true,
             seen: Arc::new(Mutex::new(Vec::new())),
             phase: Arc::new(Mutex::new("prepare")),
+            restart_bearer: None,
         }
     }
 
@@ -128,11 +135,21 @@ async fn component_status(State(d): State<Device>) -> Json<Value> {
     Json(json!({"status": "ready", "x-runtime": {"node_boot_id": format!("node-{boot}")}}))
 }
 
-async fn node_restart(State(d): State<Device>) -> StatusCode {
+async fn node_restart(State(d): State<Device>, headers: HeaderMap) -> Response {
+    if let Some(want) = d.restart_bearer {
+        let got = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+        if got != Some(&format!("Bearer {want}")) {
+            let body = json!({
+                "error_code": "insufficient-access-rights",
+                "message": "missing or malformed bearer token",
+            });
+            return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+        }
+    }
     d.restarts.fetch_add(1, Ordering::SeqCst);
     d.node_boot.fetch_add(1, Ordering::SeqCst);
     d.restarted.store(true, Ordering::SeqCst);
-    StatusCode::ACCEPTED
+    StatusCode::ACCEPTED.into_response()
 }
 
 async fn boot_id(State(d): State<Device>) -> String {
@@ -264,6 +281,71 @@ async fn keystore_without_a_declared_reset_kind_is_not_restarted() {
         "no restart request of any kind"
     );
     assert_eq!(result.base_url, a.base_url());
+    assert_eq!(result.components[0].state, "Committed");
+}
+
+/// A device whose keystore install is unauthenticated but whose activation
+/// restart demands a bearer (the installed anchor now verifies one).
+fn anchored_once_installed() -> Device {
+    Device {
+        restart_bearer: Some("activation-jwt"),
+        ..Device::new(Some("requires_ecu_reset"))
+    }
+}
+
+#[tokio::test]
+async fn keystore_activation_with_the_install_token_is_refused() {
+    let dev = anchored_once_installed();
+    let a = serve(dev.clone()).await;
+    let b = serve(dev.other_base()).await;
+
+    let err = flash_keystore_with_resolver(
+        &a.base_url(),
+        b"opaque keystore suit".to_vec(),
+        dummy_trust_anchor(),
+        RigToken::fixed(String::new()),
+        false,
+        None,
+        Arc::new(MovesOnRestart::new(&dev, &a, &b)),
+    )
+    .await
+    .expect_err("the empty install token cannot issue the activation restart");
+
+    let msg = err.to_string();
+    assert!(msg.contains("401"), "{msg}");
+    assert!(msg.contains("bearer token"), "{msg}");
+    assert_eq!(dev.restarts.load(Ordering::SeqCst), 0, "restart refused");
+}
+
+#[tokio::test]
+async fn keystore_activation_uses_the_activation_token() {
+    let dev = anchored_once_installed();
+    let a = serve(dev.clone()).await;
+    let b = serve(dev.other_base()).await;
+
+    let result = flash_keystore_activated(
+        &a.base_url(),
+        b"opaque keystore suit".to_vec(),
+        dummy_trust_anchor(),
+        RigToken::fixed(String::new()),
+        RigToken::fixed("activation-jwt"),
+        false,
+        None,
+        Arc::new(MovesOnRestart::new(&dev, &a, &b)),
+    )
+    .await
+    .expect("installed unauthenticated, activated with the activation token");
+
+    assert_eq!(
+        dev.restarts.load(Ordering::SeqCst),
+        1,
+        "exactly one node restart"
+    );
+    assert_eq!(
+        result.base_url,
+        b.base_url(),
+        "the caller learns the new base"
+    );
     assert_eq!(result.components[0].state, "Committed");
 }
 
