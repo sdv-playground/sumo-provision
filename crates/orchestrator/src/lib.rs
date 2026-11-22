@@ -1619,6 +1619,64 @@ pub async fn flash_keystore_with_resolver(
     ca_cert_pem: Option<&[u8]>,
     base_resolver: Arc<dyn BaseResolver>,
 ) -> Result<FlashResult, Error> {
+    let token: Arc<dyn TokenSource> = Arc::new(token);
+    flash_keystore_with_tokens(
+        rig_url,
+        hsm_suit,
+        trust_anchor,
+        token.clone(),
+        token,
+        insecure,
+        ca_cert_pem,
+        base_resolver,
+    )
+    .await
+}
+
+/// [`flash_keystore_with_resolver`], issuing the activation restart with
+/// `activation_token` instead of `install_token`. An unprovisioned device takes
+/// the install unauthenticated, but once the keystore is installed it has a
+/// trust anchor and demands a bearer — so the `reset_all` after it needs a token
+/// that anchor verifies (e.g. a [`RigToken::minting`] one, which reads the
+/// device only when first asked, i.e. after the install).
+#[allow(clippy::too_many_arguments)]
+pub async fn flash_keystore_activated(
+    rig_url: &str,
+    hsm_suit: Vec<u8>,
+    trust_anchor: Vec<u8>,
+    install_token: RigToken,
+    activation_token: RigToken,
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+    base_resolver: Arc<dyn BaseResolver>,
+) -> Result<FlashResult, Error> {
+    flash_keystore_with_tokens(
+        rig_url,
+        hsm_suit,
+        trust_anchor,
+        Arc::new(install_token),
+        Arc::new(activation_token),
+        insecure,
+        ca_cert_pem,
+        base_resolver,
+    )
+    .await
+}
+
+/// Stage the keystore with an engine on `install_token`, then `reset_all` the
+/// staged `ecus` with a second engine on `activation_token` — same base, resolver
+/// and TLS settings. `reset_all` needs nothing from the staging engine but `ecus`.
+#[allow(clippy::too_many_arguments)]
+async fn flash_keystore_with_tokens(
+    rig_url: &str,
+    hsm_suit: Vec<u8>,
+    trust_anchor: Vec<u8>,
+    install_token: Arc<dyn TokenSource>,
+    activation_token: Arc<dyn TokenSource>,
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+    base_resolver: Arc<dyn BaseResolver>,
+) -> Result<FlashResult, Error> {
     let plan = FlashPlan {
         jobs: vec![FlashJob {
             component_id: "hsm".to_string(),
@@ -1627,22 +1685,31 @@ pub async fn flash_keystore_with_resolver(
             payloads: Vec::new(),
         }],
     };
-    let engine = FlashEngine::new(
+    let installer = FlashEngine::new(
         rig_url,
-        Arc::new(token),
+        install_token,
+        trust_anchor.clone(),
+        EngineTimeouts::default(),
+        insecure,
+        ca_cert_pem.map(|c| c.to_vec()),
+    )
+    .with_base_resolver(base_resolver.clone());
+    let mut ecus = installer.stage_all(&plan).await?;
+    let activator = FlashEngine::new(
+        installer.server_url(),
+        activation_token,
         trust_anchor,
         EngineTimeouts::default(),
         insecure,
         ca_cert_pem.map(|c| c.to_vec()),
     )
     .with_base_resolver(base_resolver);
-    let mut ecus = engine.stage_all(&plan).await?;
-    engine.reset_all(&mut ecus).await?;
+    activator.reset_all(&mut ecus).await?;
     Ok(FlashResult {
         channel: "(keystore)".to_string(),
         device: String::new(),
         components: ecus.iter().map(component_result).collect(),
-        base_url: engine.server_url(),
+        base_url: activator.server_url(),
     })
 }
 
