@@ -608,7 +608,7 @@ mod tests {
             device: "rig",
             architecture: "arm64",
             device_pubkey: "a1b2",
-            device_id: "managed-cvc",
+            device_id: "managed-hpc",
             current_state: None,
             seq: 7,
         };
@@ -617,7 +617,7 @@ mod tests {
         assert_eq!(v["device"], "rig");
         assert_eq!(v["architecture"], "arm64");
         assert_eq!(v["device_pubkey"], "a1b2");
-        assert_eq!(v["device_id"], "managed-cvc");
+        assert_eq!(v["device_id"], "managed-hpc");
         assert_eq!(v["seq"], 7);
         assert!(
             v.get("current_state").is_none(),
@@ -636,7 +636,7 @@ mod tests {
             device: "rig",
             architecture: "arm64",
             device_pubkey: "a1b2",
-            device_id: "managed-cvc",
+            device_id: "managed-hpc",
             current_state: Some(&state),
             seq: 1,
         };

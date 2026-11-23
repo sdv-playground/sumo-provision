@@ -75,7 +75,7 @@ Postgres to point at.
 
 **The composed, runnable stack** — both towers + the workshop minter + Postgres
 (one instance per tower) + minio, pulled-and-run with nothing else on the host —
-lives in its own repo, **`tools/supernova-towers`**. It submodules this repo,
+lives in a separate deployment repo. It submodules this repo,
 builds + publishes this image in CI, and owns the compose + `towers-up.sh`. That's
 the stack `sumo-autoloader` supervises for its pull-and-run delivery.
 

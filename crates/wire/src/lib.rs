@@ -146,7 +146,7 @@ pub struct ArtifactRef {
 pub struct Device {
     /// Stable device id (e.g. a VIN or rig name).
     pub id: String,
-    /// Open device model/type, e.g. `"managed-cvc"`.
+    /// Open device model/type, e.g. `"managed-hpc"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Lifecycle status, e.g. `"registered"` / `"enrolled"`.

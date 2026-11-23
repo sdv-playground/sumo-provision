@@ -1,0 +1,3 @@
+# Functional identifiers that still carry a downstream name — see
+# scripts/check-neutral-names.sh. One `path:literal  # reason` per line.
+crates/software-tower/migrations/0005_channel_targets.sql:`managed-cvc-rig`  # comment inside an applied sqlx migration; editing it changes the checksum
