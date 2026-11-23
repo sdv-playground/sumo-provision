@@ -19,7 +19,7 @@
 # This file runs ONLY the backing services; the towers run as host processes
 # (start.sh cargo-builds + runs them) — the fast host-dev loop. For a FULLY
 # containerized, pull-and-run stack (both towers + the minter + a Postgres per
-# tower), see the tools/supernova-towers repo, which builds this repo's Dockerfile
+# tower), see the separate deployment repo, which builds this repo's Dockerfile
 # into a published image and owns the composition.
 
 services:
