@@ -101,7 +101,7 @@ enum CaCmd {
     Register {
         /// Stable device id (e.g. a VIN or rig name).
         id: String,
-        /// Device model / type (e.g. `managed-cvc`).
+        /// Device model / type (e.g. `managed-hpc`).
         #[arg(long)]
         model: Option<String>,
         /// File with the device's public key / CSR.

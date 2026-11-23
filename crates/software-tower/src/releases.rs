@@ -1553,7 +1553,7 @@ mod tests {
     #[test]
     fn new_vehicle_release_accepts_optional_config_snapshot() {
         let req: NewVehicleRelease = serde_json::from_value(serde_json::json!({
-            "tag": "managed-cvc-rig",
+            "tag": "managed-hpc-rig",
             "version": "1.0.0-dev.1",
             "members": [1, 2],
             "config_snapshot": {
@@ -1563,7 +1563,7 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(req.tag, "managed-cvc-rig");
+        assert_eq!(req.tag, "managed-hpc-rig");
         assert_eq!(
             req.config_snapshot.unwrap()["schema"],
             "sumo-target-config/v1"
@@ -1577,7 +1577,7 @@ mod tests {
         let component_id = create_component(&app).await;
         let original_snapshot = serde_json::json!({
             "schema": "sumo-target-config/v1",
-            "target_type": {"name": "managed-cvc", "kind": "vehicle"},
+            "target_type": {"name": "managed-hpc", "kind": "vehicle"},
             "deployment": {"channel": "bleeding", "profile": "default"},
             "labels": {"tower": "2"},
             "components": {
@@ -1597,7 +1597,7 @@ mod tests {
             &app,
             "/admin/vehicle-releases",
             serde_json::json!({
-                "tag": "managed-cvc",
+                "tag": "managed-hpc",
                 "version": "1.0.0",
                 "members": [component_id],
                 "config_snapshot": original_snapshot,
@@ -1623,7 +1623,7 @@ mod tests {
             &app,
             "/admin/vehicle-releases",
             serde_json::json!({
-                "tag": "managed-cvc",
+                "tag": "managed-hpc",
                 "version": "2.0.0",
                 "members": [component_id],
                 "config_snapshot": replacement_snapshot,

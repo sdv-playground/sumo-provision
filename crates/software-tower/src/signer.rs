@@ -308,7 +308,7 @@ mod tests {
         let envelope = signer
             .build_envelope(
                 &device.public_key_bytes(),
-                b"managed-cvc",
+                b"managed-hpc",
                 "vm1",
                 &[part()],
                 1,
@@ -341,7 +341,7 @@ mod tests {
             let unlabelled = signer
                 .build_envelope(
                     &device.public_key_bytes(),
-                    b"managed-cvc",
+                    b"managed-hpc",
                     "vm1",
                     &[part()],
                     1,

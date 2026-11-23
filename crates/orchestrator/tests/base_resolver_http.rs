@@ -39,7 +39,7 @@ struct Device {
     phase: Arc<Mutex<&'static str>>,
     /// The bearer the node restart demands (`None` = unauthenticated). Models
     /// the keystore's trust anchor making the device require one once installed;
-    /// only the restart PUT is gated — whether supernova also gates status reads
+    /// only the restart PUT is gated — whether the node manager also gates status reads
     /// after the install is not knowable here, so the fake doesn't.
     restart_bearer: Option<&'static str>,
 }
