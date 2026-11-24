@@ -24,7 +24,7 @@ use sumo_onboard::Manifest;
 pub use sumo_sovd_flash_engine::BaseResolver;
 use sumo_sovd_flash_engine::{
     CameUp, CampaignStep, EcuState, EcuStatus, EngineError, EngineTimeouts, FlashEngine, FlashJob,
-    FlashPlan, Payload, PayloadSource, TokenSource, UpdateType,
+    FlashPlan, NoAuth, Payload, PayloadSource, TokenSource, UpdateType,
 };
 use tokio::sync::Mutex;
 use wire::{ContentHash, Entity, Part, Tree, UpdateMode};
@@ -1639,6 +1639,11 @@ pub async fn flash_keystore_with_resolver(
 /// trust anchor and demands a bearer — so the `reset_all` after it needs a token
 /// that anchor verifies (e.g. a [`RigToken::minting`] one, which reads the
 /// device only when first asked, i.e. after the install).
+///
+/// No token is sent or minted while the device base is plain HTTP: the
+/// restart goes out tokenless there, and `activation_token` is used over plain
+/// HTTP only when the device refuses that restart with 401/403 (a device that
+/// still demands a bearer before it serves https).
 #[allow(clippy::too_many_arguments)]
 pub async fn flash_keystore_activated(
     rig_url: &str,
@@ -1666,6 +1671,10 @@ pub async fn flash_keystore_activated(
 /// Stage the keystore with an engine on `install_token`, then `reset_all` the
 /// staged `ecus` with a second engine on `activation_token` — same base, resolver
 /// and TLS settings. `reset_all` needs nothing from the staging engine but `ecus`.
+/// On a plain `http://` base the activation engine runs on [`NoAuth`] instead,
+/// so no token is sent or minted; only when the device refuses that tokenless
+/// restart with 401/403 does the activation rerun on `activation_token` over
+/// plain HTTP, for devices that still demand one.
 #[allow(clippy::too_many_arguments)]
 async fn flash_keystore_with_tokens(
     rig_url: &str,
@@ -1695,15 +1704,42 @@ async fn flash_keystore_with_tokens(
     )
     .with_base_resolver(base_resolver.clone());
     let mut ecus = installer.stage_all(&plan).await?;
-    let activator = FlashEngine::new(
-        installer.server_url(),
-        activation_token,
-        trust_anchor,
-        EngineTimeouts::default(),
-        insecure,
-        ca_cert_pem.map(|c| c.to_vec()),
-    )
-    .with_base_resolver(base_resolver);
+    let base = installer.server_url();
+    let activator = |token: Arc<dyn TokenSource>| {
+        FlashEngine::new(
+            &base,
+            token,
+            trust_anchor.clone(),
+            EngineTimeouts::default(),
+            insecure,
+            ca_cert_pem.map(|c| c.to_vec()),
+        )
+        .with_base_resolver(base_resolver.clone())
+    };
+    if base.starts_with("http://") {
+        // A bearer over plain HTTP is readable on the wire, so the restart goes
+        // out without one; the activation token is neither minted nor sent.
+        let tokenless = activator(Arc::new(NoAuth));
+        let mut tokenless_ecus = ecus.clone();
+        match tokenless.reset_all(&mut tokenless_ecus).await {
+            Ok(()) => {
+                return Ok(FlashResult {
+                    channel: "(keystore)".to_string(),
+                    device: String::new(),
+                    components: tokenless_ecus.iter().map(component_result).collect(),
+                    base_url: tokenless.server_url(),
+                })
+            }
+            Err(e) if is_restart_refused_for_authorization(&e) => tracing::warn!(
+                base = %base,
+                error = %e,
+                "device refused a tokenless restart on plain HTTP (older device) — \
+                 sending the activation token over plain HTTP"
+            ),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let activator = activator(activation_token);
     activator.reset_all(&mut ecus).await?;
     Ok(FlashResult {
         channel: "(keystore)".to_string(),
@@ -1711,6 +1747,26 @@ async fn flash_keystore_with_tokens(
         components: ecus.iter().map(component_result).collect(),
         base_url: activator.server_url(),
     })
+}
+
+/// Whether `reset_all` failed because the device answered a restart with 401 or
+/// 403. The engine reports both restart paths as `FlashFailed` with the client
+/// error text behind a prefix: the node restart as `ECU restart: ` followed by
+/// `Server error 401: …` (401) or `Security access denied: …` (403); the
+/// per-component restart as `reset: ` followed by `Server error (401): …` or
+/// `Server error (403): …`.
+fn is_restart_refused_for_authorization(err: &EngineError) -> bool {
+    match err {
+        EngineError::FlashFailed { message, .. } => [
+            "ECU restart: Server error 401:",
+            "ECU restart: Security access denied:",
+            "reset: Server error (401):",
+            "reset: Server error (403):",
+        ]
+        .iter()
+        .any(|refusal| message.starts_with(refusal)),
+        _ => false,
+    }
 }
 
 // --- verdict (reset / commit / rollback) -----------------------------------
@@ -1904,6 +1960,7 @@ fn component_result(s: &EcuStatus) -> ComponentFlashResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sovd_client::FlashError;
     use sumo_offboard::cose_key::CoseKey;
     use sumo_offboard::image_builder::{
         ComponentSpec, ImageManifestBuilder, MultiComponentBuilder,
@@ -2467,5 +2524,62 @@ mod tests {
         );
         assert!(parse_admin_disabled(Some(&serde_json::json!("unknown"))).is_err());
         assert!(parse_admin_disabled(Some(&serde_json::json!(false))).is_err());
+    }
+
+    /// The node-restart error exactly as the engine builds it from a SOVD client error.
+    fn restart_failed(e: SovdClientError) -> EngineError {
+        EngineError::FlashFailed {
+            component: "hsm".to_string(),
+            message: format!("ECU restart: {e}"),
+        }
+    }
+
+    /// The per-component restart error exactly as the engine builds it from a flash client error.
+    fn local_restart_failed(e: FlashError) -> EngineError {
+        EngineError::FlashFailed {
+            component: "hsm".to_string(),
+            message: format!("reset: {e}"),
+        }
+    }
+
+    fn flash_server_error(status: u16) -> FlashError {
+        FlashError::Server {
+            status,
+            message: "missing or malformed bearer token".to_string(),
+        }
+    }
+
+    #[test]
+    fn restart_refusal_is_401_or_403_only() {
+        assert!(is_restart_refused_for_authorization(&local_restart_failed(
+            flash_server_error(401)
+        )));
+        assert!(is_restart_refused_for_authorization(&local_restart_failed(
+            flash_server_error(403)
+        )));
+        assert!(!is_restart_refused_for_authorization(
+            &local_restart_failed(flash_server_error(500))
+        ));
+        assert!(!is_restart_refused_for_authorization(
+            &local_restart_failed(FlashError::NotFound("HTTP 404 Not Found".to_string()))
+        ));
+        assert!(is_restart_refused_for_authorization(&restart_failed(
+            SovdClientError::server_error(401, "missing or malformed bearer token")
+        )));
+        assert!(is_restart_refused_for_authorization(&restart_failed(
+            SovdClientError::SecurityAccessDenied("forbidden".to_string())
+        )));
+        assert!(!is_restart_refused_for_authorization(&restart_failed(
+            SovdClientError::server_error(500, "HTTP 500 Internal Server Error")
+        )));
+        assert!(!is_restart_refused_for_authorization(&restart_failed(
+            SovdClientError::Timeout
+        )));
+        assert!(!is_restart_refused_for_authorization(
+            &EngineError::Timeout {
+                component: "hsm".to_string(),
+                operation: "Server error 401: activation".to_string(),
+            }
+        ));
     }
 }
