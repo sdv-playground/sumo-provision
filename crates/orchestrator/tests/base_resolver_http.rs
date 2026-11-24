@@ -42,6 +42,8 @@ struct Device {
     /// only the restart PUT is gated — whether the node manager also gates status reads
     /// after the install is not knowable here, so the fake doesn't.
     restart_bearer: Option<&'static str>,
+    /// The status the node restart answers a missing or wrong bearer with.
+    restart_refusal: StatusCode,
 }
 
 impl Device {
@@ -55,6 +57,7 @@ impl Device {
             seen: Arc::new(Mutex::new(Vec::new())),
             phase: Arc::new(Mutex::new("prepare")),
             restart_bearer: None,
+            restart_refusal: StatusCode::UNAUTHORIZED,
         }
     }
 
@@ -130,26 +133,48 @@ async fn update_status(State(d): State<Device>) -> Json<Value> {
     Json(json!({"phase": *d.phase.lock().unwrap(), "status": "completed"}))
 }
 
+/// The hsm's heartbeat `boot_id` follows the node boot, so a restart of
+/// either kind rotates it.
 async fn component_status(State(d): State<Device>) -> Json<Value> {
     let boot = d.node_boot.load(Ordering::SeqCst);
-    Json(json!({"status": "ready", "x-runtime": {"node_boot_id": format!("node-{boot}")}}))
+    Json(json!({
+        "status": "ready",
+        "x-runtime": {"boot_id": boot, "node_boot_id": format!("node-{boot}")},
+    }))
+}
+
+/// The refusal a restart gets without the bearer the device demands, if any.
+fn restart_refused(d: &Device, headers: &HeaderMap) -> Option<Response> {
+    let want = d.restart_bearer?;
+    let got = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+    if got == Some(&format!("Bearer {want}")) {
+        return None;
+    }
+    let body = json!({
+        "error_code": "insufficient-access-rights",
+        "message": "missing or malformed bearer token",
+    });
+    Some((d.restart_refusal, Json(body)).into_response())
 }
 
 async fn node_restart(State(d): State<Device>, headers: HeaderMap) -> Response {
-    if let Some(want) = d.restart_bearer {
-        let got = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
-        if got != Some(&format!("Bearer {want}")) {
-            let body = json!({
-                "error_code": "insufficient-access-rights",
-                "message": "missing or malformed bearer token",
-            });
-            return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
-        }
+    if let Some(refusal) = restart_refused(&d, &headers) {
+        return refusal;
     }
     d.restarts.fetch_add(1, Ordering::SeqCst);
     d.node_boot.fetch_add(1, Ordering::SeqCst);
     d.restarted.store(true, Ordering::SeqCst);
     StatusCode::ACCEPTED.into_response()
+}
+
+/// The hsm restarting alone: its heartbeat rotates, the node stays on its base.
+async fn component_restart(State(d): State<Device>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = restart_refused(&d, &headers) {
+        return refusal;
+    }
+    d.restarts.fetch_add(1, Ordering::SeqCst);
+    d.node_boot.fetch_add(1, Ordering::SeqCst);
+    Json(json!({"status": "completed", "reset_type": "hard"})).into_response()
 }
 
 async fn boot_id(State(d): State<Device>) -> String {
@@ -174,6 +199,7 @@ async fn serve(d: Device) -> TestServer {
         .route(&format!("{hsm}/updates/{{id}}/execute"), put(execute))
         .route(&format!("{hsm}/updates/{{id}}/status"), get(update_status))
         .route(&format!("{hsm}/status"), get(component_status))
+        .route(&format!("{hsm}/status/restart"), put(component_restart))
         .route(&format!("{hsm}/x-ecu-id"), get(ecu_id))
         .route("/vehicle/v1/status/restart", put(node_restart))
         .route("/vehicle/v1/status/x-boot-id", get(boot_id))
@@ -352,6 +378,153 @@ async fn keystore_activation_uses_the_activation_token() {
 async fn mint(Json(req): Json<Value>) -> Json<Value> {
     let boot = req["boot_id"].as_str().unwrap_or_default();
     Json(json!({"token": format!("tok-{boot}"), "expires_at": "never"}))
+}
+
+/// A minter that counts the tokens it mints.
+async fn counting_minter() -> (TestServer, Arc<AtomicU32>) {
+    let mints = Arc::new(AtomicU32::new(0));
+    let router = Router::new()
+        .route(
+            "/mint",
+            post(
+                |State(n): State<Arc<AtomicU32>>, req: Json<Value>| async move {
+                    n.fetch_add(1, Ordering::SeqCst);
+                    mint(req).await
+                },
+            ),
+        )
+        .with_state(mints.clone());
+    (TestServer::start(router).await.expect("minter"), mints)
+}
+
+#[tokio::test]
+async fn keystore_activation_on_plain_http_mints_and_sends_no_token() {
+    let (minter, mints) = counting_minter().await;
+    let dev = Device::new(Some("requires_ecu_reset"));
+    let a = serve(dev.clone()).await;
+    let b = serve(dev.other_base()).await;
+    let resolver = Arc::new(MovesOnRestart::new(&dev, &a, &b));
+    let activation = RigToken::minting(minter.base_url(), "op", a.base_url(), None, false, None)
+        .with_base_resolver(resolver.clone());
+
+    let result = flash_keystore_activated(
+        &a.base_url(),
+        b"opaque keystore suit".to_vec(),
+        dummy_trust_anchor(),
+        RigToken::fixed(String::new()),
+        activation,
+        false,
+        None,
+        resolver,
+    )
+    .await
+    .expect("activated by a tokenless restart");
+
+    assert_eq!(
+        mints.load(Ordering::SeqCst),
+        0,
+        "no activation token minted"
+    );
+    assert_eq!(
+        dev.restarts.load(Ordering::SeqCst),
+        1,
+        "exactly one node restart"
+    );
+    assert_eq!(result.base_url, b.base_url());
+    assert_eq!(result.components[0].state, "Committed");
+}
+
+#[tokio::test]
+async fn keystore_activation_on_plain_http_falls_back_to_the_token_when_refused() {
+    let (minter, mints) = counting_minter().await;
+    // The token minted against the pre-restart boot is the one the device demands.
+    let dev = Device {
+        restart_bearer: Some("tok-boot-1"),
+        restart_refusal: StatusCode::FORBIDDEN,
+        ..Device::new(Some("requires_ecu_reset"))
+    };
+    let a = serve(dev.clone()).await;
+    let b = serve(dev.other_base()).await;
+    let resolver = Arc::new(MovesOnRestart::new(&dev, &a, &b));
+    let activation = RigToken::minting(minter.base_url(), "op", a.base_url(), None, false, None)
+        .with_base_resolver(resolver.clone());
+
+    let result = flash_keystore_activated(
+        &a.base_url(),
+        b"opaque keystore suit".to_vec(),
+        dummy_trust_anchor(),
+        RigToken::fixed(String::new()),
+        activation,
+        false,
+        None,
+        resolver,
+    )
+    .await
+    .expect("tokenless restart refused with 403, activated with the token");
+
+    assert!(mints.load(Ordering::SeqCst) >= 1, "activation token minted");
+    assert_eq!(
+        dev.restarts.load(Ordering::SeqCst),
+        1,
+        "exactly one node restart"
+    );
+    assert_eq!(
+        dev.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.as_str() == "PUT /vehicle/v1/status/restart")
+            .count(),
+        2,
+        "a refused tokenless restart, then the one with the token"
+    );
+    assert_eq!(result.base_url, b.base_url());
+    assert_eq!(result.components[0].state, "Committed");
+}
+
+#[tokio::test]
+async fn keystore_local_restart_on_plain_http_falls_back_to_the_token_when_refused() {
+    let dev = Device {
+        restart_bearer: Some("activation-jwt"),
+        restart_refusal: StatusCode::FORBIDDEN,
+        ..Device::new(Some("local"))
+    };
+    let a = serve(dev.clone()).await;
+
+    let result = flash_keystore_activated(
+        &a.base_url(),
+        b"opaque keystore suit".to_vec(),
+        dummy_trust_anchor(),
+        RigToken::fixed(String::new()),
+        RigToken::fixed("activation-jwt"),
+        false,
+        None,
+        Arc::new(ProbingBaseResolver::new(&a.base_url(), false, None)),
+    )
+    .await
+    .expect("tokenless hsm restart refused with 403, restarted with the token");
+
+    let restarts = |path: &str| {
+        dev.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.as_str() == format!("PUT {path}"))
+            .count()
+    };
+    assert_eq!(
+        restarts("/vehicle/v1/components/hsm/status/restart"),
+        2,
+        "a refused tokenless hsm restart, then the one with the token"
+    );
+    assert_eq!(restarts("/vehicle/v1/status/restart"), 0, "no node restart");
+    assert_eq!(
+        dev.restarts.load(Ordering::SeqCst),
+        1,
+        "one effective restart"
+    );
+    assert_eq!(result.base_url, a.base_url());
+    assert_eq!(result.components[0].state, "Committed");
 }
 
 #[tokio::test]
